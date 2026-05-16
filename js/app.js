@@ -1,4 +1,11 @@
 // UI glue + lifecycle. Mobile-first; the same DOM becomes a desktop sidebar via CSS.
+//
+// Session model: every translation pipeline (client + audio capture + TTS player +
+// transcript + status + config snapshot) lives inside a Session object. The UI
+// currently shows exactly one session at a time — `state.activeSessionId` selects
+// which one drives the chrome (status pill, meters, transcript, PiP). Multi-session
+// UI lands in a later phase; this file already routes per-session so that change
+// is purely additive.
 
 const LANGUAGES = [
   ['en', 'English'],
@@ -84,23 +91,93 @@ const els = {
   log:           $('log'),
 };
 
+// ─── Session ─────────────────────────────────────────────────────────────────
+// Pure container — no DOM, no I/O. Created from a UI snapshot, mutated by the
+// pipeline lifecycle. Multiple of these will coexist in Phase 3; for now there
+// is exactly one and it is always the "active" one.
+class Session {
+  constructor({ id, config }) {
+    this.id = id;
+    this.config = config;          // snapshot taken at create time
+
+    // Runtime objects, allocated by startPipeline, torn down by stopPipeline.
+    this.client = null;            // GeminiLiveClient
+    this.capture = null;           // AudioCapture | CompanionAudioCapture
+    this.player = null;            // TTSPlayer | null (text/transcribe modes)
+
+    this.running = false;
+    this.paused = false;
+    this.status = 'idle';
+
+    // Audio source actually in use (may differ from config if a fallback fired).
+    this.currentAudioMode = '';
+
+    // Wall-clock when the session connected; drives the age display.
+    this.startedAt = 0;
+    this.ageTimer = 0;
+
+    // Live transcript bookkeeping.
+    this.liveTurn = null;          // { root, inputEl, outputEl, ... }
+    this.pendingInput = '';
+    this.pendingOutput = '';
+    this.pendingScheduled = false;
+  }
+
+  get isAudio() { return this.config.mode === 'audio'; }
+}
+
 const state = {
-  running: false,
-  paused: false,
-  client: null,
-  capture: null,
-  player: null,
+  // Sessions live here. activeSessionId names the one whose state drives the chrome.
+  sessions: new Map(),
+  activeSessionId: null,
+
+  // Truly global UI state.
   pip: null,
-  currentAudioMode: '',
-  startedAt: 0,
-  ageTimer: 0,
-  liveTurn: null,
   systemPromptTemplate: null,
   companionAvailable: false,
   // List of {pid, name, displayName} returned by the companion /apps endpoint.
   // Refreshed when the companion service is detected or the user clicks ↻.
   companionApps: [],
 };
+
+function activeSession() {
+  return state.activeSessionId ? state.sessions.get(state.activeSessionId) || null : null;
+}
+
+function isActive(session) {
+  return !!session && session.id === state.activeSessionId;
+}
+
+// Snapshot the current Settings panel into a plain config object. This is what
+// a Session is created from; the session then owns its config independently of
+// further UI edits (which only matter at the next Start).
+function readConfigFromUI() {
+  return {
+    source: els.langSource.value,
+    target: els.langTarget.value,
+    voice:  els.voice.value,
+    mode:   els.modeSelect.value,
+    dir:    els.dirSelect.value,
+    vad:    currentVadConfig(),
+    audioSource:    els.audioSource.value || 'mic',
+    micDeviceId:    els.audioInput.value || '',
+    outputDeviceId: els.audioOutput.value || '',
+    companionApp:   els.companionApp ? els.companionApp.value : '',
+  };
+}
+
+function newSessionId() {
+  return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function ensureActiveSession() {
+  let s = activeSession();
+  if (s) return s;
+  s = new Session({ id: newSessionId(), config: readConfigFromUI() });
+  state.sessions.set(s.id, s);
+  state.activeSessionId = s.id;
+  return s;
+}
 
 // ─── Prefs ────────────────────────────────────────────────────────────────────
 function loadPrefs() {
@@ -146,16 +223,20 @@ function isBuiltinPromptTemplate(t) {
          t === GeminiLive.TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE;
 }
 
-function modeDefaultTemplate() {
-  if (els.modeSelect.value === 'transcribe') return GeminiLive.TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE;
-  if (els.dirSelect.value === 'oneway')      return GeminiLive.ONE_WAY_SYSTEM_PROMPT_TEMPLATE;
+function modeDefaultTemplate(mode, dir) {
+  if (mode === 'transcribe') return GeminiLive.TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE;
+  if (dir === 'oneway')      return GeminiLive.ONE_WAY_SYSTEM_PROMPT_TEMPLATE;
   return GeminiLive.DEFAULT_SYSTEM_PROMPT_TEMPLATE;
 }
 
-function effectivePromptTemplate() {
+// Resolve for a given mode/dir; uses the (currently global) custom template if set.
+function effectivePromptTemplateFor(mode, dir) {
   const custom = state.systemPromptTemplate;
   if (custom && !isBuiltinPromptTemplate(custom)) return custom;
-  return modeDefaultTemplate();
+  return modeDefaultTemplate(mode, dir);
+}
+function effectivePromptTemplate() {
+  return effectivePromptTemplateFor(els.modeSelect.value, els.dirSelect.value);
 }
 
 function modeDescriptiveLabel() {
@@ -537,9 +618,11 @@ async function refreshAudioOutputDevices() {
 async function changeAudioOutput() {
   els.audioOutput.dataset.preferred = els.audioOutput.value;
   savePrefs();
-  if (!state.player) return;
+  const session = activeSession();
+  if (!session || !session.player) return;
+  session.config.outputDeviceId = els.audioOutput.value;
   try {
-    await state.player.setOutputDevice(els.audioOutput.value);
+    await session.player.setOutputDevice(els.audioOutput.value);
     log('info', 'Audio output changed: ' + (els.audioOutput.selectedOptions[0]?.textContent || 'System default'));
   } catch (e) {
     log('error', 'Audio output change failed: ' + (e && e.message ? e.message : e));
@@ -547,29 +630,30 @@ async function changeAudioOutput() {
   }
 }
 
-function createAudioCapture() {
+// ─── Per-session capture/player factories ────────────────────────────────────
+function createAudioCapture(session) {
   return new LiveAudio.AudioCapture({
     onChunk: (buf) => {
-      if (!state.paused) state.client.sendAudio(buf);
+      if (!session.paused && session.client) session.client.sendAudio(buf);
     },
-    onLevel: (l) => setMeter(els.micMeter, l),
+    onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
       log('warn', 'App audio share ended by the browser.');
-      stopPipeline();
+      stopSession(session);
     },
   });
 }
 
-function createCompanionCapture() {
+function createCompanionCapture(session) {
   return new LiveAudio.CompanionAudioCapture({
     onChunk: (buf) => {
-      if (!state.paused) state.client.sendAudio(buf);
+      if (!session.paused && session.client) session.client.sendAudio(buf);
     },
-    onLevel: (l) => setMeter(els.micMeter, l),
+    onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
-      if (!state.running) return;
+      if (!session.running) return;
       log('warn', 'Companion audio service disconnected.');
-      stopPipeline();
+      stopSession(session);
     },
   });
 }
@@ -577,22 +661,24 @@ function createCompanionCapture() {
 async function changeAudioInput() {
   els.audioInput.dataset.preferred = els.audioInput.value;
   savePrefs();
-  if (!state.running) return;
+  const session = activeSession();
+  if (!session || !session.running) return;
 
-  const audioMode = state.currentAudioMode || els.audioSource.value || 'mic';
+  const audioMode = session.currentAudioMode || session.config.audioSource || 'mic';
   if (audioMode === 'display' || audioMode === 'companion') {
     log('info', 'Microphone changed; it will apply when microphone input is used.');
     return;
   }
+  session.config.micDeviceId = els.audioInput.value;
 
   try {
     if (audioMode === 'both') {
       log('info', 'Pick the app/tab audio again to switch microphones.');
     }
-    const nextCapture = createAudioCapture();
-    await nextCapture.start({ mode: audioMode, micDeviceId: els.audioInput.value });
-    try { state.capture && state.capture.stop(); } catch (_) {}
-    state.capture = nextCapture;
+    const nextCapture = createAudioCapture(session);
+    await nextCapture.start({ mode: audioMode, micDeviceId: session.config.micDeviceId });
+    try { session.capture && session.capture.stop(); } catch (_) {}
+    session.capture = nextCapture;
     await refreshAudioInputDevices();
     log('info', 'Microphone changed: ' + (els.audioInput.selectedOptions[0]?.textContent || 'System default'));
   } catch (e) {
@@ -610,7 +696,14 @@ const STATUS_MAP = {
   reconnecting: ['pill-reconnecting', 'Reconnect'],
   error:        ['pill-error',        'Error'],
 };
-function setStatus(s) {
+
+function setSessionStatus(session, s) {
+  session.status = s;
+  if (isActive(session)) applySessionStatusToChrome(session);
+}
+
+function applySessionStatusToChrome(session) {
+  const s = session ? session.status : 'idle';
   const [cls, text] = STATUS_MAP[s] || STATUS_MAP.idle;
   els.statusPill.className = 'pill ' + cls;
   els.statusText.textContent = text;
@@ -640,52 +733,48 @@ function log(level, message) {
 }
 
 // ─── Streaming transcripts: batch chunks per rAF ──────────────────────────────
-let pendingInput = '';
-let pendingOutput = '';
-let pendingScheduled = false;
-
-function scheduleFlush() {
-  if (pendingScheduled) return;
-  pendingScheduled = true;
-  requestAnimationFrame(flushPending);
+function scheduleFlush(session) {
+  if (session.pendingScheduled) return;
+  session.pendingScheduled = true;
+  requestAnimationFrame(() => flushPending(session));
 }
 
-function flushPending() {
-  pendingScheduled = false;
-  if (!pendingInput && !pendingOutput) return;
-  const t = ensureLiveTurn();
-  if (pendingInput) {
+function flushPending(session) {
+  session.pendingScheduled = false;
+  if (!session.pendingInput && !session.pendingOutput) return;
+  const t = ensureLiveTurn(session);
+  if (session.pendingInput) {
     if (t.inputText === '') {
       t.inputEl.classList.remove('empty');
       t.inputEl.firstChild.nodeValue = '';
       t.inputCaret.style.display = '';
     }
-    t.inputText += pendingInput;
+    t.inputText += session.pendingInput;
     t.inputEl.firstChild.nodeValue = t.inputText;
-    pendingInput = '';
-    if (state.pip) state.pip.setInput(t.inputText);
+    session.pendingInput = '';
+    if (state.pip && isActive(session)) state.pip.setInput(t.inputText);
   }
-  if (pendingOutput) {
+  if (session.pendingOutput) {
     if (t.outputEl) {
       if (t.outputText === '') {
         t.outputEl.classList.remove('empty');
         t.outputEl.firstChild.nodeValue = '';
         if (t.outputCaret) t.outputCaret.style.display = '';
       }
-      t.outputText += pendingOutput;
+      t.outputText += session.pendingOutput;
       t.outputEl.firstChild.nodeValue = t.outputText;
-      if (state.pip) state.pip.setOutput(t.outputText);
+      if (state.pip && isActive(session)) state.pip.setOutput(t.outputText);
     }
-    pendingOutput = '';
+    session.pendingOutput = '';
   }
-  els.turns.scrollTop = els.turns.scrollHeight;
+  if (isActive(session)) els.turns.scrollTop = els.turns.scrollHeight;
 }
 
-function ensureLiveTurn() {
-  if (state.liveTurn) return state.liveTurn;
+function ensureLiveTurn(session) {
+  if (session.liveTurn) return session.liveTurn;
   if (els.emptyState) { els.emptyState.remove(); els.emptyState = null; }
 
-  const isTranscribe = els.modeSelect.value === 'transcribe';
+  const isTranscribe = session.config.mode === 'transcribe';
 
   const root = document.createElement('div');
   root.className = 'turn live' + (isTranscribe ? ' turn-single' : '');
@@ -694,7 +783,7 @@ function ensureLiveTurn() {
   inRow.className = 'turn-row input';
   const inLab = document.createElement('span');
   inLab.className = 'turn-label';
-  inLab.textContent = '🎙 ' + langName(els.langSource.value);
+  inLab.textContent = '🎙 ' + langName(session.config.source);
   const inText = document.createElement('span');
   inText.className = 'turn-text empty';
   inText.appendChild(document.createTextNode('listening…'));
@@ -708,7 +797,7 @@ function ensureLiveTurn() {
     outRow.className = 'turn-row output';
     const outLab = document.createElement('span');
     outLab.className = 'turn-label';
-    outLab.textContent = '→ ' + langName(els.langTarget.value);
+    outLab.textContent = '→ ' + langName(session.config.target);
     outText = document.createElement('span');
     outText.className = 'turn-text empty';
     outText.appendChild(document.createTextNode('…'));
@@ -726,7 +815,7 @@ function ensureLiveTurn() {
     els.turns.removeChild(els.turns.firstChild);
   }
 
-  state.liveTurn = {
+  session.liveTurn = {
     root,
     inputEl: inText,
     outputEl: outText,
@@ -736,27 +825,27 @@ function ensureLiveTurn() {
     outputText: '',
   };
 
-  if (state.pip) {
-    state.pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+  if (state.pip && isActive(session)) {
+    state.pip.setLangs(langName(session.config.source), langName(session.config.target));
     state.pip.setInput('');
     state.pip.setOutput('');
   }
-  return state.liveTurn;
+  return session.liveTurn;
 }
 
-function appendInput(chunk)  { pendingInput  += chunk; scheduleFlush(); }
-function appendOutput(chunk) { pendingOutput += chunk; scheduleFlush(); }
+function appendInputFor(session, chunk)  { session.pendingInput  += chunk; scheduleFlush(session); }
+function appendOutputFor(session, chunk) { session.pendingOutput += chunk; scheduleFlush(session); }
 
-function finalizeTurn() {
-  flushPending();
-  if (!state.liveTurn) return;
-  const t = state.liveTurn;
+function finalizeTurn(session) {
+  flushPending(session);
+  if (!session.liveTurn) return;
+  const t = session.liveTurn;
   t.inputCaret.remove();
   if (t.outputCaret) t.outputCaret.remove();
   if (!t.inputText.trim())  { t.inputEl.classList.add('empty');  t.inputEl.firstChild.nodeValue = '(silence)'; }
   if (t.outputEl && !t.outputText.trim()) { t.outputEl.classList.add('empty'); t.outputEl.firstChild.nodeValue = '(no translation)'; }
   t.root.classList.remove('live');
-  state.liveTurn = null;
+  session.liveTurn = null;
 }
 
 function setMeter(el, level) {
@@ -764,9 +853,31 @@ function setMeter(el, level) {
   el.style.width = pct + '%';
 }
 
+function setMicLevelFor(session, level) {
+  if (isActive(session)) setMeter(els.micMeter, level);
+}
+function setOutLevelFor(session, level) {
+  if (isActive(session)) setMeter(els.outMeter, level);
+}
+
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 async function startPipeline() {
-  if (state.running) return;
+  // Reuse the active session's identity but rebuild its config from the current
+  // UI snapshot — the user may have tweaked settings since the last Start.
+  let session = activeSession();
+  if (!session) {
+    session = ensureActiveSession();
+  } else if (session.running) {
+    return;
+  } else {
+    session.config = readConfigFromUI();
+  }
+  await startSession(session);
+}
+
+async function startSession(session) {
+  if (session.running) return;
+
   const apiKey = els.apiKey.value.trim();
   if (!apiKey) {
     openSheet('sidebar');
@@ -774,74 +885,77 @@ async function startPipeline() {
     els.apiKey.focus();
     return;
   }
-  const src = els.langSource.value;
-  const tgt = els.langTarget.value;
-  if (src === tgt) {
+  const cfg = session.config;
+  if (cfg.source === cfg.target) {
     log('error', 'Source and target languages must differ.');
     return;
   }
   savePrefs();
 
-  const translationMode = els.modeSelect.value; // 'audio' | 'text' | 'transcribe'
-  const dir = els.dirSelect.value;               // 'bidir' | 'oneway'
-  const isAudio = translationMode === 'audio';
+  const isAudio = cfg.mode === 'audio';
 
-  setStatus('connecting');
-  els.btnStart.disabled = true;
-  els.btnStop.disabled  = false;
-  els.btnHush.disabled  = !isAudio;
-  setControlsLocked(true);
+  setSessionStatus(session, 'connecting');
+  if (isActive(session)) {
+    els.btnStart.disabled = true;
+    els.btnStop.disabled  = false;
+    els.btnHush.disabled  = !isAudio;
+    setControlsLocked(true);
+  }
 
   if (isAudio) {
-    state.player = new LiveAudio.TTSPlayer({
-      outputDeviceId: els.audioOutput.value,
-      onLevel: (l) => setMeter(els.outMeter, l),
+    session.player = new LiveAudio.TTSPlayer({
+      outputDeviceId: cfg.outputDeviceId,
+      onLevel: (l) => setOutLevelFor(session, l),
       onActiveChange: (active) => {
-        const s = state.client && state.client.state;
-        if (s === 'connected') setStatus(active ? 'translating' : 'connected');
+        const s = session.client && session.client.state;
+        if (s === 'connected') {
+          setSessionStatus(session, active ? 'translating' : 'connected');
+        }
       },
     });
   } else {
-    state.player = null;
+    session.player = null;
   }
 
   const systemInstruction = GeminiLive.renderSystemPrompt(
-    effectivePromptTemplate(), langName(src), langName(tgt));
+    effectivePromptTemplateFor(cfg.mode, cfg.dir),
+    langName(cfg.source), langName(cfg.target));
 
-  state.client = new GeminiLive.GeminiLiveClient({
+  session.client = new GeminiLive.GeminiLiveClient({
     apiKey,
-    voice: els.voice.value,
+    voice: cfg.voice,
     systemInstruction,
-    vad: currentVadConfig(),
+    vad: cfg.vad,
     // outputAudioTranscription is needed for both audio and text modes:
     // audio mode — show the translation text alongside the spoken audio
     // text mode  — the ONLY way to get text output (native audio model doesn't support TEXT modality)
     // transcribe mode — no model output needed, only inputAudioTranscription matters
-    useOutputTranscription: translationMode !== 'transcribe',
-    onAudio: isAudio ? (b64) => { state.player.playChunk(b64); } : () => {},
-    onInputChunk: appendInput,
-    onOutputChunk: translationMode !== 'transcribe' ? appendOutput : () => {},
-    onTurnComplete: finalizeTurn,
+    useOutputTranscription: cfg.mode !== 'transcribe',
+    onAudio: isAudio ? (b64) => { if (session.player) session.player.playChunk(b64); } : () => {},
+    onInputChunk:  (chunk) => appendInputFor(session, chunk),
+    onOutputChunk: cfg.mode !== 'transcribe' ? (chunk) => appendOutputFor(session, chunk) : () => {},
+    onTurnComplete: () => finalizeTurn(session),
     onState: (s) => {
       if (s === 'connected') {
-        setStatus(isAudio && state.player && state.player.isActive() ? 'translating' : 'connected');
+        setSessionStatus(session,
+          isAudio && session.player && session.player.isActive() ? 'translating' : 'connected');
       } else {
-        setStatus(s);
+        setSessionStatus(session, s);
       }
     },
     onLog: log,
   });
 
   try {
-    if (isAudio) await state.player.ensureCtx();
-    const audioMode = els.audioSource.value || 'mic';
+    if (isAudio) await session.player.ensureCtx();
+    const audioMode = cfg.audioSource || 'mic';
     if (audioMode === 'companion') {
       if (!state.companionAvailable && !(await detectCompanionService({ silent: false }))) {
         throw new Error('Companion audio service is not running.');
       }
       // Refresh the app list right before connecting so the pid we send is
       // still valid (the user may have closed the app since the last refresh).
-      const selectedExe = els.companionApp ? els.companionApp.value : '';
+      const selectedExe = cfg.companionApp;
       let pid = 0;
       if (selectedExe) {
         try { await refreshCompanionApps({ silent: true }); } catch (_) {}
@@ -850,69 +964,82 @@ async function startPipeline() {
         else throw new Error(`"${selectedExe}" is no longer making sound. Start playback in it and try again.`);
       }
       const wsUrl = pid ? `${COMPANION_WS_URL}?pid=${pid}` : COMPANION_WS_URL;
-      state.capture = createCompanionCapture();
-      await state.capture.start({ wsUrl });
+      session.capture = createCompanionCapture(session);
+      await session.capture.start({ wsUrl });
     } else {
-      state.capture = createAudioCapture();
-      await state.capture.start({ mode: audioMode, micDeviceId: els.audioInput.value });
+      session.capture = createAudioCapture(session);
+      await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
     }
-    state.currentAudioMode = audioMode;
+    session.currentAudioMode = audioMode;
     await refreshAudioInputDevices();
     await refreshAudioOutputDevices();
     const sourceLabels = {mic:'microphone', display:'browser app audio', companion:'companion app audio', both:'mic + app audio'};
     let sourceLog = sourceLabels[audioMode] || audioMode;
-    if (audioMode === 'companion' && els.companionApp && els.companionApp.value) {
-      const opt = els.companionApp.selectedOptions[0];
-      sourceLog = `companion app audio (${opt ? opt.textContent : els.companionApp.value})`;
+    if (audioMode === 'companion' && cfg.companionApp) {
+      const opt = els.companionApp ? els.companionApp.selectedOptions[0] : null;
+      const label = opt ? opt.textContent : cfg.companionApp;
+      sourceLog = `companion app audio (${label})`;
     }
     log('info', 'Audio source: ' + sourceLog);
   } catch (e) {
     log('error', 'Audio error: ' + (e && e.message ? e.message : e));
-    await stopPipeline();
+    await stopSession(session);
     return;
   }
 
-  state.client.start();
-  state.running = true;
-  state.paused = false;
-  els.btnPause.disabled = false;
-  els.btnPause.classList.remove('is-paused');
-  els.btnPause.title = 'Pause mic';
+  session.client.start();
+  session.running = true;
+  session.paused = false;
+  if (isActive(session)) {
+    els.btnPause.disabled = false;
+    els.btnPause.classList.remove('is-paused');
+    els.btnPause.title = 'Pause mic';
+  }
 
-  state.startedAt = Date.now();
-  if (state.ageTimer) clearInterval(state.ageTimer);
-  state.ageTimer = setInterval(() => {
-    els.sessionAge.textContent = fmtDuration(Date.now() - state.startedAt);
+  session.startedAt = Date.now();
+  if (session.ageTimer) clearInterval(session.ageTimer);
+  session.ageTimer = setInterval(() => {
+    if (isActive(session)) {
+      els.sessionAge.textContent = fmtDuration(Date.now() - session.startedAt);
+    }
   }, 1000);
 
-  const dirLabel = dir === 'oneway' ? '→' : '⇄';
-  const modeLabel = translationMode !== 'audio' ? ` (${translationMode === 'text' ? 'text only' : 'transcribe'})` : '';
-  log('info', `Session started: ${langName(src)} ${dirLabel} ${langName(tgt)}${modeLabel}`);
+  const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
+  const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
+  log('info', `Session started: ${langName(cfg.source)} ${dirLabel} ${langName(cfg.target)}${modeLabel}`);
 }
 
 async function stopPipeline() {
-  try { state.client && state.client.stop(); } catch (_) {}
-  try { state.capture && state.capture.stop(); } catch (_) {}
-  try { state.player && state.player.destroy(); } catch (_) {}
-  state.client = null;
-  state.capture = null;
-  state.player = null;
-  state.currentAudioMode = '';
-  state.running = false;
-  state.paused = false;
-  if (state.ageTimer) { clearInterval(state.ageTimer); state.ageTimer = 0; }
-  finalizeTurn();
-  setStatus('idle');
-  setControlsLocked(false);
-  els.btnStart.disabled = false;
-  els.btnStop.disabled  = true;
-  els.btnHush.disabled  = true;
-  els.btnPause.disabled = true;
-  els.btnPause.classList.remove('is-paused');
-  els.btnPause.title = 'Pause mic';
-  els.sessionAge.textContent = '00:00';
-  setMeter(els.micMeter, 0);
-  setMeter(els.outMeter, 0);
+  const session = activeSession();
+  if (!session) return;
+  await stopSession(session);
+}
+
+async function stopSession(session) {
+  try { session.client && session.client.stop(); } catch (_) {}
+  try { session.capture && session.capture.stop(); } catch (_) {}
+  try { session.player && session.player.destroy(); } catch (_) {}
+  session.client = null;
+  session.capture = null;
+  session.player = null;
+  session.currentAudioMode = '';
+  session.running = false;
+  session.paused = false;
+  if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
+  finalizeTurn(session);
+  setSessionStatus(session, 'idle');
+  if (isActive(session)) {
+    setControlsLocked(false);
+    els.btnStart.disabled = false;
+    els.btnStop.disabled  = true;
+    els.btnHush.disabled  = true;
+    els.btnPause.disabled = true;
+    els.btnPause.classList.remove('is-paused');
+    els.btnPause.title = 'Pause mic';
+    els.sessionAge.textContent = '00:00';
+    setMeter(els.micMeter, 0);
+    setMeter(els.outMeter, 0);
+  }
 }
 
 function setControlsLocked(locked) {
@@ -932,12 +1059,13 @@ function setControlsLocked(locked) {
 }
 
 function togglePause() {
-  if (!state.running) return;
-  state.paused = !state.paused;
-  els.btnPause.classList.toggle('is-paused', state.paused);
-  els.btnPause.title = state.paused ? 'Resume mic' : 'Pause mic';
-  if (state.paused && state.player) state.player.hush();
-  log('info', state.paused ? 'Mic paused.' : 'Mic resumed.');
+  const session = activeSession();
+  if (!session || !session.running) return;
+  session.paused = !session.paused;
+  els.btnPause.classList.toggle('is-paused', session.paused);
+  els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  if (session.paused && session.player) session.player.hush();
+  log('info', session.paused ? 'Mic paused.' : 'Mic resumed.');
 }
 
 // ─── Sheets ──────────────────────────────────────────────────────────────────
@@ -951,7 +1079,8 @@ function closeSheet(id) {
 }
 
 function clearConversation() {
-  state.liveTurn = null;
+  const session = activeSession();
+  if (session) session.liveTurn = null;
   els.turns.innerHTML = '';
   const empty = document.createElement('div');
   empty.className = 'empty-state';
@@ -990,7 +1119,7 @@ function savePromptEditor() {
         : 'System prompt reset — using default for the current mode.');
 }
 function resetPromptEditor() {
-  els.promptText.value = modeDefaultTemplate();
+  els.promptText.value = modeDefaultTemplate(els.modeSelect.value, els.dirSelect.value);
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
@@ -1173,15 +1302,20 @@ async function togglePip() {
   state.pip = pip;
   pip.onClose = () => { if (state.pip === pip) state.pip = null; };
 
-  // Seed with current state.
+  // Seed with current active-session state.
+  const session = activeSession();
   pip.setStatus(els.statusText.textContent, els.statusPill.classList.contains('pill-translating')
                                               || els.statusPill.classList.contains('pill-listening'));
-  pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
-  if (state.liveTurn) {
-    pip.setInput(state.liveTurn.inputText);
-    pip.setOutput(state.liveTurn.outputText);
+  if (session) {
+    pip.setLangs(langName(session.config.source), langName(session.config.target));
   } else {
-    // Try last completed turn.
+    pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+  }
+  if (session && session.liveTurn) {
+    pip.setInput(session.liveTurn.inputText);
+    pip.setOutput(session.liveTurn.outputText);
+  } else {
+    // Try last completed turn from the DOM.
     const last = els.turns.querySelector('.turn:last-child');
     if (last) {
       const it = last.querySelector('.turn-row.input .turn-text');
@@ -1199,7 +1333,8 @@ function wireUI() {
   els.btnStop.addEventListener('click', stopPipeline);
   els.btnPause.addEventListener('click', togglePause);
   els.btnHush.addEventListener('click', () => {
-    if (state.player) state.player.hush();
+    const session = activeSession();
+    if (session && session.player) session.player.hush();
     log('info', 'Playback hushed');
   });
   els.btnClear.addEventListener('click', clearConversation);
@@ -1272,7 +1407,13 @@ function wireUI() {
   });
 
   window.addEventListener('beforeunload', () => {
-    if (state.running) stopPipeline();
+    for (const session of state.sessions.values()) {
+      if (session.running) {
+        try { session.client && session.client.stop(); } catch (_) {}
+        try { session.capture && session.capture.stop(); } catch (_) {}
+        try { session.player && session.player.destroy(); } catch (_) {}
+      }
+    }
     if (state.pip) state.pip.close();
   });
   window.addEventListener('focus', () => detectCompanionService());
@@ -1310,7 +1451,11 @@ function checkSupport() {
 document.addEventListener('DOMContentLoaded', () => {
   fillLanguages();
   wireUI();
-  setStatus('idle');
+  // Seed the implicit single session so chrome (status pill, age) reflects an
+  // idle Session object from the first frame. Multi-session UI will replace
+  // this with explicit creation per tab.
+  ensureActiveSession();
+  applySessionStatusToChrome(activeSession());
   detectCompanionService();
   refreshAudioInputDevices();
   refreshAudioOutputDevices();
