@@ -78,55 +78,79 @@
 
         <section class="section advanced-only">
           <div class="field">
-            <label for="mode-select">Mode</label>
-            <select id="mode-select">
-              <option value="audio">Translate — voice + text</option>
-              <option value="text">Translate — text only</option>
-              <option value="transcribe">Transcribe only</option>
-            </select>
+            <label>Mode</label>
+            <div class="segmented" id="mode-segmented" role="radiogroup" aria-label="Translate mode">
+              <button class="seg-opt is-active" data-value="audio"      type="button" role="radio" aria-checked="true">Voice + Text</button>
+              <button class="seg-opt"           data-value="text"       type="button" role="radio" aria-checked="false">Text only</button>
+              <button class="seg-opt"           data-value="transcribe" type="button" role="radio" aria-checked="false">Transcribe</button>
+            </div>
           </div>
           <div class="field" id="dir-field">
-            <label for="dir-select">Direction</label>
-            <select id="dir-select">
-              <option value="bidir">↔ Both ways</option>
-              <option value="oneway">→ One way only</option>
-            </select>
+            <label>Direction</label>
+            <div class="segmented" id="dir-segmented" role="radiogroup" aria-label="Direction">
+              <button class="seg-opt is-active" data-value="bidir"  type="button" role="radio" aria-checked="true">↔ Both ways</button>
+              <button class="seg-opt"           data-value="oneway" type="button" role="radio" aria-checked="false">→ One way</button>
+            </div>
           </div>
         </section>
 
         <section class="section advanced-only">
           <div class="field">
-            <label for="vad-preset">Speech detection</label>
-            <select id="vad-preset">
-              <option value="quick">Quick — reply fast</option>
-              <option value="balanced">Balanced</option>
-              <option value="patient">Patient — wait for me to finish</option>
-              <option value="custom">Custom</option>
-            </select>
-            <p class="hint">If the model jumps in too early, pick <strong>Patient</strong>. Takes effect on next Start.</p>
+            <label>Speech detection</label>
+            <div class="segmented" id="speech-mode-segmented" role="radiogroup" aria-label="Speech detection">
+              <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto VAD</button>
+              <button class="seg-opt"           data-value="ptt"  type="button" role="radio" aria-checked="false">Push to talk</button>
+            </div>
+            <p class="hint" id="speech-mode-hint">Auto VAD: model decides when you start/stop speaking. Push to talk: you hold a key while speaking (needs the companion app).</p>
           </div>
-          <div class="field-grid">
+
+          <div id="vad-auto-fields">
             <div class="field">
-              <label for="vad-start">Start sensitivity</label>
-              <select id="vad-start">
-                <option value="HIGH">High</option>
-                <option value="LOW">Low</option>
+              <label for="vad-preset">VAD preset</label>
+              <select id="vad-preset">
+                <option value="quick">Quick — reply fast</option>
+                <option value="balanced">Balanced</option>
+                <option value="patient">Patient — wait for me to finish</option>
+                <option value="custom">Custom</option>
               </select>
+              <p class="hint">If the model jumps in too early, pick <strong>Patient</strong>.</p>
             </div>
-            <div class="field">
-              <label for="vad-end">End sensitivity</label>
-              <select id="vad-end">
-                <option value="HIGH">High</option>
-                <option value="LOW">Low</option>
-              </select>
+            <div class="field-grid vad-grid">
+              <div class="field">
+                <label>Start sensitivity</label>
+                <div class="segmented" id="vad-start-segmented" role="radiogroup" aria-label="Start sensitivity">
+                  <button class="seg-opt is-active" data-value="HIGH" type="button" role="radio" aria-checked="true">High</button>
+                  <button class="seg-opt"           data-value="LOW"  type="button" role="radio" aria-checked="false">Low</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>End sensitivity</label>
+                <div class="segmented" id="vad-end-segmented" role="radiogroup" aria-label="End sensitivity">
+                  <button class="seg-opt"           data-value="HIGH" type="button" role="radio" aria-checked="false">High</button>
+                  <button class="seg-opt is-active" data-value="LOW"  type="button" role="radio" aria-checked="true">Low</button>
+                </div>
+              </div>
+              <div class="field">
+                <label for="vad-prefix">Prefix padding (ms)</label>
+                <input type="number" id="vad-prefix" min="0" max="2000" step="50" />
+              </div>
+              <div class="field">
+                <label for="vad-silence">Silence (ms)</label>
+                <input type="number" id="vad-silence" min="100" max="5000" step="100" />
+              </div>
             </div>
+          </div>
+
+          <div id="vad-ptt-fields" style="display:none">
             <div class="field">
-              <label for="vad-prefix">Prefix padding (ms)</label>
-              <input type="number" id="vad-prefix" min="0" max="2000" step="50" />
-            </div>
-            <div class="field">
-              <label for="vad-silence">Silence (ms)</label>
-              <input type="number" id="vad-silence" min="100" max="5000" step="100" />
+              <label>Hotkey</label>
+              <div class="input-row">
+                <button class="btn ghost ptt-key-btn" id="btn-ptt-key" type="button">
+                  <span id="ptt-key-label">Not set — click to bind</span>
+                </button>
+                <button class="icon-btn small" id="btn-ptt-clear" type="button" title="Clear hotkey" aria-label="Clear hotkey">×</button>
+              </div>
+              <p class="hint" id="ptt-hint">Companion app must be running. Hotkey is shared across all PTT sessions and works system-wide.</p>
             </div>
           </div>
         </section>
@@ -159,14 +183,14 @@
 
         <section class="section advanced-only">
           <div class="field">
-            <label for="audio-source">Audio source</label>
-            <select id="audio-source">
-              <option value="mic">Microphone only</option>
-              <option value="display">App / tab audio only</option>
-              <option value="companion">Companion app audio</option>
-              <option value="both">Mic + app audio</option>
-            </select>
-            <p class="hint" id="audio-source-hint">Default microphone. Use "App audio" to translate a tab or window. Browser support varies.</p>
+            <label>Audio source</label>
+            <div class="segmented seg-wrap" id="audio-source-segmented" role="radiogroup" aria-label="Audio source">
+              <button class="seg-opt is-active" data-value="mic"       type="button" role="radio" aria-checked="true">Mic</button>
+              <button class="seg-opt"           data-value="display"   type="button" role="radio" aria-checked="false">Tab</button>
+              <button class="seg-opt"           data-value="companion" type="button" role="radio" aria-checked="false">Companion</button>
+              <button class="seg-opt"           data-value="both"      type="button" role="radio" aria-checked="false">Mic + Tab</button>
+            </div>
+            <p class="hint" id="audio-source-hint">Default microphone. Use "Tab" to translate a tab or window. Browser support varies.</p>
           </div>
           <div class="field" id="companion-app-field" style="display:none">
             <label for="companion-app">App to capture</label>

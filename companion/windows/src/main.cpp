@@ -833,6 +833,254 @@ std::string serialize_apps(const std::vector<AppInfo>& apps) {
   return out;
 }
 
+// ─── Push-to-talk hotkey ────────────────────────────────────────────────────
+// Web clients open ws://127.0.0.1:52341/hotkey and send a JSON bind message
+// like {"action":"bind","vkCode":32,"ctrl":true,"shift":false,"alt":false,"win":false}.
+// A single global low-level keyboard hook fans key events to every open
+// connection that has a matching binding, sending {"event":"down"} on press
+// and {"event":"up"} on release. The hook fires regardless of which window
+// has focus — that's the whole point of using the companion process.
+struct HotkeyBinding {
+  DWORD vkCode = 0;
+  bool ctrl = false, shift = false, alt = false, win = false;
+  std::atomic<bool> held{false};
+};
+
+struct HotkeyConnection {
+  SOCKET sock = INVALID_SOCKET;
+  std::mutex bindMutex;
+  HotkeyBinding binding;
+  std::atomic<bool> alive{true};
+  std::mutex sendMutex;          // serialise writes (hook thread + pong sender)
+};
+
+std::mutex g_hotkey_mutex;
+std::vector<std::shared_ptr<HotkeyConnection>> g_hotkey_connections;
+std::atomic<bool> g_hook_started{false};
+
+bool ws_send_text(HotkeyConnection& conn, const std::string& text) {
+  uint8_t hdr[4];
+  size_t hdr_len;
+  hdr[0] = 0x81;                  // FIN + opcode=text
+  const size_t len = text.size();
+  if (len < 126) {
+    hdr[1] = static_cast<uint8_t>(len);
+    hdr_len = 2;
+  } else if (len <= 0xFFFF) {
+    hdr[1] = 126;
+    hdr[2] = static_cast<uint8_t>((len >> 8) & 0xff);
+    hdr[3] = static_cast<uint8_t>(len & 0xff);
+    hdr_len = 4;
+  } else {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(conn.sendMutex);
+  if (!conn.alive) return false;
+  return send_all(conn.sock, hdr, hdr_len) &&
+         send_all(conn.sock, reinterpret_cast<const uint8_t*>(text.data()), len);
+}
+
+LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode == HC_ACTION) {
+    const KBDLLHOOKSTRUCT* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+    if (isDown || isUp) {
+      const bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+      const bool shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
+      const bool alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+      const bool win   = ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+
+      // Snapshot the list under the lock; iterate without it so a slow send()
+      // never holds the global mutex (and never blocks /audio handshakes).
+      std::vector<std::shared_ptr<HotkeyConnection>> snapshot;
+      {
+        std::lock_guard<std::mutex> lock(g_hotkey_mutex);
+        snapshot = g_hotkey_connections;
+      }
+      for (auto& conn : snapshot) {
+        if (!conn->alive.load()) continue;
+        DWORD vk;
+        bool wantCtrl, wantShift, wantAlt, wantWin;
+        {
+          std::lock_guard<std::mutex> bl(conn->bindMutex);
+          vk        = conn->binding.vkCode;
+          wantCtrl  = conn->binding.ctrl;
+          wantShift = conn->binding.shift;
+          wantAlt   = conn->binding.alt;
+          wantWin   = conn->binding.win;
+        }
+        if (vk == 0 || k->vkCode != vk) continue;
+        if (isDown) {
+          // Modifier check only on press — the user may release modifiers
+          // before the main key, and we still want a clean UP event.
+          if (wantCtrl != ctrl || wantShift != shift ||
+              wantAlt != alt   || wantWin != win) continue;
+          if (!conn->binding.held.exchange(true)) {
+            ws_send_text(*conn, R"({"event":"down"})");
+          }
+        } else {
+          if (conn->binding.held.exchange(false)) {
+            ws_send_text(*conn, R"({"event":"up"})");
+          }
+        }
+      }
+    }
+  }
+  return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void hotkey_hook_thread() {
+  // The low-level hook needs a message pump on its installing thread.
+  HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, hotkey_hook_proc,
+                                 GetModuleHandleW(nullptr), 0);
+  if (!hook) {
+    dlog("SetWindowsHookExW(WH_KEYBOARD_LL) failed: %lu", GetLastError());
+    return;
+  }
+  MSG msg;
+  while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+    TranslateMessage(&msg);
+    DispatchMessage(&msg);
+  }
+  UnhookWindowsHookEx(hook);
+}
+
+void ensure_hotkey_hook_thread() {
+  bool expected = false;
+  if (g_hook_started.compare_exchange_strong(expected, true)) {
+    std::thread(hotkey_hook_thread).detach();
+  }
+}
+
+// Tiny JSON-ish parsers — the wire protocol is flat (action / vkCode / bools)
+// and fully under our control, so we avoid pulling in a JSON dependency.
+DWORD json_int(const std::string& s, const char* key, DWORD def) {
+  std::string needle = std::string("\"") + key + "\"";
+  size_t p = s.find(needle);
+  if (p == std::string::npos) return def;
+  p += needle.size();
+  while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == ':')) ++p;
+  size_t end = p;
+  while (end < s.size() && isdigit(static_cast<unsigned char>(s[end]))) ++end;
+  if (end == p) return def;
+  try { return static_cast<DWORD>(std::stoul(s.substr(p, end - p))); }
+  catch (...) { return def; }
+}
+
+bool json_bool(const std::string& s, const char* key) {
+  std::string needle = std::string("\"") + key + "\"";
+  size_t p = s.find(needle);
+  if (p == std::string::npos) return false;
+  p += needle.size();
+  while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == ':')) ++p;
+  return p + 4 <= s.size() && s.compare(p, 4, "true") == 0;
+}
+
+bool json_action_is(const std::string& s, const char* value) {
+  size_t p = s.find("\"action\"");
+  if (p == std::string::npos) return false;
+  p += 8;
+  while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == ':')) ++p;
+  if (p >= s.size() || s[p] != '"') return false;
+  ++p;
+  size_t end = s.find('"', p);
+  if (end == std::string::npos) return false;
+  const size_t want = std::strlen(value);
+  return (end - p) == want && s.compare(p, want, value) == 0;
+}
+
+void hotkey_session_loop(SOCKET sock) {
+  ensure_hotkey_hook_thread();
+
+  auto conn = std::make_shared<HotkeyConnection>();
+  conn->sock = sock;
+  {
+    std::lock_guard<std::mutex> lock(g_hotkey_mutex);
+    g_hotkey_connections.push_back(conn);
+  }
+
+  // Inline WebSocket frame reader — keeps pong sends + binding mutex in
+  // scope so they don't need separate plumbing.
+  for (;;) {
+    uint8_t hdr[2];
+    if (recv(sock, reinterpret_cast<char*>(hdr), 2, MSG_WAITALL) != 2) break;
+    const bool fin   = (hdr[0] & 0x80) != 0;
+    const uint8_t op = hdr[0] & 0x0F;
+    const bool masked = (hdr[1] & 0x80) != 0;
+    uint64_t len = hdr[1] & 0x7F;
+    if (len == 126) {
+      uint8_t ext[2];
+      if (recv(sock, reinterpret_cast<char*>(ext), 2, MSG_WAITALL) != 2) break;
+      len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
+    } else if (len == 127) {
+      uint8_t ext[8];
+      if (recv(sock, reinterpret_cast<char*>(ext), 8, MSG_WAITALL) != 8) break;
+      len = 0;
+      for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
+    }
+    if (len > (1u << 16)) break;        // safety cap (our messages are tiny)
+    uint8_t mask[4] = {};
+    if (masked && recv(sock, reinterpret_cast<char*>(mask), 4, MSG_WAITALL) != 4) break;
+    std::string payload(static_cast<size_t>(len), '\0');
+    size_t got = 0;
+    bool ok = true;
+    while (got < len) {
+      int r = recv(sock, payload.data() + got, static_cast<int>(len - got), 0);
+      if (r <= 0) { ok = false; break; }
+      got += r;
+    }
+    if (!ok) break;
+    if (masked) {
+      for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mask[i & 3];
+    }
+
+    if (op == 0x8) break;                                       // close
+    if (op == 0x9) {                                            // ping → pong
+      uint8_t pong_hdr[4];
+      size_t pong_hdr_len;
+      pong_hdr[0] = 0x8A;
+      if (payload.size() < 126) {
+        pong_hdr[1] = static_cast<uint8_t>(payload.size());
+        pong_hdr_len = 2;
+      } else {
+        pong_hdr[1] = 126;
+        pong_hdr[2] = static_cast<uint8_t>((payload.size() >> 8) & 0xff);
+        pong_hdr[3] = static_cast<uint8_t>(payload.size() & 0xff);
+        pong_hdr_len = 4;
+      }
+      std::lock_guard<std::mutex> sl(conn->sendMutex);
+      if (!send_all(sock, pong_hdr, pong_hdr_len)) break;
+      if (!payload.empty() &&
+          !send_all(sock, reinterpret_cast<const uint8_t*>(payload.data()), payload.size())) break;
+      continue;
+    }
+    if (op == 0xA) continue;                                    // pong → ignore
+    if (op != 0x1 || !fin) continue;                            // not a complete text frame
+
+    if (json_action_is(payload, "bind")) {
+      std::lock_guard<std::mutex> bl(conn->bindMutex);
+      conn->binding.vkCode = json_int(payload, "vkCode", 0);
+      conn->binding.ctrl   = json_bool(payload, "ctrl");
+      conn->binding.shift  = json_bool(payload, "shift");
+      conn->binding.alt    = json_bool(payload, "alt");
+      conn->binding.win    = json_bool(payload, "win");
+      conn->binding.held   = false;
+    } else if (json_action_is(payload, "unbind")) {
+      std::lock_guard<std::mutex> bl(conn->bindMutex);
+      conn->binding.vkCode = 0;
+      conn->binding.held = false;
+    }
+  }
+
+  conn->alive = false;
+  std::lock_guard<std::mutex> lock(g_hotkey_mutex);
+  g_hotkey_connections.erase(
+      std::remove_if(g_hotkey_connections.begin(), g_hotkey_connections.end(),
+                     [&](auto& c) { return c.get() == conn.get(); }),
+      g_hotkey_connections.end());
+}
+
 // ─── HTTP / WebSocket router ────────────────────────────────────────────────
 void handle_client(SOCKET accepted) {
   SocketGuard client{accepted};
@@ -862,9 +1110,9 @@ void handle_client(SOCKET accepted) {
 
   if (path == "/status") {
     const std::string body =
-        "{\"status\":\"ok\",\"version\":\"0.2.0\","
+        "{\"status\":\"ok\",\"version\":\"0.3.0\","
         "\"audio\":\"pcm16-16000-mono\","
-        "\"features\":[\"system-loopback\",\"process-loopback\",\"app-enumeration\"]}";
+        "\"features\":[\"system-loopback\",\"process-loopback\",\"app-enumeration\",\"ptt-hotkey\"]}";
     send_text(client.s, "HTTP/1.1 200 OK\r\n" + cors +
                         "Content-Type: application/json\r\n"
                         "Cache-Control: no-store\r\n"
@@ -913,6 +1161,22 @@ void handle_client(SOCKET accepted) {
       if (r <= 0) alive = false;
     }
     if (capture.joinable()) capture.join();
+    return;
+  }
+
+  if (path == "/hotkey") {
+    const std::string key = header_value(req, "Sec-WebSocket-Key");
+    const std::string accept = websocket_accept(key);
+    if (key.empty() || accept.empty()) {
+      send_text(client.s, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+      return;
+    }
+    send_text(client.s,
+              "HTTP/1.1 101 Switching Protocols\r\n"
+              "Upgrade: websocket\r\n"
+              "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Accept: " + accept + "\r\n\r\n");
+    hotkey_session_loop(client.s);
     return;
   }
 

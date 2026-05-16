@@ -37,8 +37,80 @@ const VAD_PRESETS = {
 const DEFAULT_VAD_PRESET = 'balanced';
 const COMPANION_HTTP_URL = 'http://127.0.0.1:52341';
 const COMPANION_WS_URL = 'ws://127.0.0.1:52341/audio';
+const COMPANION_PTT_URL = 'ws://127.0.0.1:52341/hotkey';
 
 const $ = (id) => document.getElementById(id);
+
+// ─── Segmented control helpers ───────────────────────────────────────────────
+// We replaced several <select> elements with .segmented button groups. To keep
+// the rest of the code reading naturally, segmented elements are wrapped in a
+// tiny proxy that mimics the .value + change-event API.
+function segValueOf(seg) {
+  if (!seg) return '';
+  const btn = seg.querySelector('.seg-opt.is-active');
+  return btn ? btn.dataset.value : '';
+}
+
+function setSegValue(seg, value) {
+  if (!seg) return;
+  let foundActive = false;
+  for (const btn of seg.querySelectorAll('.seg-opt')) {
+    const isThis = btn.dataset.value === value;
+    if (isThis) foundActive = true;
+    btn.classList.toggle('is-active', isThis);
+    btn.setAttribute('aria-checked', isThis ? 'true' : 'false');
+  }
+  if (!foundActive) {
+    // Value not in the group — pick the first enabled option as a safe fallback.
+    const first = seg.querySelector('.seg-opt:not([disabled])');
+    if (first) {
+      first.classList.add('is-active');
+      first.setAttribute('aria-checked', 'true');
+    }
+  }
+}
+
+function setSegOptionDisabled(seg, value, disabled) {
+  if (!seg) return;
+  const btn = seg.querySelector(`.seg-opt[data-value="${value}"]`);
+  if (btn) btn.disabled = !!disabled;
+}
+
+function segOption(seg, value) {
+  return seg ? seg.querySelector(`.seg-opt[data-value="${value}"]`) : null;
+}
+
+function wireSegmented(seg, onChange) {
+  if (!seg) return;
+  seg.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.seg-opt');
+    if (!btn || btn.disabled) return;
+    if (btn.classList.contains('is-active')) return;
+    setSegValue(seg, btn.dataset.value);
+    if (onChange) onChange(btn.dataset.value);
+  });
+}
+
+// Wraps a .segmented element as a select-like proxy: `.value` get/set,
+// `addEventListener('change', …)`. Lets the rest of the code keep its shape.
+function segProxy(seg) {
+  const proxy = {
+    el: seg,
+    get value() { return segValueOf(seg); },
+    set value(v) { setSegValue(seg, v); },
+    set disabled(d) { if (seg) seg.classList.toggle('is-locked', !!d); },
+    get selectedOptions() {
+      const btn = seg && seg.querySelector('.seg-opt.is-active');
+      return btn ? [{ textContent: btn.textContent, value: btn.dataset.value }] : [];
+    },
+    addEventListener(type, fn) {
+      if (type === 'change') wireSegmented(seg, () => fn({ target: proxy }));
+    },
+    setOptionDisabled(value, disabled) { setSegOptionDisabled(seg, value, disabled); },
+    getOption(value) { return segOption(seg, value); },
+  };
+  return proxy;
+}
 
 const els = {
   apiKey:        $('api-key'),
@@ -48,7 +120,7 @@ const els = {
   voice:         $('voice'),
   audioInput:    $('audio-input'),
   audioInputHint:$('audio-input-hint'),
-  audioSource:   $('audio-source'),
+  audioSource:   segProxy($('audio-source-segmented')),
   audioHint:     $('audio-source-hint'),
   companionApp:      $('companion-app'),
   companionAppField: $('companion-app-field'),
@@ -56,12 +128,16 @@ const els = {
   btnRefreshApps:    $('btn-refresh-apps'),
   audioOutput:   $('audio-output'),
   audioOutputHint:$('audio-output-hint'),
-  modeSelect:    $('mode-select'),
-  dirSelect:     $('dir-select'),
+  modeSelect:    segProxy($('mode-segmented')),
+  dirSelect:     segProxy($('dir-segmented')),
   dirField:      $('dir-field'),
+  speechMode:    segProxy($('speech-mode-segmented')),
+  speechModeHint:$('speech-mode-hint'),
+  vadAutoFields: $('vad-auto-fields'),
+  vadPttFields:  $('vad-ptt-fields'),
   vadPreset:     $('vad-preset'),
-  vadStart:      $('vad-start'),
-  vadEnd:        $('vad-end'),
+  vadStart:      segProxy($('vad-start-segmented')),
+  vadEnd:        segProxy($('vad-end-segmented')),
   vadPrefix:     $('vad-prefix'),
   vadSilence:    $('vad-silence'),
   btnSwap:       $('btn-swap'),
@@ -77,6 +153,10 @@ const els = {
   btnEditPrompt: $('btn-edit-prompt'),
   btnSavePrompt: $('btn-save-prompt'),
   btnResetPrompt:$('btn-reset-prompt'),
+  btnPttKey:     $('btn-ptt-key'),
+  btnPttClear:   $('btn-ptt-clear'),
+  pttKeyLabel:   $('ptt-key-label'),
+  pttHint:       $('ptt-hint'),
   promptText:    $('prompt-text'),
   sidebar:       $('sidebar'),
   promptSheet:   $('prompt-sheet'),
@@ -129,6 +209,11 @@ class Session {
     // speaking; sendAudioGated swaps real audio for zero-filled buffers so
     // the model neither picks up another turn nor hears its own output.
     this.muteInput = false;
+
+    // True while the PTT key is held down (only meaningful in pttMode === 'ptt').
+    // Outside the window we send silence to keep the stream healthy without
+    // triggering the model.
+    this.pttHeld = false;
   }
 
   get isAudio() { return this.config.mode === 'audio'; }
@@ -275,6 +360,138 @@ class TTSCoordinator {
   }
 }
 
+// ─── PTT (push-to-talk) hotkey client ────────────────────────────────────────
+// Talks to the companion app's /hotkey WebSocket. The companion installs a
+// low-level keyboard hook that fires globally (even when this page isn't
+// focused). When the bound key is pressed/released, we get a JSON message
+// here, which we fan out to subscribed sessions.
+class PttHotkeyClient {
+  constructor({ wsUrl }) {
+    this.wsUrl = wsUrl;
+    this.ws = null;
+    this.binding = null;          // {vkCode, ctrl, shift, alt, win, label}
+    this.subscribers = new Map(); // sessionId -> {onDown, onUp}
+    this.connected = false;
+    this._reconnectTimer = 0;
+    this._wantConnect = false;
+    this.onAvailabilityChange = () => {};
+    this._held = false;
+  }
+
+  setBinding(binding) {
+    this.binding = binding;
+    this._sendBinding();
+  }
+
+  clearBinding() {
+    this.binding = null;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.send(JSON.stringify({ action: 'unbind' })); } catch (_) {}
+    }
+    // Any session that thought a key was held loses that state.
+    if (this._held) this._broadcast('up');
+    this._held = false;
+  }
+
+  subscribe(sessionId, onDown, onUp) {
+    this.subscribers.set(sessionId, { onDown, onUp });
+    this._wantConnect = true;
+    this._ensureConnection();
+    if (this._held) { try { onDown(); } catch (_) {} }
+  }
+
+  unsubscribe(sessionId) {
+    const sub = this.subscribers.get(sessionId);
+    if (!sub) return;
+    if (this._held) { try { sub.onUp(); } catch (_) {} }
+    this.subscribers.delete(sessionId);
+    if (this.subscribers.size === 0) {
+      this._wantConnect = false;
+      this._teardown();
+    }
+  }
+
+  hasBinding() { return !!this.binding && Number.isFinite(this.binding.vkCode); }
+  isConnected() { return this.connected; }
+
+  _ensureConnection() {
+    if (this.ws || !this._wantConnect) return;
+    try {
+      this.ws = new WebSocket(this.wsUrl);
+    } catch (e) {
+      this._scheduleReconnect();
+      return;
+    }
+    this.ws.onopen = () => {
+      this.connected = true;
+      this.onAvailabilityChange(true);
+      if (this.hasBinding()) this._sendBinding();
+    };
+    this.ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return;
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.event === 'down' && !this._held) {
+        this._held = true;
+        this._broadcast('down');
+      } else if (msg.event === 'up' && this._held) {
+        this._held = false;
+        this._broadcast('up');
+      }
+    };
+    this.ws.onerror = () => {};
+    this.ws.onclose = () => {
+      this.ws = null;
+      const wasConnected = this.connected;
+      this.connected = false;
+      if (this._held) {
+        // Connection died with key still "held" — release it locally so
+        // sessions don't get stuck in the speaking state.
+        this._held = false;
+        this._broadcast('up');
+      }
+      if (wasConnected) this.onAvailabilityChange(false);
+      if (this._wantConnect) this._scheduleReconnect();
+    };
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectTimer) return;
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = 0;
+      this._ensureConnection();
+    }, 1500);
+  }
+
+  _teardown() {
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = 0; }
+    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
+    this.connected = false;
+  }
+
+  _sendBinding() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.hasBinding()) return;
+    const b = this.binding;
+    try {
+      this.ws.send(JSON.stringify({
+        action: 'bind',
+        vkCode: b.vkCode,
+        ctrl:   !!b.ctrl,
+        shift:  !!b.shift,
+        alt:    !!b.alt,
+        win:    !!b.win,
+      }));
+    } catch (_) {}
+  }
+
+  _broadcast(which) {
+    for (const sub of this.subscribers.values()) {
+      try { which === 'down' ? sub.onDown() : sub.onUp(); } catch (_) {}
+    }
+  }
+}
+
 const state = {
   sessions: new Map(),
   activeSessionId: null,
@@ -284,6 +501,12 @@ const state = {
   // shows everything. Sessions and configs are unaffected — flipping back to
   // advanced reveals all existing tabs untouched.
   uiMode: 'simple',
+
+  // Global PTT key binding shared across all PTT-enabled sessions.
+  // Shape: { vkCode, ctrl, shift, alt, win, label } | null
+  pttBinding: null,
+  pttClient: null,             // PttHotkeyClient, lazily created in init
+  pttCapturing: false,         // true while waiting for the user to press a key
 
   // Truly global UI state.
   pip: null,
@@ -326,6 +549,10 @@ function readConfigFromUI() {
     micDeviceId:    els.audioInput.value || '',
     outputDeviceId: els.audioOutput.value || '',
     companionApp:   els.companionApp ? els.companionApp.value : '',
+    // 'auto' = automatic VAD on Gemini's side, 'ptt' = client signals activity
+    // via the companion-app global hotkey. The hotkey binding itself is global
+    // (state.pttBinding), not per-session.
+    pttMode:        els.speechMode.value || 'auto',
   };
 }
 
@@ -390,6 +617,196 @@ function removeSessionEmptyState(session) {
   if (!session.transcriptEl) return;
   const empty = session.transcriptEl.querySelector(':scope > .empty-state');
   if (empty) empty.remove();
+}
+
+// ─── Push-to-talk (PTT) ──────────────────────────────────────────────────────
+// PTT inputs are captured in two layers:
+//   - This file owns the UI (toggle, key-capture button) and the per-session
+//     subscription via state.pttClient.
+//   - The companion app exposes /hotkey, installs a low-level keyboard hook,
+//     and emits down/up events even when the page isn't focused.
+//
+// When pttMode === 'ptt' is enabled on a session:
+//   - manualActivity: true is passed to GeminiLiveClient (disables auto VAD).
+//   - sendAudioGated sends silence whenever pttHeld is false.
+//   - Key-down → session.pttHeld = true + activityStart(); audio flows.
+//   - Key-up   → session.pttHeld = false + activityEnd(); silence resumes.
+function vkLabel(binding) {
+  if (!binding || !Number.isFinite(binding.vkCode)) return 'Not set — click to bind';
+  const parts = [];
+  if (binding.ctrl)  parts.push('Ctrl');
+  if (binding.shift) parts.push('Shift');
+  if (binding.alt)   parts.push('Alt');
+  if (binding.win)   parts.push('Win');
+  parts.push(binding.label || keyLabelFromVk(binding.vkCode));
+  return parts.join(' + ');
+}
+
+// Best-effort label for a Windows VK code; covers the keys the user is likely
+// to bind. Used as a fallback when the captured event didn't supply a code.
+function keyLabelFromVk(vk) {
+  if (vk >= 0x30 && vk <= 0x39) return String.fromCharCode(vk);            // 0..9
+  if (vk >= 0x41 && vk <= 0x5A) return String.fromCharCode(vk);            // A..Z
+  if (vk >= 0x70 && vk <= 0x7B) return 'F' + (vk - 0x6F);                  // F1..F12
+  const map = {
+    0x08:'Backspace', 0x09:'Tab', 0x0D:'Enter', 0x10:'Shift', 0x11:'Ctrl',
+    0x12:'Alt', 0x13:'Pause', 0x14:'CapsLock', 0x1B:'Esc', 0x20:'Space',
+    0x21:'PageUp', 0x22:'PageDown', 0x23:'End', 0x24:'Home',
+    0x25:'Left', 0x26:'Up', 0x27:'Right', 0x28:'Down',
+    0x2D:'Insert', 0x2E:'Delete', 0x5B:'Win', 0x5C:'Win',
+    0x90:'NumLock', 0x91:'ScrollLock',
+    0xBA:';', 0xBB:'=', 0xBC:',', 0xBD:'-', 0xBE:'.', 0xBF:'/', 0xC0:'`',
+    0xDB:'[', 0xDC:'\\', 0xDD:']', 0xDE:"'",
+  };
+  return map[vk] || ('VK_' + vk);
+}
+
+// Browser KeyboardEvent.code → human label (mostly mirrors keyLabelFromVk).
+function keyLabelFromCode(code) {
+  let m;
+  if ((m = code.match(/^Key([A-Z])$/)))   return m[1];
+  if ((m = code.match(/^Digit(\d)$/)))    return m[1];
+  if ((m = code.match(/^Numpad(\d)$/)))   return 'Num ' + m[1];
+  if ((m = code.match(/^F(\d+)$/)))       return 'F' + m[1];
+  const map = {
+    Space:'Space', Tab:'Tab', Enter:'Enter', Escape:'Esc', Backspace:'Backspace',
+    ArrowLeft:'Left', ArrowUp:'Up', ArrowRight:'Right', ArrowDown:'Down',
+    Home:'Home', End:'End', PageUp:'PageUp', PageDown:'PageDown',
+    Insert:'Insert', Delete:'Delete', CapsLock:'CapsLock',
+    Backquote:'`', Minus:'-', Equal:'=',
+    BracketLeft:'[', BracketRight:']', Backslash:'\\',
+    Semicolon:';', Quote:"'", Comma:',', Period:'.', Slash:'/',
+    NumpadAdd:'Num +', NumpadSubtract:'Num -', NumpadMultiply:'Num *',
+    NumpadDivide:'Num /', NumpadDecimal:'Num .', NumpadEnter:'Num Enter',
+  };
+  return map[code] || code;
+}
+
+function bindingFromKeyboardEvent(ev) {
+  const vkCode = ev.keyCode || ev.which || 0;
+  if (!vkCode) return null;
+  // Disallow pure modifier keys as the main key — they'd fire on every Ctrl
+  // press and be unusable.
+  if (vkCode === 0x10 || vkCode === 0x11 || vkCode === 0x12 ||
+      vkCode === 0x5B || vkCode === 0x5C) return null;
+  return {
+    vkCode,
+    ctrl:  !!ev.ctrlKey,
+    shift: !!ev.shiftKey,
+    alt:   !!ev.altKey,
+    win:   !!ev.metaKey,
+    label: keyLabelFromCode(ev.code || ''),
+  };
+}
+
+function updatePttButton() {
+  if (!els.pttKeyLabel) return;
+  els.pttKeyLabel.textContent = state.pttCapturing
+    ? 'Press a key…'
+    : vkLabel(state.pttBinding);
+  if (els.btnPttKey) els.btnPttKey.classList.toggle('is-capturing', !!state.pttCapturing);
+  if (els.btnPttClear) {
+    els.btnPttClear.disabled = !state.pttBinding;
+  }
+  if (els.pttHint) {
+    const companionMissing = !state.companionAvailable;
+    if (companionMissing) {
+      els.pttHint.textContent = 'Push-to-talk needs the companion app running. Start it, then refresh.';
+    } else if (!state.pttBinding) {
+      els.pttHint.textContent = 'Click "Not set" and press a key (or key combo) to bind the global hotkey.';
+    } else {
+      els.pttHint.textContent = 'Hotkey works system-wide via the companion app — even when this page is in the background.';
+    }
+  }
+}
+
+// Toggle which sub-section is visible (auto-VAD fields vs PTT fields) and
+// disable the PTT option entirely when the companion app isn't reachable.
+function updateSpeechModeFields() {
+  const companionOk = state.companionAvailable;
+  if (els.speechMode) els.speechMode.setOptionDisabled('ptt', !companionOk);
+
+  // If the user is on PTT but the companion just went away, fall back to auto
+  // and sync the change through onSettingsChange so the active session learns.
+  if (!companionOk && els.speechMode && els.speechMode.value === 'ptt') {
+    els.speechMode.value = 'auto';
+    const session = activeSession();
+    if (session) {
+      session.config.pttMode = 'auto';
+      saveSessions();
+    }
+  }
+
+  const mode = els.speechMode ? els.speechMode.value : 'auto';
+  if (els.vadAutoFields) els.vadAutoFields.style.display = mode === 'ptt' ? 'none' : '';
+  if (els.vadPttFields)  els.vadPttFields.style.display  = mode === 'ptt' ? '' : 'none';
+
+  if (els.speechModeHint) {
+    if (!companionOk) {
+      els.speechModeHint.textContent = 'Push to talk needs the companion app running.';
+    } else if (mode === 'ptt') {
+      els.speechModeHint.textContent = 'Hold the bound key while speaking. Release to let the model translate.';
+    } else {
+      els.speechModeHint.textContent = 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
+    }
+  }
+  updatePttButton();
+}
+
+function beginPttCapture() {
+  if (state.pttCapturing) return;
+  state.pttCapturing = true;
+  updatePttButton();
+  const finish = () => {
+    state.pttCapturing = false;
+    window.removeEventListener('keydown', onKey, true);
+    updatePttButton();
+  };
+  const onKey = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    // Escape cancels capture without binding — gives the user an escape hatch.
+    if (ev.key === 'Escape') { finish(); return; }
+    const binding = bindingFromKeyboardEvent(ev);
+    if (!binding) return;     // modifier-only press; keep waiting
+    finish();
+    state.pttBinding = binding;
+    if (state.pttClient) state.pttClient.setBinding(binding);
+    savePrefs();
+    updatePttButton();
+    log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
+  };
+  // Capture-phase so the keypress doesn't trigger sidebar/sheet shortcuts.
+  window.addEventListener('keydown', onKey, true);
+  // Safety: bail after 6 seconds if the user changed their mind.
+  setTimeout(finish, 6000);
+}
+
+function finishPttCapture(binding) {
+  // Retained for compatibility with earlier callers; the inline capture flow
+  // in beginPttCapture is the live path.
+  state.pttCapturing = false;
+  state.pttBinding = binding;
+  if (state.pttClient) state.pttClient.setBinding(binding);
+  savePrefs();
+  updatePttButton();
+}
+
+function finishPttCapture(binding) {
+  state.pttCapturing = false;
+  state.pttBinding = binding;
+  if (state.pttClient) state.pttClient.setBinding(binding);
+  savePrefs();
+  updatePttButton();
+  log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
+}
+
+function clearPttBinding() {
+  state.pttBinding = null;
+  if (state.pttClient) state.pttClient.clearBinding();
+  savePrefs();
+  updatePttButton();
+  log('info', 'Push-to-talk hotkey cleared.');
 }
 
 // ─── Active session switching ────────────────────────────────────────────────
@@ -481,8 +898,10 @@ function loadSessionConfigIntoUI(session) {
   els.vadPrefix.value = String(cfg.vad.prefixPaddingMs);
   els.vadSilence.value = String(cfg.vad.silenceDurationMs);
   els.vadPreset.value = detectVadPreset();
+  els.speechMode.value = cfg.pttMode === 'ptt' ? 'ptt' : 'auto';
   updateDirVisibility();
   updateCompanionAppVisibility();
+  updateSpeechModeFields();
 }
 
 // Called whenever a settings input changes. Saves the snapshot as global
@@ -502,10 +921,9 @@ function createNewSession({ activate = true } = {}) {
   state.sessions.set(session.id, session);
   createSessionDOM(session);
   saveSessions();
-  if (activate) {
-    state.activeSessionId = null;     // force setActiveSession to apply
-    setActiveSession(session.id);
-  }
+  // The new session has a fresh id, so setActiveSession's early-return won't
+  // fire and the previous session's .is-active class is correctly removed.
+  if (activate) setActiveSession(session.id);
   return session;
 }
 
@@ -579,7 +997,8 @@ function restoreSessionsFromStorage() {
   const wantActive = data.activeId && state.sessions.has(data.activeId)
     ? data.activeId
     : state.sessions.keys().next().value;
-  state.activeSessionId = null;
+  // state.activeSessionId is still null from initial state — setActiveSession
+  // proceeds and activates the chosen session as expected.
   setActiveSession(wantActive);
 }
 
@@ -608,6 +1027,7 @@ function savePrefs() {
       vadPrefix:   els.vadPrefix ? Number(els.vadPrefix.value) : null,
       vadSilence:  els.vadSilence ? Number(els.vadSilence.value) : null,
       uiMode:      state.uiMode || 'simple',
+      pttBinding:  state.pttBinding || null,
     }));
   } catch (_) {}
 }
@@ -700,14 +1120,15 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 500) {
 }
 
 function updateAudioSourceAvailability() {
-  for (const opt of els.audioSource.options) {
-    if (opt.value === 'display') {
-      opt.disabled = !LiveAudio.canCaptureDisplayAudio();
-    } else if (opt.value === 'companion') {
-      opt.disabled = !state.companionAvailable;
-    }
-  }
-  if (els.audioSource.selectedOptions[0]?.disabled) {
+  const displayOk = LiveAudio.canCaptureDisplayAudio();
+  // "both" (Mic + tab audio) uses getDisplayMedia under the hood, so it
+  // requires display-audio capture support, same as "display".
+  els.audioSource.setOptionDisabled('display',   !displayOk);
+  els.audioSource.setOptionDisabled('both',      !displayOk);
+  els.audioSource.setOptionDisabled('companion', !state.companionAvailable);
+
+  const currentBtn = els.audioSource.getOption(els.audioSource.value);
+  if (currentBtn && currentBtn.disabled) {
     els.audioSource.value = 'mic';
   }
 
@@ -738,6 +1159,7 @@ async function detectCompanionService({ silent = true } = {}) {
     if (!silent) log('warn', 'Companion service unavailable: ' + (e && e.message ? e.message : e));
   }
   updateAudioSourceAvailability();
+  updateSpeechModeFields();
   if (state.companionAvailable && els.companionApp) {
     refreshCompanionApps({ silent: true });
   }
@@ -848,6 +1270,10 @@ function fillLanguages() {
   els.modeSelect.value  = prefs.mode   || 'audio';
   els.dirSelect.value   = prefs.dir    || 'bidir';
   state.systemPromptTemplate = prefs.promptTemplate || null;
+  // Restore the global PTT binding (single hotkey shared across sessions).
+  if (prefs.pttBinding && Number.isFinite(prefs.pttBinding.vkCode)) {
+    state.pttBinding = prefs.pttBinding;
+  }
   setUIMode(prefs.uiMode === 'advanced' ? 'advanced' : 'simple');
 
   const urlKey = new URLSearchParams(location.search).get('api');
@@ -1018,7 +1444,12 @@ async function changeAudioOutput() {
 // ─── Per-session capture/player factories ────────────────────────────────────
 function sendAudioGated(session, buf) {
   if (!session.client || session.paused) return;
-  if (session.muteInput) {
+  // In PTT mode we stream real audio only while the bound key is held.
+  // Outside that window, send silence so the WebSocket stays warm but the
+  // model receives no input to act on.
+  const isPtt = session.config && session.config.pttMode === 'ptt';
+  const pttMuted = isPtt && !session.pttHeld;
+  if (session.muteInput || pttMuted) {
     session.client.sendAudio(new ArrayBuffer(buf.byteLength));
   } else {
     session.client.sendAudio(buf);
@@ -1338,11 +1769,16 @@ async function startSession(session) {
     effectivePromptTemplateFor(cfg.mode, cfg.dir),
     langName(cfg.source), langName(cfg.target));
 
+  const isPtt = cfg.pttMode === 'ptt';
+
   session.client = new GeminiLive.GeminiLiveClient({
     apiKey,
     voice: cfg.voice,
     systemInstruction,
     vad: cfg.vad,
+    // manualActivity disables Gemini's auto VAD so we control turn boundaries
+    // via activityStart/activityEnd (sent from the PTT key handlers below).
+    manualActivity: isPtt,
     useOutputTranscription: cfg.mode !== 'transcribe',
     onAudio: isAudio ? (b64) => state.ttsCoordinator.enqueueChunk(session, b64) : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
@@ -1361,6 +1797,26 @@ async function startSession(session) {
     },
     onLog: log,
   });
+
+  // PTT integration: subscribe to global hotkey events. The PttHotkeyClient
+  // fans out down/up to all subscribed sessions; here we translate to
+  // activity signals + the pttHeld flag that gates audio streaming.
+  if (isPtt && state.pttClient) {
+    if (!state.companionAvailable) {
+      log('warn', 'Push-to-talk needs the companion app to be running — the session will receive only silence until you switch to Auto VAD or start it.');
+    } else if (!state.pttBinding) {
+      log('warn', 'Push-to-talk enabled but no hotkey is bound — open Settings → Speech detection to bind a key.');
+    }
+    state.pttClient.subscribe(session.id,
+      () => {
+        session.pttHeld = true;
+        if (session.client) session.client.sendActivityStart();
+      },
+      () => {
+        session.pttHeld = false;
+        if (session.client) session.client.sendActivityEnd();
+      });
+  }
 
   try {
     if (isAudio) await session.player.ensureCtx();
@@ -1427,6 +1883,8 @@ async function stopPipeline() {
 
 async function stopSession(session) {
   state.ttsCoordinator.unregister(session);
+  if (state.pttClient) state.pttClient.unsubscribe(session.id);
+  session.pttHeld = false;
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
   try { session.player && session.player.destroy(); } catch (_) {}
@@ -1456,11 +1914,14 @@ function setControlsLocked(locked) {
   els.btnSwap.disabled       = locked;
   els.modeSelect.disabled    = locked;
   els.dirSelect.disabled     = locked;
+  els.speechMode.disabled    = locked;
   els.vadPreset.disabled     = locked;
   els.vadStart.disabled      = locked;
   els.vadEnd.disabled        = locked;
   els.vadPrefix.disabled     = locked;
   els.vadSilence.disabled    = locked;
+  // PTT key binding is global, not session config — leave it editable when
+  // a session is running so the user can change the hotkey mid-session.
 }
 
 function togglePause() {
@@ -1744,6 +2205,16 @@ function wireUI() {
     updateCompanionAppVisibility();
     onSettingsChange();
   });
+  els.speechMode.addEventListener('change', () => {
+    updateSpeechModeFields();
+    onSettingsChange();
+  });
+  if (els.btnPttKey) {
+    els.btnPttKey.addEventListener('click', beginPttCapture);
+  }
+  if (els.btnPttClear) {
+    els.btnPttClear.addEventListener('click', clearPttBinding);
+  }
   if (els.companionApp) {
     els.companionApp.addEventListener('change', () => {
       els.companionApp.dataset.preferred = els.companionApp.value;
@@ -1871,9 +2342,17 @@ function checkSupport() {
 document.addEventListener('DOMContentLoaded', () => {
   fillLanguages();
   wireUI();
+  // Construct the PTT client up front so subscribe() works the moment a PTT
+  // session starts. Apply any saved binding immediately; if no session is
+  // active yet, the client stays disconnected until subscribe() arrives.
+  state.pttClient = new PttHotkeyClient({ wsUrl: COMPANION_PTT_URL });
+  if (state.pttBinding) state.pttClient.setBinding(state.pttBinding);
+  state.pttClient.onAvailabilityChange = () => updatePttButton();
   restoreSessionsFromStorage();
   detectCompanionService();
   refreshAudioInputDevices();
   refreshAudioOutputDevices();
+  updateSpeechModeFields();
+  updatePttButton();
   if (checkSupport()) log('info', 'Ready.');
 });

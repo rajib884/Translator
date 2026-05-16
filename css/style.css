@@ -75,7 +75,7 @@ a:hover { text-decoration: underline; }
 .status { display: flex; align-items: center; gap: 8px; }
 .age { font-size: 11px; color: var(--fg-1); background: var(--bg-3); padding: 4px 8px; border-radius: 6px; }
 
-/* Simple/Advanced toggle */
+/* Simple/Advanced toggle — compact, inline-fit version of .segmented */
 .mode-switch {
   display: inline-flex;
   background: var(--bg-3);
@@ -101,6 +101,65 @@ a:hover { text-decoration: underline; }
 }
 @media (max-width: 480px) {
   .mode-opt { padding: 5px 8px; font-size: 10px; }
+}
+
+/* Generic segmented control for form fields (mode/dir/audio source/VAD sensitivity).
+   Fills the field width; options share the row equally; long labels ellipsise. */
+.segmented {
+  display: flex;
+  background: var(--bg-3);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 0;
+  width: 100%;
+  min-height: 40px;
+}
+.segmented.seg-wrap { flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-sm); }
+.seg-opt {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 8px 8px;
+  font-size: 12px; font-weight: 600;
+  color: var(--fg-2);
+  border-radius: 999px;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.segmented.seg-wrap .seg-opt { border-radius: var(--radius-sm); flex-basis: 0; }
+.seg-opt:hover:not(:disabled) { color: var(--fg-1); }
+.seg-opt.is-active {
+  background: var(--bg-1);
+  color: var(--fg-0);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.seg-opt:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  color: var(--fg-2);
+}
+.segmented.is-locked { pointer-events: none; opacity: 0.6; }
+
+/* Wide-enough screens get a roomier VAD grid (segmented controls breathe). */
+.vad-grid { gap: 10px 12px; }
+
+/* Push-to-talk hotkey button (mono, fixed-width look). */
+.ptt-key-btn {
+  justify-content: flex-start !important;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px !important;
+  flex: 1 1 auto;
+}
+.ptt-key-btn.is-capturing {
+  background: rgba(124, 156, 255, 0.12) !important;
+  color: var(--accent) !important;
+  border-color: rgba(124, 156, 255, 0.4) !important;
+  animation: pulse 1s infinite;
 }
 
 /* Simple mode hides anything tagged advanced-only and the tab strip */

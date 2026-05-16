@@ -11,9 +11,34 @@ This service exposes:
   - No `pid` → default render-device loopback (everything you hear).
   - `pid=N`  → per-app loopback for that process **and its child processes**
     (handy for Chrome/Edge/Discord/etc., which spawn many helpers).
+- `GET /hotkey` WebSocket on `ws://127.0.0.1:52341/hotkey` — global keyboard
+  hook for push-to-talk. The web client sends a JSON bind message, the
+  companion installs a low-level hook (works system-wide, even when the page
+  is in the background), and forwards key-down / key-up events back as JSON.
 
-The WebSocket streams mono 16 kHz signed PCM16 frames, matching what the web app
-already sends to Gemini.
+The `/audio` WebSocket streams mono 16 kHz signed PCM16 frames, matching what
+the web app already sends to Gemini.
+
+### Push-to-talk wire format
+
+Client → companion (JSON text frames):
+
+```jsonc
+{ "action": "bind", "vkCode": 32, "ctrl": false, "shift": false, "alt": false, "win": false }
+{ "action": "unbind" }
+```
+
+`vkCode` is a Windows virtual-key code (e.g. `32` = Space, `0x70` = F1).
+Modifier flags describe what must be held alongside the main key on press.
+
+Companion → client (JSON text frames):
+
+```jsonc
+{ "event": "down" }   // bound combo just became pressed
+{ "event": "up" }     // bound key just released
+```
+
+Only one binding per connection; multiple connections each maintain their own.
 
 ## Build
 

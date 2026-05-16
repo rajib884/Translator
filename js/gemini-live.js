@@ -74,6 +74,9 @@ class GeminiLiveClient {
     this.systemInstruction = opts.systemInstruction || '';
     this.useOutputTranscription = opts.useOutputTranscription !== false;
     this.vad = opts.vad || null;  // { startSensitivity, endSensitivity, prefixPaddingMs, silenceDurationMs }
+    // When true, Gemini's auto VAD is disabled; the client must signal turn
+    // boundaries via sendActivityStart / sendActivityEnd. Used by push-to-talk.
+    this.manualActivity = !!opts.manualActivity;
 
     this.onAudio = opts.onAudio || (() => {});
     this.onInputChunk = opts.onInputChunk || (() => {});
@@ -157,7 +160,9 @@ class GeminiLiveClient {
         systemInstruction: { parts: [{ text: this.systemInstruction }] },
         inputAudioTranscription: {},
         realtimeInputConfig: {
-          automaticActivityDetection: {
+          // Manual mode disables server-side VAD; we send activityStart /
+          // activityEnd ourselves. Otherwise we configure auto detection.
+          automaticActivityDetection: this.manualActivity ? { disabled: true } : {
             startOfSpeechSensitivity: `START_SENSITIVITY_${(this.vad && this.vad.startSensitivity) || 'HIGH'}`,
             endOfSpeechSensitivity:   `END_SENSITIVITY_${(this.vad && this.vad.endSensitivity) || 'LOW'}`,
             prefixPaddingMs:   this.vad && Number.isFinite(this.vad.prefixPaddingMs)   ? this.vad.prefixPaddingMs   : 200,
@@ -267,6 +272,20 @@ class GeminiLiveClient {
         audio: { data: b64, mimeType: 'audio/pcm;rate=16000' },
       },
     }));
+  }
+
+  // Manual activity signals — only valid when manualActivity (auto VAD off)
+  // was passed to the constructor. Bracket each PTT key-down/key-up press.
+  sendActivityStart() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this._setupComplete) return;
+    this.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+  }
+
+  sendActivityEnd() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this._setupComplete) return;
+    this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
   }
 }
 
