@@ -126,10 +126,147 @@ class Session {
   get isAudio() { return this.config.mode === 'audio'; }
 }
 
+// ─── TTS coordinator ─────────────────────────────────────────────────────────
+// Sessions translate concurrently but must not all speak at once. This owns a
+// global "who is speaking" slot and a queue. While a session is queued or
+// actively speaking, its capture is gated to silence so the model doesn't pick
+// up another turn from real audio (and doesn't loop back its own output).
+//
+// Lifecycle per turn:
+//   1. Session's first onAudio chunk → mark wantsToSpeak, gate input to silence,
+//      requestSpeak. If nobody is speaking, become speaker; else queue + buffer.
+//   2. Subsequent chunks during the same turn route to player or buffer based
+//      on whether we're the current speaker.
+//   3. Model fires onTurnComplete → markTurnComplete. If we're the speaker and
+//      the player has drained, finishSpeaking; else wait for player drain.
+//   4. finishSpeaking → ungate input, drop currentSpeaker, drain queue.
+class TTSCoordinator {
+  constructor() {
+    this.currentSpeakerId = null;
+    this.queue = [];                 // session ids waiting in FIFO order
+    this.entries = new Map();        // id -> { session, player, buffered, wantsToSpeak, turnComplete }
+  }
+
+  register(session, player) {
+    if (!player) return;
+    const entry = {
+      session,
+      player,
+      buffered: [],
+      wantsToSpeak: false,
+      turnComplete: false,
+    };
+    this.entries.set(session.id, entry);
+
+    // Wrap onActiveChange so we observe "player just drained" without stealing
+    // the existing handler (which updates the status pill).
+    const userOnActive = player.onActiveChange;
+    player.onActiveChange = (active) => {
+      if (userOnActive) { try { userOnActive(active); } catch (_) {} }
+      if (!active && this.currentSpeakerId === session.id) {
+        this._maybeFinishSpeaking(session.id);
+      }
+    };
+  }
+
+  unregister(session) {
+    const id = session.id;
+    this.entries.delete(id);
+    this.queue = this.queue.filter((sid) => sid !== id);
+    if (this.currentSpeakerId === id) {
+      this.currentSpeakerId = null;
+      this._tryStartNext();
+    }
+    session.muteInput = false;
+  }
+
+  enqueueChunk(session, b64) {
+    const entry = this.entries.get(session.id);
+    if (!entry) return;
+    if (!entry.wantsToSpeak) {
+      entry.wantsToSpeak = true;
+      entry.turnComplete = false;
+      session.muteInput = true;
+      this._requestSpeak(session.id);
+    }
+    if (this.currentSpeakerId === session.id) {
+      entry.player.playChunk(b64);
+    } else {
+      entry.buffered.push(b64);
+    }
+  }
+
+  markTurnComplete(session) {
+    const entry = this.entries.get(session.id);
+    if (!entry || !entry.wantsToSpeak) return;
+    entry.turnComplete = true;
+    if (this.currentSpeakerId === session.id) {
+      this._maybeFinishSpeaking(session.id);
+    }
+  }
+
+  // Hush: drop current playback + any buffered chunks for this session, release
+  // its slot in the queue/speaker, ungate input. Other sessions are untouched.
+  hush(session) {
+    const entry = this.entries.get(session.id);
+    if (!entry) return;
+    try { entry.player.hush(); } catch (_) {}
+    entry.buffered.length = 0;
+    entry.wantsToSpeak = false;
+    entry.turnComplete = false;
+    session.muteInput = false;
+    if (this.currentSpeakerId === session.id) {
+      this.currentSpeakerId = null;
+      this._tryStartNext();
+    } else {
+      this.queue = this.queue.filter((sid) => sid !== session.id);
+    }
+  }
+
+  _requestSpeak(sessionId) {
+    if (!this.currentSpeakerId) {
+      this.currentSpeakerId = sessionId;
+    } else if (!this.queue.includes(sessionId)) {
+      this.queue.push(sessionId);
+    }
+  }
+
+  _maybeFinishSpeaking(sessionId) {
+    const entry = this.entries.get(sessionId);
+    if (!entry || !entry.turnComplete) return;
+    if (entry.player.isActive()) return;
+    entry.wantsToSpeak = false;
+    entry.turnComplete = false;
+    entry.session.muteInput = false;
+    this.currentSpeakerId = null;
+    this._tryStartNext();
+  }
+
+  _tryStartNext() {
+    if (this.currentSpeakerId) return;
+    while (this.queue.length) {
+      const nextId = this.queue.shift();
+      const entry = this.entries.get(nextId);
+      if (!entry) continue;
+      this.currentSpeakerId = nextId;
+      const buf = entry.buffered;
+      entry.buffered = [];
+      for (const b64 of buf) entry.player.playChunk(b64);
+      // If the buffered chunks drain immediately AND the model already
+      // signalled turn complete while we were queued, settle the slot.
+      if (entry.turnComplete) this._maybeFinishSpeaking(nextId);
+      return;
+    }
+  }
+}
+
 const state = {
   // Sessions live here. activeSessionId names the one whose state drives the chrome.
   sessions: new Map(),
   activeSessionId: null,
+
+  // Global TTS speak queue across all sessions.
+  ttsCoordinator: new TTSCoordinator(),
 
   // Truly global UI state.
   pip: null,
@@ -631,11 +768,23 @@ async function changeAudioOutput() {
 }
 
 // ─── Per-session capture/player factories ────────────────────────────────────
+// While session.muteInput is true (set by the TTS coordinator while the
+// session is queued or speaking) we still send buffers — same size, same
+// cadence — but zero-filled. This keeps the realtime stream alive without
+// feeding the model real audio that could trigger another turn or loop back
+// the model's own TTS output.
+function sendAudioGated(session, buf) {
+  if (!session.client || session.paused) return;
+  if (session.muteInput) {
+    session.client.sendAudio(new ArrayBuffer(buf.byteLength));
+  } else {
+    session.client.sendAudio(buf);
+  }
+}
+
 function createAudioCapture(session) {
   return new LiveAudio.AudioCapture({
-    onChunk: (buf) => {
-      if (!session.paused && session.client) session.client.sendAudio(buf);
-    },
+    onChunk: (buf) => sendAudioGated(session, buf),
     onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
       log('warn', 'App audio share ended by the browser.');
@@ -646,9 +795,7 @@ function createAudioCapture(session) {
 
 function createCompanionCapture(session) {
   return new LiveAudio.CompanionAudioCapture({
-    onChunk: (buf) => {
-      if (!session.paused && session.client) session.client.sendAudio(buf);
-    },
+    onChunk: (buf) => sendAudioGated(session, buf),
     onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
       if (!session.running) return;
@@ -913,6 +1060,7 @@ async function startSession(session) {
         }
       },
     });
+    state.ttsCoordinator.register(session, session.player);
   } else {
     session.player = null;
   }
@@ -931,10 +1079,13 @@ async function startSession(session) {
     // text mode  — the ONLY way to get text output (native audio model doesn't support TEXT modality)
     // transcribe mode — no model output needed, only inputAudioTranscription matters
     useOutputTranscription: cfg.mode !== 'transcribe',
-    onAudio: isAudio ? (b64) => { if (session.player) session.player.playChunk(b64); } : () => {},
+    onAudio: isAudio ? (b64) => state.ttsCoordinator.enqueueChunk(session, b64) : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
     onOutputChunk: cfg.mode !== 'transcribe' ? (chunk) => appendOutputFor(session, chunk) : () => {},
-    onTurnComplete: () => finalizeTurn(session),
+    onTurnComplete: () => {
+      if (isAudio) state.ttsCoordinator.markTurnComplete(session);
+      finalizeTurn(session);
+    },
     onState: (s) => {
       if (s === 'connected') {
         setSessionStatus(session,
@@ -1016,6 +1167,9 @@ async function stopPipeline() {
 }
 
 async function stopSession(session) {
+  // Release the speak queue slot first so a queued session can take over
+  // immediately, even before this session's player finishes destroy().
+  state.ttsCoordinator.unregister(session);
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
   try { session.player && session.player.destroy(); } catch (_) {}
@@ -1064,7 +1218,7 @@ function togglePause() {
   session.paused = !session.paused;
   els.btnPause.classList.toggle('is-paused', session.paused);
   els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
-  if (session.paused && session.player) session.player.hush();
+  if (session.paused) state.ttsCoordinator.hush(session);
   log('info', session.paused ? 'Mic paused.' : 'Mic resumed.');
 }
 
@@ -1334,7 +1488,7 @@ function wireUI() {
   els.btnPause.addEventListener('click', togglePause);
   els.btnHush.addEventListener('click', () => {
     const session = activeSession();
-    if (session && session.player) session.player.hush();
+    if (session) state.ttsCoordinator.hush(session);
     log('info', 'Playback hushed');
   });
   els.btnClear.addEventListener('click', clearConversation);
