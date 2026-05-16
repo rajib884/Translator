@@ -92,6 +92,79 @@ a:hover { text-decoration: underline; }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
+/* ─── Tab strip ─── */
+.tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  padding: 6px 8px 0;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-soft);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  height: 45px;
+}
+.tabs::-webkit-scrollbar { height: 4px; }
+.tabs::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 2px; }
+.tab-list {
+  display: flex; align-items: stretch;
+  gap: 4px;
+  flex: 1 1 auto; min-width: 0;
+}
+.tab-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 6px 7px 10px;
+  background: var(--bg-2);
+  color: var(--fg-1);
+  border: 1px solid var(--line-soft);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  font-size: 12px; font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+  flex: 0 0 auto;
+  position: relative; bottom: -1px;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tab-chip:hover { background: var(--bg-3); color: var(--fg-0); }
+.tab-chip.is-active {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border-color: var(--line-soft);
+}
+.tab-status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--fg-2); flex: 0 0 auto;
+}
+.tab-chip[data-status="connecting"]   .tab-status-dot,
+.tab-chip[data-status="reconnecting"] .tab-status-dot { background: var(--warn); animation: pulse 1.2s infinite; }
+.tab-chip[data-status="connected"]    .tab-status-dot { background: var(--good); animation: pulse 1.6s infinite; }
+.tab-chip[data-status="translating"]  .tab-status-dot { background: var(--accent); animation: pulse 0.8s infinite; }
+.tab-chip[data-status="error"]        .tab-status-dot { background: var(--bad); }
+.tab-label { line-height: 1; letter-spacing: 0.4px; }
+.tab-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  font-size: 16px; line-height: 1;
+  color: var(--fg-2);
+  margin-left: 2px;
+}
+.tab-close:hover { background: var(--bg-3); color: var(--fg-0); }
+.tab-new {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px;
+  background: var(--bg-2);
+  color: var(--fg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  align-self: center;
+  flex: 0 0 auto;
+}
+.tab-new:hover { background: var(--bg-3); color: var(--fg-0); }
+.tab-new .icon { width: 14px; height: 14px; }
+
 /* ─── Meter row ─── */
 .meter-row {
   flex: 0 0 auto;
@@ -114,13 +187,20 @@ a:hover { text-decoration: underline; }
   display: flex; flex-direction: column;
   background: var(--bg-0);
 }
-.turns {
+.turns-host {
+  flex: 1 1 auto; min-height: 0;
+  display: flex;
+  position: relative;
+}
+.session-turns {
   flex: 1 1 auto; min-height: 0;
   overflow-y: auto;
   padding: 12px;
-  display: flex; flex-direction: column; gap: 10px;
+  display: none; flex-direction: column; gap: 10px;
   scroll-behavior: smooth;
+  width: 100%;
 }
+.session-turns.is-active { display: flex; }
 
 .empty-state {
   margin: auto; text-align: center; color: var(--fg-2);
@@ -383,9 +463,10 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   body {
     display: grid;
     grid-template-columns: var(--sidebar-w) 1fr;
-    grid-template-rows: auto auto 1fr auto;
+    grid-template-rows: auto auto auto 1fr auto;
     grid-template-areas:
       "sidebar topbar"
+      "sidebar tabs"
       "sidebar meter"
       "sidebar conv"
       "sidebar controls";
@@ -393,6 +474,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   }
 
   .topbar    { grid-area: topbar; }
+  .tabs      { grid-area: tabs; }
   .meter-row { grid-area: meter; }
   .conv      { grid-area: conv; }
   .controls  { grid-area: controls; }
@@ -444,8 +526,13 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   .controls .btn.primary { min-width: 160px; }
   .controls #btn-pip-quick { margin-left: auto; }
 
+  /* Tab strip — roomier on desktop */
+  .tabs { padding: 8px 22px 0; gap: 6px; }
+  .tab-chip { padding: 8px 8px 9px 12px; font-size: 13px; }
+  .tab-new { width: 32px; height: 32px; }
+
   /* Two-column turns on wide screens */
-  .turns { padding: 18px; gap: 12px; }
+  .session-turns { padding: 18px; gap: 12px; }
   .turn {
     display: grid;
     grid-template-columns: 1fr 1fr;

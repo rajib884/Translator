@@ -1,11 +1,11 @@
 // UI glue + lifecycle. Mobile-first; the same DOM becomes a desktop sidebar via CSS.
 //
 // Session model: every translation pipeline (client + audio capture + TTS player +
-// transcript + status + config snapshot) lives inside a Session object. The UI
-// currently shows exactly one session at a time — `state.activeSessionId` selects
-// which one drives the chrome (status pill, meters, transcript, PiP). Multi-session
-// UI lands in a later phase; this file already routes per-session so that change
-// is purely additive.
+// transcript + status + config snapshot) lives inside a Session object. Each
+// session owns its own tab chip and transcript DOM; the chrome (status pill,
+// meters, age, control bar, settings panel) reflects whichever session is
+// currently `state.activeSessionId`. A global TTSCoordinator serializes TTS
+// playback across all running sessions.
 
 const LANGUAGES = [
   ['en', 'English'],
@@ -24,6 +24,7 @@ const LANGUAGES = [
 const MAX_TURNS = 50;
 const MAX_LOG = 200;
 const STORAGE_KEY = 'live-translator-prefs';
+const SESSIONS_KEY = 'live-translator-sessions';
 
 // Voice-activity-detection presets. Hand-tuned for translation use: the model
 // shouldn't jump in mid-sentence, so we lean towards LOW end-sensitivity and
@@ -77,30 +78,27 @@ const els = {
   btnSavePrompt: $('btn-save-prompt'),
   btnResetPrompt:$('btn-reset-prompt'),
   promptText:    $('prompt-text'),
-  openFromEmpty: $('open-settings-from-empty'),
   sidebar:       $('sidebar'),
   promptSheet:   $('prompt-sheet'),
   logSheet:      $('log-sheet'),
   statusPill:    $('status-pill'),
   statusText:    $('status-text'),
   sessionAge:    $('session-age'),
-  turns:         $('turns'),
-  emptyState:    $('empty-state'),
+  tabList:       $('tab-list'),
+  btnNewSession: $('btn-new-session'),
+  turnsHost:     $('turns-host'),
   micMeter:      $('mic-meter'),
   outMeter:      $('out-meter'),
   log:           $('log'),
 };
 
 // ─── Session ─────────────────────────────────────────────────────────────────
-// Pure container — no DOM, no I/O. Created from a UI snapshot, mutated by the
-// pipeline lifecycle. Multiple of these will coexist in Phase 3; for now there
-// is exactly one and it is always the "active" one.
 class Session {
   constructor({ id, config }) {
     this.id = id;
-    this.config = config;          // snapshot taken at create time
+    this.config = config;          // snapshot, mutable while idle
 
-    // Runtime objects, allocated by startPipeline, torn down by stopPipeline.
+    // Runtime objects, allocated by startSession, torn down by stopSession.
     this.client = null;            // GeminiLiveClient
     this.capture = null;           // AudioCapture | CompanionAudioCapture
     this.player = null;            // TTSPlayer | null (text/transcribe modes)
@@ -117,10 +115,14 @@ class Session {
     this.ageTimer = 0;
 
     // Live transcript bookkeeping.
-    this.liveTurn = null;          // { root, inputEl, outputEl, ... }
+    this.liveTurn = null;
     this.pendingInput = '';
     this.pendingOutput = '';
     this.pendingScheduled = false;
+
+    // DOM owned by this session.
+    this.tabEl = null;             // .tab-chip
+    this.transcriptEl = null;      // .session-turns
   }
 
   get isAudio() { return this.config.mode === 'audio'; }
@@ -131,15 +133,6 @@ class Session {
 // global "who is speaking" slot and a queue. While a session is queued or
 // actively speaking, its capture is gated to silence so the model doesn't pick
 // up another turn from real audio (and doesn't loop back its own output).
-//
-// Lifecycle per turn:
-//   1. Session's first onAudio chunk → mark wantsToSpeak, gate input to silence,
-//      requestSpeak. If nobody is speaking, become speaker; else queue + buffer.
-//   2. Subsequent chunks during the same turn route to player or buffer based
-//      on whether we're the current speaker.
-//   3. Model fires onTurnComplete → markTurnComplete. If we're the speaker and
-//      the player has drained, finishSpeaking; else wait for player drain.
-//   4. finishSpeaking → ungate input, drop currentSpeaker, drain queue.
 class TTSCoordinator {
   constructor() {
     this.currentSpeakerId = null;
@@ -158,8 +151,6 @@ class TTSCoordinator {
     };
     this.entries.set(session.id, entry);
 
-    // Wrap onActiveChange so we observe "player just drained" without stealing
-    // the existing handler (which updates the status pill).
     const userOnActive = player.onActiveChange;
     player.onActiveChange = (active) => {
       if (userOnActive) { try { userOnActive(active); } catch (_) {} }
@@ -205,8 +196,6 @@ class TTSCoordinator {
     }
   }
 
-  // Hush: drop current playback + any buffered chunks for this session, release
-  // its slot in the queue/speaker, ungate input. Other sessions are untouched.
   hush(session) {
     const entry = this.entries.get(session.id);
     if (!entry) return;
@@ -252,8 +241,6 @@ class TTSCoordinator {
       const buf = entry.buffered;
       entry.buffered = [];
       for (const b64 of buf) entry.player.playChunk(b64);
-      // If the buffered chunks drain immediately AND the model already
-      // signalled turn complete while we were queued, settle the slot.
       if (entry.turnComplete) this._maybeFinishSpeaking(nextId);
       return;
     }
@@ -261,19 +248,14 @@ class TTSCoordinator {
 }
 
 const state = {
-  // Sessions live here. activeSessionId names the one whose state drives the chrome.
   sessions: new Map(),
   activeSessionId: null,
-
-  // Global TTS speak queue across all sessions.
   ttsCoordinator: new TTSCoordinator(),
 
   // Truly global UI state.
   pip: null,
   systemPromptTemplate: null,
   companionAvailable: false,
-  // List of {pid, name, displayName} returned by the companion /apps endpoint.
-  // Refreshed when the companion service is detected or the user clicks ↻.
   companionApps: [],
 };
 
@@ -285,9 +267,6 @@ function isActive(session) {
   return !!session && session.id === state.activeSessionId;
 }
 
-// Snapshot the current Settings panel into a plain config object. This is what
-// a Session is created from; the session then owns its config independently of
-// further UI edits (which only matter at the next Start).
 function readConfigFromUI() {
   return {
     source: els.langSource.value,
@@ -307,16 +286,223 @@ function newSessionId() {
   return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
-function ensureActiveSession() {
-  let s = activeSession();
-  if (s) return s;
-  s = new Session({ id: newSessionId(), config: readConfigFromUI() });
-  state.sessions.set(s.id, s);
-  state.activeSessionId = s.id;
-  return s;
+// ─── Per-session DOM ─────────────────────────────────────────────────────────
+function createSessionDOM(session) {
+  const chip = document.createElement('div');
+  chip.className = 'tab-chip';
+  chip.dataset.sessionId = session.id;
+  chip.dataset.status = session.status;
+  chip.setAttribute('role', 'tab');
+  chip.innerHTML =
+    '<span class="tab-status-dot" aria-hidden="true"></span>' +
+    '<span class="tab-label"></span>' +
+    '<span class="tab-close" role="button" aria-label="Close session" title="Close session">×</span>';
+  els.tabList.appendChild(chip);
+  session.tabEl = chip;
+  updateTabChip(session);
+
+  const turns = document.createElement('div');
+  turns.className = 'session-turns';
+  turns.dataset.sessionId = session.id;
+  els.turnsHost.appendChild(turns);
+  session.transcriptEl = turns;
+  renderSessionEmptyState(session);
 }
 
-// ─── Prefs ────────────────────────────────────────────────────────────────────
+function updateTabChip(session) {
+  if (!session.tabEl) return;
+  const cfg = session.config;
+  const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
+  const label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
+  const labelEl = session.tabEl.querySelector('.tab-label');
+  if (labelEl) labelEl.textContent = label;
+  session.tabEl.dataset.status = session.status;
+  session.tabEl.title = `${langName(cfg.source)} → ${langName(cfg.target)}`;
+}
+
+function renderSessionEmptyState(session) {
+  if (!session.transcriptEl) return;
+  session.transcriptEl.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.className = 'empty-state';
+  empty.innerHTML =
+    '<div class="empty-icon" aria-hidden="true">' +
+      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+        '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>' +
+        '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>' +
+        '<line x1="12" y1="19" x2="12" y2="23"/>' +
+        '<line x1="8" y1="23" x2="16" y2="23"/>' +
+      '</svg>' +
+    '</div>' +
+    '<p>Press <strong>Start</strong> and speak.<br/>Your words appear on one side, the translation on the other.</p>' +
+    '<p class="hint">First, open <button class="link-btn" data-empty-action="open-settings" type="button">Settings</button> and paste your Gemini API key.</p>';
+  session.transcriptEl.appendChild(empty);
+}
+
+function removeSessionEmptyState(session) {
+  if (!session.transcriptEl) return;
+  const empty = session.transcriptEl.querySelector(':scope > .empty-state');
+  if (empty) empty.remove();
+}
+
+// ─── Active session switching ────────────────────────────────────────────────
+function setActiveSession(id) {
+  if (!state.sessions.has(id)) return;
+  if (state.activeSessionId === id) return;
+
+  const prev = activeSession();
+  if (prev) {
+    if (prev.tabEl) prev.tabEl.classList.remove('is-active');
+    if (prev.transcriptEl) prev.transcriptEl.classList.remove('is-active');
+  }
+  state.activeSessionId = id;
+  const next = state.sessions.get(id);
+  if (next.tabEl) next.tabEl.classList.add('is-active');
+  if (next.transcriptEl) next.transcriptEl.classList.add('is-active');
+
+  loadSessionConfigIntoUI(next);
+  applySessionStatusToChrome(next);
+  applyControlButtonsForActiveSession();
+  els.sessionAge.textContent = next.startedAt
+    ? fmtDuration(Date.now() - next.startedAt)
+    : '00:00';
+  // Meters reset on switch — they'll re-fill from the new session's level
+  // callbacks on the next audio frame.
+  setMeter(els.micMeter, 0);
+  setMeter(els.outMeter, 0);
+
+  saveSessions();
+}
+
+function loadSessionConfigIntoUI(session) {
+  const cfg = session.config;
+  els.langSource.value = cfg.source;
+  els.langTarget.value = cfg.target;
+  els.voice.value = cfg.voice;
+  els.modeSelect.value = cfg.mode;
+  els.dirSelect.value = cfg.dir;
+  els.audioSource.value = cfg.audioSource;
+  // dataset.preferred is what refreshAudioInputDevices/OutputDevices fall back
+  // to when the saved deviceId isn't in the current device list yet (devices
+  // can take a moment to enumerate). Without this, an async refresh after a
+  // tab switch would reset the dropdown to the global pref rather than the
+  // active session's preference.
+  els.audioInput.value = cfg.micDeviceId;
+  els.audioInput.dataset.preferred = cfg.micDeviceId;
+  els.audioOutput.value = cfg.outputDeviceId;
+  els.audioOutput.dataset.preferred = cfg.outputDeviceId;
+  if (els.companionApp) {
+    els.companionApp.value = cfg.companionApp || '';
+    els.companionApp.dataset.preferred = cfg.companionApp || '';
+  }
+  els.vadStart.value = cfg.vad.startSensitivity;
+  els.vadEnd.value = cfg.vad.endSensitivity;
+  els.vadPrefix.value = String(cfg.vad.prefixPaddingMs);
+  els.vadSilence.value = String(cfg.vad.silenceDurationMs);
+  els.vadPreset.value = detectVadPreset();
+  updateDirVisibility();
+  updateCompanionAppVisibility();
+}
+
+// Called whenever a settings input changes. Saves the snapshot as global
+// "default for new sessions" prefs, and writes through to the active session's
+// config so it picks up the change at the next Start.
+function onSettingsChange() {
+  savePrefs();
+  const session = activeSession();
+  if (!session) return;
+  session.config = readConfigFromUI();
+  updateTabChip(session);
+  saveSessions();
+}
+
+function createNewSession({ activate = true } = {}) {
+  const session = new Session({ id: newSessionId(), config: readConfigFromUI() });
+  state.sessions.set(session.id, session);
+  createSessionDOM(session);
+  saveSessions();
+  if (activate) {
+    state.activeSessionId = null;     // force setActiveSession to apply
+    setActiveSession(session.id);
+  }
+  return session;
+}
+
+async function closeSession(session) {
+  if (!session) return;
+  if (session.running) {
+    if (!window.confirm('This session is running. Stop it and remove?')) return;
+    await stopSession(session);
+  }
+  if (session.tabEl) session.tabEl.remove();
+  if (session.transcriptEl) session.transcriptEl.remove();
+  state.sessions.delete(session.id);
+
+  if (state.activeSessionId === session.id) {
+    state.activeSessionId = null;
+    const next = state.sessions.values().next().value;
+    if (next) {
+      setActiveSession(next.id);
+    } else {
+      // No sessions left — create a fresh default from current UI state.
+      createNewSession({ activate: true });
+    }
+  } else {
+    saveSessions();
+  }
+}
+
+// ─── Persistence (sessions) ──────────────────────────────────────────────────
+function saveSessions() {
+  try {
+    const arr = [...state.sessions.values()].map((s) => ({
+      id: s.id,
+      config: s.config,
+    }));
+    localStorage.setItem(SESSIONS_KEY, JSON.stringify({
+      sessions: arr,
+      activeId: state.activeSessionId,
+    }));
+  } catch (_) {}
+}
+
+function loadSavedSessions() {
+  try {
+    const raw = localStorage.getItem(SESSIONS_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.sessions)) return null;
+    return data;
+  } catch (_) { return null; }
+}
+
+function restoreSessionsFromStorage() {
+  const data = loadSavedSessions();
+  if (!data || data.sessions.length === 0) {
+    createNewSession({ activate: true });
+    return;
+  }
+  // Use the current UI snapshot as a fallback for any missing config fields,
+  // then overlay the saved per-session config.
+  const fallback = readConfigFromUI();
+  for (const entry of data.sessions) {
+    const cfg = Object.assign({}, fallback, entry.config || {});
+    cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+    const session = new Session({
+      id: entry.id || newSessionId(),
+      config: cfg,
+    });
+    state.sessions.set(session.id, session);
+    createSessionDOM(session);
+  }
+  const wantActive = data.activeId && state.sessions.has(data.activeId)
+    ? data.activeId
+    : state.sessions.keys().next().value;
+  state.activeSessionId = null;
+  setActiveSession(wantActive);
+}
+
+// ─── Prefs (global UI defaults) ──────────────────────────────────────────────
 function loadPrefs() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
   catch (_) { return {}; }
@@ -334,7 +520,6 @@ function savePrefs() {
       mode:   els.modeSelect.value,
       dir:    els.dirSelect.value,
       promptTemplate: state.systemPromptTemplate || '',
-      // Persist the exe name, not the pid — pids change between runs.
       companionApp: els.companionApp ? els.companionApp.value : '',
       vadPreset:   els.vadPreset ? els.vadPreset.value : DEFAULT_VAD_PRESET,
       vadStart:    els.vadStart ? els.vadStart.value : '',
@@ -351,9 +536,6 @@ function langName(code) {
 }
 
 // ─── System prompt resolution ────────────────────────────────────────────────
-// One custom slot. Mode/Direction supply defaults. A saved template that
-// matches any built-in template is treated as "not customised" so users can
-// switch modes without their old default-text overriding the new default.
 function isBuiltinPromptTemplate(t) {
   return t === GeminiLive.DEFAULT_SYSTEM_PROMPT_TEMPLATE ||
          t === GeminiLive.ONE_WAY_SYSTEM_PROMPT_TEMPLATE ||
@@ -366,7 +548,6 @@ function modeDefaultTemplate(mode, dir) {
   return GeminiLive.DEFAULT_SYSTEM_PROMPT_TEMPLATE;
 }
 
-// Resolve for a given mode/dir; uses the (currently global) custom template if set.
 function effectivePromptTemplateFor(mode, dir) {
   const custom = state.systemPromptTemplate;
   if (custom && !isBuiltinPromptTemplate(custom)) return custom;
@@ -389,9 +570,6 @@ function updateDirVisibility() {
 }
 
 // ─── VAD preset / advanced fields ────────────────────────────────────────────
-// The preset dropdown drives the 4 detail fields. Touching any detail field
-// flips the preset to "custom" so the user sees that they've deviated. On
-// Start we read whatever the detail fields say — preset is just a shortcut.
 function applyVadPreset(name) {
   const preset = VAD_PRESETS[name];
   if (!preset) return;
@@ -402,7 +580,6 @@ function applyVadPreset(name) {
 }
 
 function currentVadConfig() {
-  // Clamp into a sensible range so a typo doesn't break the session.
   const prefix = Math.max(0, Math.min(2000, Number(els.vadPrefix.value) || 0));
   const silence = Math.max(100, Math.min(5000, Number(els.vadSilence.value) || 800));
   return {
@@ -480,7 +657,6 @@ async function detectCompanionService({ silent = true } = {}) {
   }
   updateAudioSourceAvailability();
   if (state.companionAvailable && els.companionApp) {
-    // Don't block detection on this; just trigger a background fetch.
     refreshCompanionApps({ silent: true });
   }
   return state.companionAvailable;
@@ -501,7 +677,6 @@ async function refreshCompanionApps({ silent = true } = {}) {
   if (!els.companionApp) return;
   try {
     const apps = await fetchCompanionApps();
-    // Sort by display name (case-insensitive) for a stable, scannable list.
     apps.sort((a, b) =>
       (a.displayName || a.name || '').localeCompare(b.displayName || b.name || '', undefined, { sensitivity: 'base' })
     );
@@ -526,7 +701,6 @@ async function refreshCompanionApps({ silent = true } = {}) {
     els.companionApp.innerHTML = '';
     els.companionApp.appendChild(frag);
 
-    // Restore the user's previous selection if it's still present.
     const stillThere = apps.some((a) => a.name === preferred);
     els.companionApp.value = stillThere ? preferred : '';
     els.companionApp.dataset.preferred = els.companionApp.value;
@@ -574,15 +748,10 @@ function fillLanguages() {
   els.audioOutput.dataset.preferred = prefs.output || '';
   els.audioOutput.value = prefs.output || '';
   if (els.companionApp) {
-    // Stash the saved exe name; refreshCompanionApps() picks it up once the
-    // /apps response comes in.
     els.companionApp.dataset.preferred = prefs.companionApp || '';
     els.companionApp.value = prefs.companionApp || '';
   }
 
-  // VAD: load preset first, then let any saved detail values override it. If
-  // the result no longer matches a named preset, switch the dropdown to
-  // "custom" so the UI reflects reality.
   const savedPreset = prefs.vadPreset && (VAD_PRESETS[prefs.vadPreset] || prefs.vadPreset === 'custom')
     ? prefs.vadPreset : DEFAULT_VAD_PRESET;
   els.vadPreset.value = savedPreset;
@@ -598,9 +767,6 @@ function fillLanguages() {
   els.dirSelect.value   = prefs.dir    || 'bidir';
   state.systemPromptTemplate = prefs.promptTemplate || null;
 
-  // ?api=... in the URL overrides any saved key — handy for sharing a single
-  // link that pre-fills the key. We strip the param afterwards so the key
-  // doesn't linger in browser history, bookmarks, or referer headers.
   const urlKey = new URLSearchParams(location.search).get('api');
   if (urlKey) {
     els.apiKey.value = urlKey;
@@ -754,10 +920,9 @@ async function refreshAudioOutputDevices() {
 
 async function changeAudioOutput() {
   els.audioOutput.dataset.preferred = els.audioOutput.value;
-  savePrefs();
+  onSettingsChange();
   const session = activeSession();
   if (!session || !session.player) return;
-  session.config.outputDeviceId = els.audioOutput.value;
   try {
     await session.player.setOutputDevice(els.audioOutput.value);
     log('info', 'Audio output changed: ' + (els.audioOutput.selectedOptions[0]?.textContent || 'System default'));
@@ -768,11 +933,6 @@ async function changeAudioOutput() {
 }
 
 // ─── Per-session capture/player factories ────────────────────────────────────
-// While session.muteInput is true (set by the TTS coordinator while the
-// session is queued or speaking) we still send buffers — same size, same
-// cadence — but zero-filled. This keeps the realtime stream alive without
-// feeding the model real audio that could trigger another turn or loop back
-// the model's own TTS output.
 function sendAudioGated(session, buf) {
   if (!session.client || session.paused) return;
   if (session.muteInput) {
@@ -807,7 +967,7 @@ function createCompanionCapture(session) {
 
 async function changeAudioInput() {
   els.audioInput.dataset.preferred = els.audioInput.value;
-  savePrefs();
+  onSettingsChange();
   const session = activeSession();
   if (!session || !session.running) return;
 
@@ -816,7 +976,6 @@ async function changeAudioInput() {
     log('info', 'Microphone changed; it will apply when microphone input is used.');
     return;
   }
-  session.config.micDeviceId = els.audioInput.value;
 
   try {
     if (audioMode === 'both') {
@@ -846,6 +1005,7 @@ const STATUS_MAP = {
 
 function setSessionStatus(session, s) {
   session.status = s;
+  if (session.tabEl) session.tabEl.dataset.status = s;
   if (isActive(session)) applySessionStatusToChrome(session);
 }
 
@@ -890,6 +1050,7 @@ function flushPending(session) {
   session.pendingScheduled = false;
   if (!session.pendingInput && !session.pendingOutput) return;
   const t = ensureLiveTurn(session);
+  if (!t) return;
   if (session.pendingInput) {
     if (t.inputText === '') {
       t.inputEl.classList.remove('empty');
@@ -914,12 +1075,16 @@ function flushPending(session) {
     }
     session.pendingOutput = '';
   }
-  if (isActive(session)) els.turns.scrollTop = els.turns.scrollHeight;
+  if (session.transcriptEl) {
+    session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+  }
 }
 
 function ensureLiveTurn(session) {
   if (session.liveTurn) return session.liveTurn;
-  if (els.emptyState) { els.emptyState.remove(); els.emptyState = null; }
+  const host = session.transcriptEl;
+  if (!host) return null;
+  removeSessionEmptyState(session);
 
   const isTranscribe = session.config.mode === 'transcribe';
 
@@ -956,10 +1121,10 @@ function ensureLiveTurn(session) {
     root.appendChild(inRow);
   }
 
-  els.turns.appendChild(root);
+  host.appendChild(root);
 
-  while (els.turns.children.length > MAX_TURNS) {
-    els.turns.removeChild(els.turns.firstChild);
+  while (host.children.length > MAX_TURNS) {
+    host.removeChild(host.firstChild);
   }
 
   session.liveTurn = {
@@ -1007,18 +1172,36 @@ function setOutLevelFor(session, level) {
   if (isActive(session)) setMeter(els.outMeter, level);
 }
 
+// ─── Control-bar state ───────────────────────────────────────────────────────
+function applyControlButtonsForActiveSession() {
+  const session = activeSession();
+  if (!session) {
+    els.btnStart.disabled = true;
+    els.btnStop.disabled = true;
+    els.btnHush.disabled = true;
+    els.btnPause.disabled = true;
+    els.btnPause.classList.remove('is-paused');
+    els.btnPause.title = 'Pause mic';
+    setControlsLocked(false);
+    return;
+  }
+  els.btnStart.disabled = session.running;
+  els.btnStop.disabled = !session.running;
+  els.btnHush.disabled = !session.running || !session.isAudio;
+  els.btnPause.disabled = !session.running;
+  els.btnPause.classList.toggle('is-paused', !!session.paused);
+  els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  setControlsLocked(session.running);
+}
+
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 async function startPipeline() {
-  // Reuse the active session's identity but rebuild its config from the current
-  // UI snapshot — the user may have tweaked settings since the last Start.
   let session = activeSession();
-  if (!session) {
-    session = ensureActiveSession();
-  } else if (session.running) {
-    return;
-  } else {
-    session.config = readConfigFromUI();
-  }
+  if (!session) return;
+  if (session.running) return;
+  // Re-snapshot the UI in case the user edited fields without changing the
+  // active session (defensive — onSettingsChange should already have synced).
+  session.config = readConfigFromUI();
   await startSession(session);
 }
 
@@ -1042,10 +1225,13 @@ async function startSession(session) {
   const isAudio = cfg.mode === 'audio';
 
   setSessionStatus(session, 'connecting');
+  // Eagerly disable Start while the pipeline negotiates so a double-click
+  // doesn't fire a second startSession. session.running flips true after
+  // session.client.start() succeeds.
   if (isActive(session)) {
     els.btnStart.disabled = true;
-    els.btnStop.disabled  = false;
-    els.btnHush.disabled  = !isAudio;
+    els.btnStop.disabled = false;
+    els.btnHush.disabled = !isAudio;
     setControlsLocked(true);
   }
 
@@ -1074,10 +1260,6 @@ async function startSession(session) {
     voice: cfg.voice,
     systemInstruction,
     vad: cfg.vad,
-    // outputAudioTranscription is needed for both audio and text modes:
-    // audio mode — show the translation text alongside the spoken audio
-    // text mode  — the ONLY way to get text output (native audio model doesn't support TEXT modality)
-    // transcribe mode — no model output needed, only inputAudioTranscription matters
     useOutputTranscription: cfg.mode !== 'transcribe',
     onAudio: isAudio ? (b64) => state.ttsCoordinator.enqueueChunk(session, b64) : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
@@ -1104,8 +1286,6 @@ async function startSession(session) {
       if (!state.companionAvailable && !(await detectCompanionService({ silent: false }))) {
         throw new Error('Companion audio service is not running.');
       }
-      // Refresh the app list right before connecting so the pid we send is
-      // still valid (the user may have closed the app since the last refresh).
       const selectedExe = cfg.companionApp;
       let pid = 0;
       if (selectedExe) {
@@ -1141,11 +1321,7 @@ async function startSession(session) {
   session.client.start();
   session.running = true;
   session.paused = false;
-  if (isActive(session)) {
-    els.btnPause.disabled = false;
-    els.btnPause.classList.remove('is-paused');
-    els.btnPause.title = 'Pause mic';
-  }
+  if (isActive(session)) applyControlButtonsForActiveSession();
 
   session.startedAt = Date.now();
   if (session.ageTimer) clearInterval(session.ageTimer);
@@ -1167,8 +1343,6 @@ async function stopPipeline() {
 }
 
 async function stopSession(session) {
-  // Release the speak queue slot first so a queued session can take over
-  // immediately, even before this session's player finishes destroy().
   state.ttsCoordinator.unregister(session);
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
@@ -1183,13 +1357,7 @@ async function stopSession(session) {
   finalizeTurn(session);
   setSessionStatus(session, 'idle');
   if (isActive(session)) {
-    setControlsLocked(false);
-    els.btnStart.disabled = false;
-    els.btnStop.disabled  = true;
-    els.btnHush.disabled  = true;
-    els.btnPause.disabled = true;
-    els.btnPause.classList.remove('is-paused');
-    els.btnPause.title = 'Pause mic';
+    applyControlButtonsForActiveSession();
     els.sessionAge.textContent = '00:00';
     setMeter(els.micMeter, 0);
     setMeter(els.outMeter, 0);
@@ -1234,23 +1402,12 @@ function closeSheet(id) {
 
 function clearConversation() {
   const session = activeSession();
-  if (session) session.liveTurn = null;
-  els.turns.innerHTML = '';
-  const empty = document.createElement('div');
-  empty.className = 'empty-state';
-  empty.id = 'empty-state';
-  empty.innerHTML =
-    '<div class="empty-icon" aria-hidden="true">' +
-      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
-        '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>' +
-        '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>' +
-        '<line x1="12" y1="19" x2="12" y2="23"/>' +
-        '<line x1="8" y1="23" x2="16" y2="23"/>' +
-      '</svg>' +
-    '</div>' +
-    '<p>Press <strong>Start</strong> and speak.</p>';
-  els.turns.appendChild(empty);
-  els.emptyState = empty;
+  if (!session) return;
+  session.liveTurn = null;
+  if (session.transcriptEl) {
+    session.transcriptEl.innerHTML = '';
+    renderSessionEmptyState(session);
+  }
   if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
 }
 
@@ -1263,8 +1420,6 @@ function openPromptEditor() {
 }
 function savePromptEditor() {
   const v = els.promptText.value.trim();
-  // Treat empty or any built-in template as "no custom" — the resolver will
-  // pick the right default for whichever mode the user is in.
   state.systemPromptTemplate = (v && !isBuiltinPromptTemplate(v)) ? v : null;
   savePrefs();
   closeSheet('prompt-sheet');
@@ -1383,7 +1538,6 @@ class PipController {
     this.inputEl = doc.getElementById('pipin');
     this.outputEl = doc.getElementById('pipout');
 
-    // Replay current state.
     this.setStatus(this._currentStatus, this._currentLive);
     if (this._inLang) this.setLangs(this._inLang, this._outLang);
     this.setInput(this._currentInput);
@@ -1456,7 +1610,6 @@ async function togglePip() {
   state.pip = pip;
   pip.onClose = () => { if (state.pip === pip) state.pip = null; };
 
-  // Seed with current active-session state.
   const session = activeSession();
   pip.setStatus(els.statusText.textContent, els.statusPill.classList.contains('pill-translating')
                                               || els.statusPill.classList.contains('pill-listening'));
@@ -1468,9 +1621,8 @@ async function togglePip() {
   if (session && session.liveTurn) {
     pip.setInput(session.liveTurn.inputText);
     pip.setOutput(session.liveTurn.outputText);
-  } else {
-    // Try last completed turn from the DOM.
-    const last = els.turns.querySelector('.turn:last-child');
+  } else if (session && session.transcriptEl) {
+    const last = session.transcriptEl.querySelector('.turn:last-child');
     if (last) {
       const it = last.querySelector('.turn-row.input .turn-text');
       const ot = last.querySelector('.turn-row.output .turn-text');
@@ -1496,44 +1648,45 @@ function wireUI() {
     const a = els.langSource.value;
     els.langSource.value = els.langTarget.value;
     els.langTarget.value = a;
-    savePrefs();
+    onSettingsChange();
   });
   els.btnShowKey.addEventListener('click', () => {
     els.apiKey.type = els.apiKey.type === 'password' ? 'text' : 'password';
   });
   els.modeSelect.addEventListener('change', () => {
     updateDirVisibility();
-    savePrefs();
+    onSettingsChange();
   });
   els.vadPreset.addEventListener('change', () => {
     if (els.vadPreset.value !== 'custom') applyVadPreset(els.vadPreset.value);
-    savePrefs();
+    onSettingsChange();
   });
   for (const el of [els.vadStart, els.vadEnd, els.vadPrefix, els.vadSilence]) {
     el.addEventListener('change', () => {
       els.vadPreset.value = detectVadPreset();
-      savePrefs();
+      onSettingsChange();
     });
   }
   els.audioSource.addEventListener('change', () => {
     if (els.audioSource.value === 'companion') detectCompanionService({ silent: false });
     updateCompanionAppVisibility();
-    savePrefs();
+    onSettingsChange();
   });
   if (els.companionApp) {
     els.companionApp.addEventListener('change', () => {
       els.companionApp.dataset.preferred = els.companionApp.value;
-      savePrefs();
+      onSettingsChange();
     });
   }
   if (els.btnRefreshApps) {
     els.btnRefreshApps.addEventListener('click', () => refreshCompanionApps({ silent: false }));
   }
   for (const sel of [els.langSource, els.langTarget, els.voice, els.dirSelect]) {
-    sel.addEventListener('change', savePrefs);
+    sel.addEventListener('change', onSettingsChange);
   }
   els.audioInput.addEventListener('change', changeAudioInput);
   els.audioOutput.addEventListener('change', changeAudioOutput);
+  // API key is global, not per-session — savePrefs only.
   els.apiKey.addEventListener('change', savePrefs);
 
   els.btnMenu.addEventListener('click', () => openSheet('sidebar'));
@@ -1543,8 +1696,33 @@ function wireUI() {
   els.btnResetPrompt.addEventListener('click', resetPromptEditor);
   els.btnPip.addEventListener('click', togglePip);
   els.btnPipQuick.addEventListener('click', togglePip);
-  if (els.openFromEmpty) {
-    els.openFromEmpty.addEventListener('click', () => openSheet('sidebar'));
+
+  // Tabs: + to add, click chip to activate, click × to close.
+  if (els.btnNewSession) {
+    els.btnNewSession.addEventListener('click', () => createNewSession({ activate: true }));
+  }
+  if (els.tabList) {
+    els.tabList.addEventListener('click', (ev) => {
+      const close = ev.target.closest('.tab-close');
+      if (close) {
+        const chip = close.closest('.tab-chip');
+        if (chip) closeSession(state.sessions.get(chip.dataset.sessionId));
+        ev.stopPropagation();
+        return;
+      }
+      const chip = ev.target.closest('.tab-chip');
+      if (chip) setActiveSession(chip.dataset.sessionId);
+    });
+  }
+
+  // Empty-state "Settings" button is created dynamically per session — use
+  // event delegation so we don't re-bind on every render.
+  if (els.turnsHost) {
+    els.turnsHost.addEventListener('click', (ev) => {
+      if (ev.target.closest('[data-empty-action="open-settings"]')) {
+        openSheet('sidebar');
+      }
+    });
   }
 
   // Generic sheet close handlers
@@ -1605,11 +1783,7 @@ function checkSupport() {
 document.addEventListener('DOMContentLoaded', () => {
   fillLanguages();
   wireUI();
-  // Seed the implicit single session so chrome (status pill, age) reflects an
-  // idle Session object from the first frame. Multi-session UI will replace
-  // this with explicit creation per tab.
-  ensureActiveSession();
-  applySessionStatusToChrome(activeSession());
+  restoreSessionsFromStorage();
   detectCompanionService();
   refreshAudioInputDevices();
   refreshAudioOutputDevices();
