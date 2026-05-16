@@ -22,8 +22,8 @@
       <span class="title-text">Translator</span>
     </div>
     <div class="mode-switch" id="mode-switch" role="group" aria-label="Interface mode">
-      <button class="mode-opt is-active" data-ui-mode="simple" type="button" aria-pressed="true">Simple</button>
-      <button class="mode-opt" data-ui-mode="advanced" type="button" aria-pressed="false">Advanced</button>
+      <button class="mode-opt is-active" data-ui-mode="simple" type="button" aria-pressed="true">Basic</button>
+      <button class="mode-opt" data-ui-mode="advanced" type="button" aria-pressed="false">Full</button>
     </div>
     <div class="status">
       <span id="session-age" class="age mono" aria-label="Session age">00:00</span>
@@ -80,17 +80,19 @@
           <div class="field">
             <label>Mode</label>
             <div class="segmented" id="mode-segmented" role="radiogroup" aria-label="Translate mode">
-              <button class="seg-opt is-active" data-value="audio"      type="button" role="radio" aria-checked="true">Voice + Text</button>
-              <button class="seg-opt"           data-value="text"       type="button" role="radio" aria-checked="false">Text only</button>
+              <button class="seg-opt is-active" data-value="audio"      type="button" role="radio" aria-checked="true">Translate (Voice)</button>
+              <button class="seg-opt"           data-value="text"       type="button" role="radio" aria-checked="false">Translate (Text)</button>
               <button class="seg-opt"           data-value="transcribe" type="button" role="radio" aria-checked="false">Transcribe</button>
             </div>
+            <p class="hint" id="mode-hint">Translates speech into both text and spoken audio.</p>
           </div>
           <div class="field" id="dir-field">
             <label>Direction</label>
             <div class="segmented" id="dir-segmented" role="radiogroup" aria-label="Direction">
-              <button class="seg-opt is-active" data-value="bidir"  type="button" role="radio" aria-checked="true">↔ Both ways</button>
-              <button class="seg-opt"           data-value="oneway" type="button" role="radio" aria-checked="false">→ One way</button>
+              <button class="seg-opt is-active" data-value="bidir"  type="button" role="radio" aria-checked="true">Bidirectional</button>
+              <button class="seg-opt"           data-value="oneway" type="button" role="radio" aria-checked="false">Unidirectional</button>
             </div>
+            <p class="hint" id="dir-hint">Translates both your speech and the other person's speech.</p>
           </div>
         </section>
 
@@ -98,15 +100,15 @@
           <div class="field">
             <label>Speech detection</label>
             <div class="segmented" id="speech-mode-segmented" role="radiogroup" aria-label="Speech detection">
-              <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto VAD</button>
+              <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto Detect</button>
               <button class="seg-opt"           data-value="ptt"  type="button" role="radio" aria-checked="false">Push to talk</button>
             </div>
-            <p class="hint" id="speech-mode-hint">Auto VAD: model decides when you start/stop speaking. Push to talk: you hold a key while speaking (needs the companion app).</p>
+            <p class="hint" id="speech-mode-hint">Auto Detect: model decides when you start/stop speaking. Push to talk: you hold a key while speaking (needs the companion app).</p>
           </div>
 
           <div id="vad-auto-fields">
             <div class="field">
-              <label for="vad-preset">VAD preset</label>
+              <label for="vad-preset">Detection sensitivity</label>
               <select id="vad-preset">
                 <option value="quick">Quick — reply fast</option>
                 <option value="balanced">Balanced</option>
@@ -155,7 +157,7 @@
           </div>
         </section>
 
-        <section class="section">
+        <section class="section" id="voice-section">
           <div class="field">
             <label for="voice">Voice</label>
             <select id="voice">
@@ -168,16 +170,7 @@
               <option value="Leda">Leda</option>
               <option value="Orus">Orus</option>
             </select>
-          </div>
-        </section>
-
-        <section class="section advanced-only">
-          <div class="field">
-            <label for="audio-input">Microphone</label>
-            <select id="audio-input">
-              <option value="">System default</option>
-            </select>
-            <p class="hint" id="audio-input-hint">Choose the microphone used for speech input. Device names may appear after permission.</p>
+            <p class="hint">Used for the spoken translation. Hidden in text-only and transcribe modes.</p>
           </div>
         </section>
 
@@ -191,6 +184,13 @@
               <button class="seg-opt"           data-value="both"      type="button" role="radio" aria-checked="false">Mic + Tab</button>
             </div>
             <p class="hint" id="audio-source-hint">Default microphone. Use "Tab" to translate a tab or window. Browser support varies.</p>
+          </div>
+          <div class="field" id="mic-section">
+            <label for="audio-input">Microphone</label>
+            <select id="audio-input">
+              <option value="">System default</option>
+            </select>
+            <p class="hint" id="audio-input-hint">Choose the microphone used for speech input. Device names may appear after permission.</p>
           </div>
           <div class="field" id="companion-app-field" style="display:none">
             <label for="companion-app">App to capture</label>
@@ -206,7 +206,7 @@
           </div>
         </section>
 
-        <section class="section advanced-only">
+        <section class="section advanced-only" id="audio-output-section">
           <div class="field">
             <label for="audio-output">Audio output</label>
             <select id="audio-output">
@@ -266,7 +266,7 @@
       <svg class="icon icon-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
     </button>
     <button id="btn-hush" class="btn warn" type="button" disabled title="Stop current speech output">
-      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></span><span class="btn-tx">Hush</span>
+      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></span><span class="btn-tx">Silence</span>
     </button>
     <button id="btn-stop" class="btn danger" type="button" disabled>
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>

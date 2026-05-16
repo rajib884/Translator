@@ -127,10 +127,15 @@ const els = {
   companionAppHint:  $('companion-app-hint'),
   btnRefreshApps:    $('btn-refresh-apps'),
   audioOutput:   $('audio-output'),
+  audioOutputSection: $('audio-output-section'),
   audioOutputHint:$('audio-output-hint'),
   modeSelect:    segProxy($('mode-segmented')),
+  modeHint:      $('mode-hint'),
   dirSelect:     segProxy($('dir-segmented')),
   dirField:      $('dir-field'),
+  dirHint:       $('dir-hint'),
+  voiceSection:  $('voice-section'),
+  micSection:    $('mic-section'),
   speechMode:    segProxy($('speech-mode-segmented')),
   speechModeHint:$('speech-mode-hint'),
   vadAutoFields: $('vad-auto-fields'),
@@ -899,7 +904,7 @@ function loadSessionConfigIntoUI(session) {
   els.vadSilence.value = String(cfg.vad.silenceDurationMs);
   els.vadPreset.value = detectVadPreset();
   els.speechMode.value = cfg.pttMode === 'ptt' ? 'ptt' : 'auto';
-  updateDirVisibility();
+  updateUIVisibility();
   updateCompanionAppVisibility();
   updateSpeechModeFields();
 }
@@ -1067,8 +1072,39 @@ function modeDescriptiveLabel() {
   return `Translate (${fmt}, ${dirLabel})`;
 }
 
-function updateDirVisibility() {
-  els.dirField.style.display = els.modeSelect.value === 'transcribe' ? 'none' : '';
+function updateUIVisibility() {
+  const mode = els.modeSelect.value;
+  const source = els.audioSource.value;
+
+  // Direction: only for translation modes
+  els.dirField.style.display = (mode === 'transcribe') ? 'none' : '';
+
+  // Voice & Audio Output: only for Translate (Voice) mode
+  const showAudio = (mode === 'audio');
+  els.voiceSection.style.display = showAudio ? '' : 'none';
+  els.audioOutputSection.style.display = showAudio ? '' : 'none';
+
+  // Microphone: only for Mic or Mic+Tab sources
+  els.micSection.style.display = (source === 'mic' || source === 'both') ? '' : 'none';
+
+  // Hints
+  if (els.modeHint) {
+    if (mode === 'audio') {
+      els.modeHint.textContent = 'Translates speech into both text and spoken audio.';
+    } else if (mode === 'text') {
+      els.modeHint.textContent = 'Translates speech into text only (spoken audio discarded).';
+    } else if (mode === 'transcribe') {
+      els.modeHint.textContent = 'Transcribes speech into text in the same language (no translation).';
+    }
+  }
+
+  if (els.dirHint) {
+    if (els.dirSelect.value === 'bidir') {
+      els.dirHint.textContent = 'Translates both your speech and the other person\'s speech.';
+    } else {
+      els.dirHint.textContent = 'Translates only your speech (useful for broadcasts).';
+    }
+  }
 }
 
 // ─── VAD preset / advanced fields ────────────────────────────────────────────
@@ -1290,7 +1326,7 @@ function fillLanguages() {
     els.langTarget.value = els.langSource.value === 'en' ? 'es' : 'en';
   }
 
-  updateDirVisibility();
+  updateUIVisibility();
   updateAudioSourceAvailability();
 
   updateAudioInputSupport();
@@ -2174,7 +2210,7 @@ function wireUI() {
   els.btnHush.addEventListener('click', () => {
     const session = activeSession();
     if (session) state.ttsCoordinator.hush(session);
-    log('info', 'Playback hushed');
+    log('info', 'Playback silenced');
   });
   els.btnClear.addEventListener('click', clearConversation);
   els.btnSwap.addEventListener('click', () => {
@@ -2187,7 +2223,7 @@ function wireUI() {
     els.apiKey.type = els.apiKey.type === 'password' ? 'text' : 'password';
   });
   els.modeSelect.addEventListener('change', () => {
-    updateDirVisibility();
+    updateUIVisibility();
     onSettingsChange();
   });
   els.vadPreset.addEventListener('change', () => {
@@ -2203,6 +2239,7 @@ function wireUI() {
   els.audioSource.addEventListener('change', () => {
     if (els.audioSource.value === 'companion') detectCompanionService({ silent: false });
     updateCompanionAppVisibility();
+    updateUIVisibility();
     onSettingsChange();
   });
   els.speechMode.addEventListener('change', () => {
@@ -2224,7 +2261,11 @@ function wireUI() {
   if (els.btnRefreshApps) {
     els.btnRefreshApps.addEventListener('click', () => refreshCompanionApps({ silent: false }));
   }
-  for (const sel of [els.langSource, els.langTarget, els.voice, els.dirSelect]) {
+  els.dirSelect.addEventListener('change', () => {
+    updateUIVisibility();
+    onSettingsChange();
+  });
+  for (const sel of [els.langSource, els.langTarget, els.voice]) {
     sel.addEventListener('change', onSettingsChange);
   }
   els.audioInput.addEventListener('change', changeAudioInput);

@@ -17,7 +17,7 @@
   --radius-sm: 8px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-top: env(safe-area-inset-top, 0px);
-  --sidebar-w: 340px;
+  --sidebar-w: 380px;
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -498,7 +498,7 @@ body[data-ui-mode="simple"] .advanced-only { display: none !important; }
 @keyframes slide-up { from { transform: translateY(100%); } to { transform: none; } }
 
 /* ─── Form ─── */
-.field { display: flex; flex-direction: column; gap: 5px; }
+.field, #vad-auto-fields { display: flex; flex-direction: column; gap: 5px; }
 .field label {
   font-size: 10px; font-weight: 700;
   text-transform: uppercase; letter-spacing: 0.6px; color: var(--fg-2);
@@ -506,7 +506,7 @@ body[data-ui-mode="simple"] .advanced-only { display: none !important; }
 .input-row { display: flex; gap: 6px; align-items: stretch; }
 .input-row input,
 .input-row select { flex: 1; min-width: 0; }
-input[type="text"], input[type="password"], select, textarea {
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
   background: var(--bg-3);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -533,6 +533,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .hint { margin: 0; font-size: 11px; color: var(--fg-2); }
 
 .field-grid { display: grid; grid-template-columns: 1fr auto 1fr; gap: 6px; align-items: end; }
+.vad-grid.field-grid { grid-template-columns: 1fr 1fr; }
 .swap {
   background: var(--bg-3); border: 1px solid var(--line);
   border-radius: var(--radius-sm);
