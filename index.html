@@ -7,6 +7,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>Live Translator</title>
+  <link rel="icon" type="image/png" href="favico.png" />
+  <link rel="apple-touch-icon" href="favico.png" />
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
@@ -18,7 +20,7 @@
       </svg>
     </button>
     <div class="title">
-      <span class="logo" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
+      <span class="logo" aria-hidden="true"><img src="favico.png" alt="" /></span>
       <span class="title-text">Translator</span>
     </div>
     <div class="mode-switch" id="mode-switch" role="group" aria-label="Interface mode">
@@ -239,15 +241,16 @@
     </div>
   </aside>
 
-  <div class="meter-row">
-    <span class="meter-label">MIC</span>
-    <div class="meter"><div class="meter-fill" id="mic-meter"></div></div>
-    <span class="meter-label">OUT</span>
-    <div class="meter"><div class="meter-fill" id="out-meter"></div></div>
-  </div>
-
   <nav class="tabs" id="tabs" aria-label="Sessions">
     <div class="tab-list" id="tab-list" role="tablist"></div>
+    <div class="tab-actions advanced-only">
+      <button id="btn-start-all" class="tab-action" type="button" title="Start every idle session" aria-label="Start all">
+        <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="4 3 14 12 4 21 4 3"/><rect x="16" y="3" width="3" height="18"/></svg>
+      </button>
+      <button id="btn-stop-all" class="tab-action" type="button" title="Stop every running session" aria-label="Stop all">
+        <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="10" height="16"/><rect x="17" y="4" width="3" height="16"/></svg>
+      </button>
+    </div>
     <button id="btn-new-session" class="tab-new" type="button" title="New session" aria-label="New session">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
     </button>

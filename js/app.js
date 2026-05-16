@@ -23,6 +23,10 @@ const LANGUAGES = [
 
 const MAX_TURNS = 50;
 const MAX_LOG = 200;
+// Multi-session is meant for the occasional power user juggling a couple of
+// translations. Past 3 the audio coordinator queues up too far behind real
+// time and the tab strip gets cluttered on narrow screens.
+const MAX_SESSIONS = 3;
 const STORAGE_KEY = 'live-translator-prefs';
 const SESSIONS_KEY = 'live-translator-sessions';
 
@@ -171,10 +175,10 @@ const els = {
   sessionAge:    $('session-age'),
   tabList:       $('tab-list'),
   btnNewSession: $('btn-new-session'),
+  btnStartAll:   $('btn-start-all'),
+  btnStopAll:    $('btn-stop-all'),
   turnsHost:     $('turns-host'),
   modeSwitch:    $('mode-switch'),
-  micMeter:      $('mic-meter'),
-  outMeter:      $('out-meter'),
   log:           $('log'),
 };
 
@@ -208,7 +212,17 @@ class Session {
 
     // DOM owned by this session.
     this.tabEl = null;             // .tab-chip
+    this.tabLabelEl = null;        // .tab-label
+    this.tabStatusEl = null;       // .tab-status-text
+    this.tabAgeEl = null;          // .tab-age
+    this.tabMicFill = null;        // .tab-meter.mic .tab-meter-fill
+    this.tabOutFill = null;        // .tab-meter.out .tab-meter-fill
     this.transcriptEl = null;      // .session-turns
+
+    // Last observed audio levels (0..1). Snapshotted so the chip meters keep
+    // their state across tab switches without waiting for the next callback.
+    this.lastMicLevel = 0;
+    this.lastOutLevel = 0;
 
     // Set true by the TTS coordinator while this session is queued or
     // speaking; sendAudioGated swaps real audio for zero-filled buffers so
@@ -279,17 +293,32 @@ class TTSCoordinator {
     // Drop chunks that arrive after Hush, until the model signals the turn
     // is over (then suppression lifts and the next utterance plays normally).
     if (entry.suppressed) return;
-    if (!entry.wantsToSpeak) {
+    const firstChunkOfTurn = !entry.wantsToSpeak;
+    if (firstChunkOfTurn) {
       entry.wantsToSpeak = true;
       entry.turnComplete = false;
       session.muteInput = true;
       this._requestSpeak(session.id);
+      // The session either just became the speaker (status flips via
+      // onActiveChange when playChunk fires) or got queued behind someone
+      // else. The queued case has no other repaint trigger, so we always
+      // refresh here.
+      refreshSessionDisplay(session);
     }
     if (this.currentSpeakerId === session.id) {
       entry.player.playChunk(b64);
     } else {
       entry.buffered.push(b64);
     }
+  }
+
+  // True when the session has a pending turn but isn't the speaker — i.e. its
+  // chunks are buffering while another session is speaking. effectiveStatus()
+  // uses this to surface a distinct "Queued" chip + pill state.
+  isQueued(sessionId) {
+    const entry = this.entries.get(sessionId);
+    if (!entry) return false;
+    return entry.wantsToSpeak && this.currentSpeakerId !== sessionId;
   }
 
   markTurnComplete(session) {
@@ -324,9 +353,13 @@ class TTSCoordinator {
     session.muteInput = false;
     if (this.currentSpeakerId === session.id) {
       this.currentSpeakerId = null;
+      refreshSessionDisplay(session);
       this._tryStartNext();
     } else {
       this.queue = this.queue.filter((sid) => sid !== session.id);
+      // Was queued or idle — either way, repaint the chip so a "Queued"
+      // indicator clears immediately rather than after the next status event.
+      refreshSessionDisplay(session);
     }
   }
 
@@ -346,6 +379,10 @@ class TTSCoordinator {
     entry.turnComplete = false;
     entry.session.muteInput = false;
     this.currentSpeakerId = null;
+    // The session that just finished should flip out of "Speaking" — the
+    // wrapped onActiveChange already set status=connected, but we refresh
+    // again so the muteInput → mic-meter-unlocked transition is reflected.
+    refreshSessionDisplay(entry.session);
     this._tryStartNext();
   }
 
@@ -356,6 +393,11 @@ class TTSCoordinator {
       const entry = this.entries.get(nextId);
       if (!entry) continue;
       this.currentSpeakerId = nextId;
+      // The newly-promoted session was "Queued"; it's about to be "Speaking".
+      // playChunk's onActiveChange will fire the proper status flip, but we
+      // refresh here too so the queued indicator clears in the same frame
+      // even if no chunks are immediately available.
+      refreshSessionDisplay(entry.session);
       const buf = entry.buffered;
       entry.buffered = [];
       for (const b64 of buf) entry.player.playChunk(b64);
@@ -566,19 +608,42 @@ function newSessionId() {
 }
 
 // ─── Per-session DOM ─────────────────────────────────────────────────────────
+// A tab chip is the session at a glance:
+//   row 1:  ● [lang pair]                ×
+//   row 2:  STATUS                    00:23
+//   row 3:  ▓▓▓░░░░░░ (mic) / ░░░ (out)
+// Active chip gets a thick accent bar on top + bg-0 background to clearly
+// indicate which session's transcript fills the panel below.
 function createSessionDOM(session) {
   const chip = document.createElement('div');
   chip.className = 'tab-chip';
   chip.dataset.sessionId = session.id;
   chip.dataset.status = session.status;
+  chip.dataset.audio  = session.isAudio ? 'true' : 'false';
   chip.setAttribute('role', 'tab');
   chip.innerHTML =
-    '<span class="tab-status-dot" aria-hidden="true"></span>' +
-    '<span class="tab-label"></span>' +
-    '<span class="tab-close" role="button" aria-label="Close session" title="Close session">×</span>';
+    '<div class="tab-chip-head">' +
+      '<span class="tab-status-dot" aria-hidden="true"></span>' +
+      '<span class="tab-label"></span>' +
+      '<span class="tab-close" role="button" aria-label="Close session" title="Close session">×</span>' +
+    '</div>' +
+    '<div class="tab-chip-mid">' +
+      '<span class="tab-status-text">Idle</span>' +
+      '<span class="tab-age mono">00:00</span>' +
+    '</div>' +
+    '<div class="tab-meters" aria-hidden="true">' +
+      '<div class="tab-meter mic"><div class="tab-meter-fill"></div></div>' +
+      '<div class="tab-meter out"><div class="tab-meter-fill"></div></div>' +
+    '</div>';
   els.tabList.appendChild(chip);
-  session.tabEl = chip;
+  session.tabEl       = chip;
+  session.tabLabelEl  = chip.querySelector('.tab-label');
+  session.tabStatusEl = chip.querySelector('.tab-status-text');
+  session.tabAgeEl    = chip.querySelector('.tab-age');
+  session.tabMicFill  = chip.querySelector('.tab-meter.mic .tab-meter-fill');
+  session.tabOutFill  = chip.querySelector('.tab-meter.out .tab-meter-fill');
   updateTabChip(session);
+  refreshSessionDisplay(session);
 
   const turns = document.createElement('div');
   turns.className = 'session-turns';
@@ -593,9 +658,8 @@ function updateTabChip(session) {
   const cfg = session.config;
   const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
   const label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
-  const labelEl = session.tabEl.querySelector('.tab-label');
-  if (labelEl) labelEl.textContent = label;
-  session.tabEl.dataset.status = session.status;
+  if (session.tabLabelEl) session.tabLabelEl.textContent = label;
+  session.tabEl.dataset.audio = session.isAudio ? 'true' : 'false';
   session.tabEl.title = `${langName(cfg.source)} → ${langName(cfg.target)}`;
 }
 
@@ -787,16 +851,8 @@ function beginPttCapture() {
   setTimeout(finish, 6000);
 }
 
-function finishPttCapture(binding) {
-  // Retained for compatibility with earlier callers; the inline capture flow
-  // in beginPttCapture is the live path.
-  state.pttCapturing = false;
-  state.pttBinding = binding;
-  if (state.pttClient) state.pttClient.setBinding(binding);
-  savePrefs();
-  updatePttButton();
-}
-
+// The live capture path in beginPttCapture sets this inline. This helper stays
+// for any direct callers (e.g. unit tests or future programmatic binds).
 function finishPttCapture(binding) {
   state.pttCapturing = false;
   state.pttBinding = binding;
@@ -830,15 +886,13 @@ function setActiveSession(id) {
   if (next.transcriptEl) next.transcriptEl.classList.add('is-active');
 
   loadSessionConfigIntoUI(next);
-  applySessionStatusToChrome(next);
+  refreshSessionDisplay(next);
   applyControlButtonsForActiveSession();
   els.sessionAge.textContent = next.startedAt
     ? fmtDuration(Date.now() - next.startedAt)
     : '00:00';
-  // Meters reset on switch — they'll re-fill from the new session's level
-  // callbacks on the next audio frame.
-  setMeter(els.micMeter, 0);
-  setMeter(els.outMeter, 0);
+  // Per-session meters live inside the chip and keep painting themselves on
+  // every level callback; no global meter to reset here.
 
   // PiP follows the active session: relabel and replay the session's transcript
   // so what's on the popout matches what's in the main window.
@@ -922,9 +976,15 @@ function onSettingsChange() {
 }
 
 function createNewSession({ activate = true } = {}) {
+  if (state.sessions.size >= MAX_SESSIONS) {
+    log('warn', `Maximum of ${MAX_SESSIONS} sessions reached — close one to add another.`);
+    return null;
+  }
   const session = new Session({ id: newSessionId(), config: readConfigFromUI() });
   state.sessions.set(session.id, session);
   createSessionDOM(session);
+  refreshAddSessionButton();
+  refreshBulkActionButtons();
   saveSessions();
   // The new session has a fresh id, so setActiveSession's early-return won't
   // fire and the previous session's .is-active class is correctly removed.
@@ -941,6 +1001,8 @@ async function closeSession(session) {
   if (session.tabEl) session.tabEl.remove();
   if (session.transcriptEl) session.transcriptEl.remove();
   state.sessions.delete(session.id);
+  refreshAddSessionButton();
+  refreshBulkActionButtons();
 
   if (state.activeSessionId === session.id) {
     state.activeSessionId = null;
@@ -954,6 +1016,54 @@ async function closeSession(session) {
   } else {
     saveSessions();
   }
+}
+
+// Disables the "+" affordance and explains why when we're at the per-window
+// session cap. Cheap to call after any sessions-map mutation.
+function refreshAddSessionButton() {
+  if (!els.btnNewSession) return;
+  const atLimit = state.sessions.size >= MAX_SESSIONS;
+  els.btnNewSession.disabled = atLimit;
+  els.btnNewSession.title = atLimit
+    ? `Maximum ${MAX_SESSIONS} sessions — close one to add another`
+    : 'New session';
+}
+
+// Bulk-action button state. Start-all only makes sense when at least one
+// session is idle; stop-all only when at least one is running.
+function refreshBulkActionButtons() {
+  if (!els.btnStartAll || !els.btnStopAll) return;
+  let idle = 0, running = 0;
+  for (const s of state.sessions.values()) {
+    if (s.running) running++; else idle++;
+  }
+  els.btnStartAll.disabled = idle === 0;
+  els.btnStopAll.disabled  = running === 0;
+}
+
+// Start every idle session sequentially. We don't fire them in parallel
+// because each Start may surface a getUserMedia / getDisplayMedia prompt; the
+// browser would only honour one of those at a time anyway.
+async function startAllSessions() {
+  const targets = [...state.sessions.values()].filter((s) => !s.running);
+  if (targets.length === 0) return;
+  log('info', `Starting ${targets.length} session${targets.length === 1 ? '' : 's'}…`);
+  for (const s of targets) {
+    try { await startSession(s); }
+    catch (e) { log('warn', `Start failed for one session: ${e && e.message || e}`); }
+  }
+  refreshBulkActionButtons();
+}
+
+async function stopAllSessions() {
+  const targets = [...state.sessions.values()].filter((s) => s.running);
+  if (targets.length === 0) return;
+  log('info', `Stopping ${targets.length} session${targets.length === 1 ? '' : 's'}…`);
+  for (const s of targets) {
+    try { await stopSession(s); }
+    catch (_) {}
+  }
+  refreshBulkActionButtons();
 }
 
 // ─── Persistence (sessions) ──────────────────────────────────────────────────
@@ -989,7 +1099,13 @@ function restoreSessionsFromStorage() {
   // Use the current UI snapshot as a fallback for any missing config fields,
   // then overlay the saved per-session config.
   const fallback = readConfigFromUI();
-  for (const entry of data.sessions) {
+  // If an older build saved more than MAX_SESSIONS, keep only the first N —
+  // the rest are lost on first load but no longer count against the cap.
+  const entries = data.sessions.slice(0, MAX_SESSIONS);
+  if (data.sessions.length > MAX_SESSIONS) {
+    log('warn', `Found ${data.sessions.length} saved sessions; only the first ${MAX_SESSIONS} were restored.`);
+  }
+  for (const entry of entries) {
     const cfg = Object.assign({}, fallback, entry.config || {});
     cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
     const session = new Session({
@@ -999,6 +1115,8 @@ function restoreSessionsFromStorage() {
     state.sessions.set(session.id, session);
     createSessionDOM(session);
   }
+  refreshAddSessionButton();
+  refreshBulkActionButtons();
   const wantActive = data.activeId && state.sessions.has(data.activeId)
     ? data.activeId
     : state.sessions.keys().next().value;
@@ -1543,29 +1661,72 @@ async function changeAudioInput() {
   }
 }
 
-// ─── Status pill ──────────────────────────────────────────────────────────────
-const STATUS_MAP = {
-  idle:         ['pill-idle',         'Idle'],
-  connecting:   ['pill-connecting',   'Connecting'],
-  connected:    ['pill-listening',    'Listening'],
-  translating:  ['pill-translating',  'Speaking'],
-  reconnecting: ['pill-reconnecting', 'Reconnect'],
-  error:        ['pill-error',        'Error'],
+// ─── Status pill / per-session display ────────────────────────────────────────
+// Each session has a "base" status set by the Gemini Live client (idle,
+// connecting, connected, translating, reconnecting, error). On top of that we
+// derive two UI-only overlays:
+//   - paused:  user hit the pause button; mic is gated out
+//   - waiting: PTT mode is on, session is connected, but the key isn't held
+// effectiveStatus combines them. refreshSessionDisplay then paints the chip
+// (always) and the topbar pill (only when the session is the active one).
+const STATUS_DEF = {
+  idle:         { cls: 'pill-idle',         label: () => 'Idle' },
+  connecting:   { cls: 'pill-connecting',   label: () => 'Connecting' },
+  connected:    { cls: 'pill-listening',    label: () => 'Listening' },
+  translating:  { cls: 'pill-translating',  label: () => 'Speaking' },
+  reconnecting: { cls: 'pill-reconnecting', label: () => 'Reconnect' },
+  error:        { cls: 'pill-error',        label: () => 'Error' },
+  paused:       { cls: 'pill-paused',       label: () => 'Paused' },
+  queued:       { cls: 'pill-queued',       label: () => 'Queued' },
+  waiting:      { cls: 'pill-waiting',      label: () => {
+    const b = state.pttBinding;
+    return b ? ('Hold ' + (b.label || keyLabelFromVk(b.vkCode))) : 'Hold to talk';
+  } },
 };
+
+function effectiveStatus(session) {
+  if (!session || !session.running) return 'idle';
+  if (session.paused) return 'paused';
+  // Queued: this session has a turn ready but another session is currently
+  // speaking. The mic is silenced; the chip should say so clearly rather
+  // than misleadingly reading "Listening".
+  if (state.ttsCoordinator && state.ttsCoordinator.isQueued(session.id)) {
+    return 'queued';
+  }
+  // Waiting only applies while we have an open connection — there's nothing to
+  // hold a key for if we're not actually listening yet.
+  if (session.status === 'connected' &&
+      session.config && session.config.pttMode === 'ptt' && !session.pttHeld) {
+    return 'waiting';
+  }
+  return session.status;
+}
 
 function setSessionStatus(session, s) {
   session.status = s;
-  if (session.tabEl) session.tabEl.dataset.status = s;
-  if (isActive(session)) applySessionStatusToChrome(session);
+  refreshSessionDisplay(session);
 }
 
-function applySessionStatusToChrome(session) {
-  const s = session ? session.status : 'idle';
-  const [cls, text] = STATUS_MAP[s] || STATUS_MAP.idle;
-  els.statusPill.className = 'pill ' + cls;
-  els.statusText.textContent = text;
-  if (state.pip) state.pip.setStatus(text, s === 'translating' || s === 'connected');
+// Repaint everything tied to a session's state — chip dot/text, topbar pill
+// (if active), PiP, and per-state meter dimming. Cheap to call on any change.
+function refreshSessionDisplay(session) {
+  if (!session) return;
+  const eff = effectiveStatus(session);
+  const def = STATUS_DEF[eff] || STATUS_DEF.idle;
+  const text = def.label();
+
+  if (session.tabEl) session.tabEl.dataset.status = eff;
+  if (session.tabStatusEl) session.tabStatusEl.textContent = text;
+
+  if (isActive(session)) {
+    els.statusPill.className = 'pill ' + def.cls;
+    els.statusText.textContent = text;
+    if (state.pip) {
+      state.pip.setStatus(text, eff === 'translating' || eff === 'connected');
+    }
+  }
 }
+
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function fmtDuration(ms) {
@@ -1710,16 +1871,32 @@ function finalizeTurn(session) {
   session.liveTurn = null;
 }
 
-function setMeter(el, level) {
-  const pct = level <= 0 ? 0 : Math.min(100, Math.sqrt(level) * 110);
-  el.style.width = pct + '%';
+// Per-session level → meter-fill width. Same sqrt curve as before, just
+// painted into the chip-local meter elements. Updates run for ALL sessions
+// (not just the active one) so the user can see every running session's
+// activity in the tab strip at once.
+function levelToPct(level) {
+  return level <= 0 ? 0 : Math.min(100, Math.sqrt(level) * 110);
+}
+
+function paintMeterFill(el, level) {
+  if (!el) return;
+  el.style.width = levelToPct(level) + '%';
 }
 
 function setMicLevelFor(session, level) {
-  if (isActive(session)) setMeter(els.micMeter, level);
+  // Paused sessions: freeze the meter at zero so the user clearly sees the mic
+  // is NOT reaching the model, even though the capture is technically still
+  // open. PTT-waiting sessions still show real level — that confirms the mic
+  // is hearing them, while the status text says "Hold [KEY]".
+  if (session.paused) level = 0;
+  session.lastMicLevel = level;
+  paintMeterFill(session.tabMicFill, level);
 }
+
 function setOutLevelFor(session, level) {
-  if (isActive(session)) setMeter(els.outMeter, level);
+  session.lastOutLevel = level;
+  paintMeterFill(session.tabOutFill, level);
 }
 
 // ─── Control-bar state ───────────────────────────────────────────────────────
@@ -1847,10 +2024,14 @@ async function startSession(session) {
       () => {
         session.pttHeld = true;
         if (session.client) session.client.sendActivityStart();
+        // The chip status flips from "Hold KEY" → "Listening" on the same
+        // frame the key goes down, so the user sees an immediate response.
+        refreshSessionDisplay(session);
       },
       () => {
         session.pttHeld = false;
         if (session.client) session.client.sendActivityEnd();
+        refreshSessionDisplay(session);
       });
   }
 
@@ -1897,14 +2078,17 @@ async function startSession(session) {
   session.running = true;
   session.paused = false;
   if (isActive(session)) applyControlButtonsForActiveSession();
+  refreshBulkActionButtons();
 
   session.startedAt = Date.now();
   if (session.ageTimer) clearInterval(session.ageTimer);
   session.ageTimer = setInterval(() => {
-    if (isActive(session)) {
-      els.sessionAge.textContent = fmtDuration(Date.now() - session.startedAt);
-    }
+    const txt = fmtDuration(Date.now() - session.startedAt);
+    if (session.tabAgeEl) session.tabAgeEl.textContent = txt;
+    if (isActive(session)) els.sessionAge.textContent = txt;
   }, 1000);
+  // Paint once immediately so the chip doesn't read "00:00" for a full second.
+  if (session.tabAgeEl) session.tabAgeEl.textContent = '00:00';
 
   const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
   const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
@@ -1933,12 +2117,17 @@ async function stopSession(session) {
   if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
   finalizeTurn(session);
   setSessionStatus(session, 'idle');
+  // Stale meter state would imply audio is still flowing; zero it explicitly.
+  session.lastMicLevel = 0;
+  session.lastOutLevel = 0;
+  paintMeterFill(session.tabMicFill, 0);
+  paintMeterFill(session.tabOutFill, 0);
+  if (session.tabAgeEl) session.tabAgeEl.textContent = '00:00';
   if (isActive(session)) {
     applyControlButtonsForActiveSession();
     els.sessionAge.textContent = '00:00';
-    setMeter(els.micMeter, 0);
-    setMeter(els.outMeter, 0);
   }
+  refreshBulkActionButtons();
 }
 
 function setControlsLocked(locked) {
@@ -1967,8 +2156,15 @@ function togglePause() {
   // Pause-while-speaking should also stop the model's current TTS output —
   // the user explicitly wants quiet. Coordinator clears the queue slot and
   // suppresses leftover chunks of the in-flight turn.
-  if (session.paused) state.ttsCoordinator.hush(session);
+  if (session.paused) {
+    state.ttsCoordinator.hush(session);
+    // Freeze the mic meter visually so the user can see the model is no
+    // longer hearing them.
+    paintMeterFill(session.tabMicFill, 0);
+    session.lastMicLevel = 0;
+  }
   applyControlButtonsForActiveSession();
+  refreshSessionDisplay(session);  // chip + pill now read "Paused" / "Listening"
   log('info', session.paused ? 'Mic paused.' : 'Mic resumed.');
 }
 
@@ -2293,6 +2489,12 @@ function wireUI() {
   // Tabs: + to add, click chip to activate, click × to close.
   if (els.btnNewSession) {
     els.btnNewSession.addEventListener('click', () => createNewSession({ activate: true }));
+  }
+  if (els.btnStartAll) {
+    els.btnStartAll.addEventListener('click', () => startAllSessions());
+  }
+  if (els.btnStopAll) {
+    els.btnStopAll.addEventListener('click', () => stopAllSessions());
   }
   if (els.tabList) {
     els.tabList.addEventListener('click', (ev) => {
