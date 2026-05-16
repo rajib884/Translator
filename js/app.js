@@ -87,6 +87,7 @@ const els = {
   tabList:       $('tab-list'),
   btnNewSession: $('btn-new-session'),
   turnsHost:     $('turns-host'),
+  modeSwitch:    $('mode-switch'),
   micMeter:      $('mic-meter'),
   outMeter:      $('out-meter'),
   log:           $('log'),
@@ -252,12 +253,31 @@ const state = {
   activeSessionId: null,
   ttsCoordinator: new TTSCoordinator(),
 
+  // 'simple' hides the tab strip and advanced settings sections; 'advanced'
+  // shows everything. Sessions and configs are unaffected — flipping back to
+  // advanced reveals all existing tabs untouched.
+  uiMode: 'simple',
+
   // Truly global UI state.
   pip: null,
   systemPromptTemplate: null,
   companionAvailable: false,
   companionApps: [],
 };
+
+function setUIMode(mode) {
+  if (mode !== 'simple' && mode !== 'advanced') mode = 'simple';
+  state.uiMode = mode;
+  document.body.dataset.uiMode = mode;
+  if (els.modeSwitch) {
+    for (const btn of els.modeSwitch.querySelectorAll('.mode-opt')) {
+      const isThis = btn.dataset.uiMode === mode;
+      btn.classList.toggle('is-active', isThis);
+      btn.setAttribute('aria-pressed', isThis ? 'true' : 'false');
+    }
+  }
+  savePrefs();
+}
 
 function activeSession() {
   return state.activeSessionId ? state.sessions.get(state.activeSessionId) || null : null;
@@ -526,6 +546,7 @@ function savePrefs() {
       vadEnd:      els.vadEnd ? els.vadEnd.value : '',
       vadPrefix:   els.vadPrefix ? Number(els.vadPrefix.value) : null,
       vadSilence:  els.vadSilence ? Number(els.vadSilence.value) : null,
+      uiMode:      state.uiMode || 'simple',
     }));
   } catch (_) {}
 }
@@ -766,6 +787,7 @@ function fillLanguages() {
   els.modeSelect.value  = prefs.mode   || 'audio';
   els.dirSelect.value   = prefs.dir    || 'bidir';
   state.systemPromptTemplate = prefs.promptTemplate || null;
+  setUIMode(prefs.uiMode === 'advanced' ? 'advanced' : 'simple');
 
   const urlKey = new URLSearchParams(location.search).get('api');
   if (urlKey) {
@@ -1696,6 +1718,15 @@ function wireUI() {
   els.btnResetPrompt.addEventListener('click', resetPromptEditor);
   els.btnPip.addEventListener('click', togglePip);
   els.btnPipQuick.addEventListener('click', togglePip);
+
+  // Simple/Advanced toggle.
+  if (els.modeSwitch) {
+    els.modeSwitch.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.mode-opt');
+      if (!btn) return;
+      setUIMode(btn.dataset.uiMode);
+    });
+  }
 
   // Tabs: + to add, click chip to activate, click × to close.
   if (els.btnNewSession) {

@@ -75,6 +75,38 @@ a:hover { text-decoration: underline; }
 .status { display: flex; align-items: center; gap: 8px; }
 .age { font-size: 11px; color: var(--fg-1); background: var(--bg-3); padding: 4px 8px; border-radius: 6px; }
 
+/* Simple/Advanced toggle */
+.mode-switch {
+  display: inline-flex;
+  background: var(--bg-3);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 2px;
+  flex: 0 0 auto;
+}
+.mode-opt {
+  padding: 5px 12px;
+  font-size: 11px; font-weight: 600;
+  color: var(--fg-2);
+  border-radius: 999px;
+  white-space: nowrap;
+  letter-spacing: 0.3px;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.mode-opt:hover { color: var(--fg-1); }
+.mode-opt.is-active {
+  background: var(--bg-1);
+  color: var(--fg-0);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+@media (max-width: 480px) {
+  .mode-opt { padding: 5px 8px; font-size: 10px; }
+}
+
+/* Simple mode hides anything tagged advanced-only and the tab strip */
+body[data-ui-mode="simple"] .tabs { display: none; }
+body[data-ui-mode="simple"] .advanced-only { display: none !important; }
+
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 999px;
@@ -363,8 +395,8 @@ a:hover { text-decoration: underline; }
   flex: 1 1 auto; min-height: 0;
 }
 .section { display: flex; flex-direction: column; gap: 10px; }
-.section.actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-.section.actions .btn { padding: 0 10px; }
+.section.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.section.actions .btn { flex: 1 1 0; min-width: 90px; padding: 0 10px; }
 .footer-hint { margin: 8px 0 0; font-size: 11px; color: var(--fg-2); text-align: center; }
 
 /* Generic sheets (prompt, log) */
@@ -505,7 +537,6 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   }
   .sidebar .sheet-head h2 { font-size: 14px; }
   .sidebar .sheet-body { padding: 18px; gap: 18px; }
-  .section.actions { grid-template-columns: 1fr 1fr 1fr; }
 
   /* Hide the hamburger; settings always visible */
   .menu-btn { display: none; }
