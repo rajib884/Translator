@@ -146,24 +146,32 @@ body[data-ui-mode="simple"] .advanced-only { display: none !important; }
 }
 .tab-chip {
   display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 6px 7px 10px;
+  padding: 6px 4px 6px 10px;
   background: var(--bg-2);
   color: var(--fg-1);
   border: 1px solid var(--line-soft);
-  border-bottom: 0;
   border-radius: 8px 8px 0 0;
   font-size: 12px; font-weight: 600;
   white-space: nowrap;
   user-select: none;
   flex: 0 0 auto;
-  position: relative; bottom: -1px;
-  transition: background 0.12s ease, color 0.12s ease;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  animation: tab-in 0.18s ease-out;
 }
 .tab-chip:hover { background: var(--bg-3); color: var(--fg-0); }
 .tab-chip.is-active {
   background: var(--bg-0);
   color: var(--fg-0);
-  border-color: var(--line-soft);
+  /* Bottom border colour matches the conv panel below so the chip "merges" with
+     it; the negative margin pulls the chip 1px down to overlap the strip's own
+     border-bottom, hiding the strip-line under the active chip. */
+  border-bottom-color: var(--bg-0);
+  margin-bottom: -1px;
+}
+@keyframes tab-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
 }
 .tab-status-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -177,13 +185,16 @@ body[data-ui-mode="simple"] .advanced-only { display: none !important; }
 .tab-label { line-height: 1; letter-spacing: 0.4px; }
 .tab-close {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 18px; height: 18px;
+  width: 22px; height: 22px;
   border-radius: 50%;
   font-size: 16px; line-height: 1;
   color: var(--fg-2);
   margin-left: 2px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
 }
-.tab-close:hover { background: var(--bg-3); color: var(--fg-0); }
+.tab-close:hover { background: rgba(248, 113, 113, 0.18); color: var(--bad); }
+.tab-chip.is-active .tab-close:hover { background: rgba(248, 113, 113, 0.22); }
 .tab-new {
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px;
@@ -498,8 +509,8 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
     grid-template-rows: auto auto auto 1fr auto;
     grid-template-areas:
       "sidebar topbar"
-      "sidebar tabs"
       "sidebar meter"
+      "sidebar tabs"
       "sidebar conv"
       "sidebar controls";
     overflow: hidden;
@@ -582,6 +593,95 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 
   /* Sheets: cap width centered on desktop */
   .sheet-content { max-width: 640px; }
+}
+
+/* ─── Polish: focus, scrollbars, dividers, narrow phones ─── */
+
+/* Visible keyboard focus on every interactive surface. Preserves :focus
+   behaviour for mouse/touch (no ring) but shows it for keyboard nav. */
+.btn:focus-visible,
+.icon-btn:focus-visible,
+.swap:focus-visible,
+.mode-opt:focus-visible,
+.tab-chip:focus-visible,
+.tab-close:focus-visible,
+.tab-new:focus-visible,
+.link-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.tab-chip { outline-offset: -2px; }
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: none;     /* the .focus border-color rule already handles these */
+}
+
+/* Custom scrollbars — match the dark palette, stay slim. */
+.session-turns, .log, .sheet-body, .sidebar-inner {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-3) transparent;
+}
+.session-turns::-webkit-scrollbar,
+.log::-webkit-scrollbar,
+.sheet-body::-webkit-scrollbar,
+.sidebar-inner::-webkit-scrollbar { width: 8px; }
+.session-turns::-webkit-scrollbar-thumb,
+.log::-webkit-scrollbar-thumb,
+.sheet-body::-webkit-scrollbar-thumb,
+.sidebar-inner::-webkit-scrollbar-thumb {
+  background: var(--bg-3); border-radius: 4px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+.session-turns::-webkit-scrollbar-thumb:hover,
+.log::-webkit-scrollbar-thumb:hover,
+.sheet-body::-webkit-scrollbar-thumb:hover,
+.sidebar-inner::-webkit-scrollbar-thumb:hover {
+  background: var(--line); background-clip: padding-box;
+}
+
+/* Subtle dividers between sidebar sections — gives the panel rhythm without
+   shouting. Skip the first and any hidden section so the spacing stays clean. */
+.sheet-body > .section + .section:not(.actions) {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 14px;
+}
+.sheet-body > .section.actions { margin-top: 4px; }
+
+/* Subtle elevation: a 1px highlight on the topbar gives it depth against
+   the sidebar/content seam. */
+.topbar { box-shadow: inset 0 -1px 0 var(--line-soft); border-bottom: 0; }
+.controls { box-shadow: inset 0 1px 0 var(--line-soft); border-top: 0; }
+
+/* Smooth transition between sessions. Showing/hiding via display: flex/none
+   can't transition; fade the active session instead. */
+.session-turns.is-active { animation: session-in 0.14s ease-out; }
+@keyframes session-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Status pill: better hover affordance for keyboard users (it's not clickable
+   but the dot's pulse can feel busy with too much else moving). */
+.pill { transition: background 0.12s ease; }
+
+/* Pause/Hush/Stop transitions match the rest. */
+.btn .icon, .icon-btn .icon { transition: color 0.12s ease; }
+
+/* Narrow phones: reclaim space in the topbar.
+   - Below 480px, keep the mode-switch but tighten it.
+   - Below 380px, hide the age (already minimal real-estate).
+   - Below 340px, drop the title text too (logo stays). */
+@media (max-width: 380px) {
+  .age { display: none; }
+}
+@media (max-width: 340px) {
+  .title-text { display: none; }
+  .topbar { gap: 6px; padding-left: 8px; padding-right: 8px; }
+  .mode-opt { padding: 4px 6px; font-size: 9.5px; }
+}
+
+/* Tabs at touch-friendly height on mobile. */
+@media (hover: none) {
+  .tab-close { width: 26px; height: 26px; }
 }
 
 /* ─── Reduced motion ─── */

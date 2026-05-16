@@ -124,6 +124,11 @@ class Session {
     // DOM owned by this session.
     this.tabEl = null;             // .tab-chip
     this.transcriptEl = null;      // .session-turns
+
+    // Set true by the TTS coordinator while this session is queued or
+    // speaking; sendAudioGated swaps real audio for zero-filled buffers so
+    // the model neither picks up another turn nor hears its own output.
+    this.muteInput = false;
   }
 
   get isAudio() { return this.config.mode === 'audio'; }
@@ -149,6 +154,10 @@ class TTSCoordinator {
       buffered: [],
       wantsToSpeak: false,
       turnComplete: false,
+      // True after Hush is hit mid-turn: drop the rest of the model's chunks
+      // for this turn so they don't immediately restart playback. Cleared on
+      // the next turn-complete signal (a fresh user utterance gets a fresh slate).
+      suppressed: false,
     };
     this.entries.set(session.id, entry);
 
@@ -170,11 +179,16 @@ class TTSCoordinator {
       this._tryStartNext();
     }
     session.muteInput = false;
+    // Note: entry is now gone, so any leftover chunks from gemini-live for
+    // this session id will be dropped by enqueueChunk's `if (!entry) return`.
   }
 
   enqueueChunk(session, b64) {
     const entry = this.entries.get(session.id);
     if (!entry) return;
+    // Drop chunks that arrive after Hush, until the model signals the turn
+    // is over (then suppression lifts and the next utterance plays normally).
+    if (entry.suppressed) return;
     if (!entry.wantsToSpeak) {
       entry.wantsToSpeak = true;
       entry.turnComplete = false;
@@ -190,7 +204,15 @@ class TTSCoordinator {
 
   markTurnComplete(session) {
     const entry = this.entries.get(session.id);
-    if (!entry || !entry.wantsToSpeak) return;
+    if (!entry) return;
+    // A turn ended — clear suppression so the next user utterance can speak.
+    if (entry.suppressed) {
+      entry.suppressed = false;
+      // No further bookkeeping: hush() already released the slot and the
+      // mic gate. We just stop dropping incoming chunks from the next turn.
+      return;
+    }
+    if (!entry.wantsToSpeak) return;
     entry.turnComplete = true;
     if (this.currentSpeakerId === session.id) {
       this._maybeFinishSpeaking(session.id);
@@ -200,10 +222,15 @@ class TTSCoordinator {
   hush(session) {
     const entry = this.entries.get(session.id);
     if (!entry) return;
+    // If we were mid-turn (had wantsToSpeak set), the model is still streaming.
+    // Suppress remaining chunks so they don't re-enter the queue and restart
+    // playback. Suppression auto-clears on the next turn-complete.
+    const wasMidTurn = entry.wantsToSpeak;
     try { entry.player.hush(); } catch (_) {}
     entry.buffered.length = 0;
     entry.wantsToSpeak = false;
     entry.turnComplete = false;
+    entry.suppressed = wasMidTurn;
     session.muteInput = false;
     if (this.currentSpeakerId === session.id) {
       this.currentSpeakerId = null;
@@ -391,7 +418,41 @@ function setActiveSession(id) {
   setMeter(els.micMeter, 0);
   setMeter(els.outMeter, 0);
 
+  // PiP follows the active session: relabel and replay the session's transcript
+  // so what's on the popout matches what's in the main window.
+  if (state.pip) seedPipFromSession(next);
+
+  // Auto-scroll the new tab's transcript to the bottom so the latest turn is
+  // in view (transcripts can be scrolled up while the user is reading old ones).
+  if (next.transcriptEl) {
+    next.transcriptEl.scrollTop = next.transcriptEl.scrollHeight;
+  }
+
   saveSessions();
+}
+
+function seedPipFromSession(session) {
+  if (!state.pip) return;
+  state.pip.setStatus(els.statusText.textContent,
+    session.status === 'translating' || session.status === 'connected');
+  state.pip.setLangs(langName(session.config.source), langName(session.config.target));
+  if (session.liveTurn) {
+    state.pip.setInput(session.liveTurn.inputText);
+    state.pip.setOutput(session.liveTurn.outputText);
+    return;
+  }
+  if (session.transcriptEl) {
+    const last = session.transcriptEl.querySelector('.turn:last-child');
+    if (last) {
+      const it = last.querySelector('.turn-row.input .turn-text');
+      const ot = last.querySelector('.turn-row.output .turn-text');
+      state.pip.setInput(it && !it.classList.contains('empty') ? it.textContent : '');
+      state.pip.setOutput(ot && !ot.classList.contains('empty') ? ot.textContent : '');
+      return;
+    }
+  }
+  state.pip.setInput('');
+  state.pip.setOutput('');
 }
 
 function loadSessionConfigIntoUI(session) {
@@ -1406,9 +1467,11 @@ function togglePause() {
   const session = activeSession();
   if (!session || !session.running) return;
   session.paused = !session.paused;
-  els.btnPause.classList.toggle('is-paused', session.paused);
-  els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  // Pause-while-speaking should also stop the model's current TTS output —
+  // the user explicitly wants quiet. Coordinator clears the queue slot and
+  // suppresses leftover chunks of the in-flight turn.
   if (session.paused) state.ttsCoordinator.hush(session);
+  applyControlButtonsForActiveSession();
   log('info', session.paused ? 'Mic paused.' : 'Mic resumed.');
 }
 
@@ -1633,24 +1696,11 @@ async function togglePip() {
   pip.onClose = () => { if (state.pip === pip) state.pip = null; };
 
   const session = activeSession();
-  pip.setStatus(els.statusText.textContent, els.statusPill.classList.contains('pill-translating')
-                                              || els.statusPill.classList.contains('pill-listening'));
   if (session) {
-    pip.setLangs(langName(session.config.source), langName(session.config.target));
+    seedPipFromSession(session);
   } else {
+    pip.setStatus(els.statusText.textContent, false);
     pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
-  }
-  if (session && session.liveTurn) {
-    pip.setInput(session.liveTurn.inputText);
-    pip.setOutput(session.liveTurn.outputText);
-  } else if (session && session.transcriptEl) {
-    const last = session.transcriptEl.querySelector('.turn:last-child');
-    if (last) {
-      const it = last.querySelector('.turn-row.input .turn-text');
-      const ot = last.querySelector('.turn-row.output .turn-text');
-      pip.setInput(it && !it.classList.contains('empty') ? it.textContent : '');
-      pip.setOutput(ot && !ot.classList.contains('empty') ? ot.textContent : '');
-    }
   }
   log('info', PipController.isDocPipSupported() ? 'Pop-out window opened.' : 'Pop-out (popup fallback) opened.');
 }
@@ -1747,11 +1797,18 @@ function wireUI() {
   }
 
   // Empty-state "Settings" button is created dynamically per session — use
-  // event delegation so we don't re-bind on every render.
+  // event delegation so we don't re-bind on every render. On desktop the
+  // sidebar is always visible so openSheet is a no-op; either way, focusing
+  // the API key field is the actually useful action.
   if (els.turnsHost) {
     els.turnsHost.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-empty-action="open-settings"]')) {
         openSheet('sidebar');
+        // Give the sheet a beat to slide up on mobile before focusing, so the
+        // mobile keyboard doesn't race the animation.
+        setTimeout(() => {
+          try { els.apiKey.focus({ preventScroll: false }); } catch (_) { els.apiKey.focus(); }
+        }, 220);
       }
     });
   }
