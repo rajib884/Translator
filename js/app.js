@@ -703,11 +703,12 @@ function removeSessionEmptyState(session) {
 function vkLabel(binding) {
   if (!binding || !Number.isFinite(binding.vkCode)) return 'Not set — click to bind';
   const parts = [];
-  if (binding.ctrl)  parts.push('Ctrl');
-  if (binding.shift) parts.push('Shift');
-  if (binding.alt)   parts.push('Alt');
-  if (binding.win)   parts.push('Win');
-  parts.push(binding.label || keyLabelFromVk(binding.vkCode));
+  const label = binding.label || keyLabelFromVk(binding.vkCode);
+  if (binding.ctrl && label !== 'Ctrl')  parts.push('Ctrl');
+  if (binding.shift && label !== 'Shift') parts.push('Shift');
+  if (binding.alt && label !== 'Alt')   parts.push('Alt');
+  if (binding.win && label !== 'Win')   parts.push('Win');
+  parts.push(label);
   return parts.join(' + ');
 }
 
@@ -754,12 +755,11 @@ function keyLabelFromCode(code) {
 function bindingFromKeyboardEvent(ev) {
   const vkCode = ev.keyCode || ev.which || 0;
   if (!vkCode) return null;
-  // Disallow pure modifier keys as the main key — they'd fire on every Ctrl
-  // press and be unusable.
-  if (vkCode === 0x10 || vkCode === 0x11 || vkCode === 0x12 ||
-      vkCode === 0x5B || vkCode === 0x5C) return null;
+  const isModifier = (vkCode === 0x10 || vkCode === 0x11 || vkCode === 0x12 ||
+                      vkCode === 0x5B || vkCode === 0x5C);
   return {
     vkCode,
+    isModifier,
     ctrl:  !!ev.ctrlKey,
     shift: !!ev.shiftKey,
     alt:   !!ev.altKey,
@@ -826,18 +826,15 @@ function beginPttCapture() {
   if (state.pttCapturing) return;
   state.pttCapturing = true;
   updatePttButton();
+
   const finish = () => {
     state.pttCapturing = false;
-    window.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('keyup', onKeyUp, true);
     updatePttButton();
   };
-  const onKey = (ev) => {
-    ev.preventDefault();
-    ev.stopPropagation();
-    // Escape cancels capture without binding — gives the user an escape hatch.
-    if (ev.key === 'Escape') { finish(); return; }
-    const binding = bindingFromKeyboardEvent(ev);
-    if (!binding) return;     // modifier-only press; keep waiting
+
+  const finishCapture = (binding) => {
     finish();
     state.pttBinding = binding;
     if (state.pttClient) state.pttClient.setBinding(binding);
@@ -845,8 +842,37 @@ function beginPttCapture() {
     updatePttButton();
     log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
   };
+
+  const onKeyDown = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    // Escape cancels capture without binding — gives the user an escape hatch.
+    if (ev.key === 'Escape') { finish(); return; }
+    const binding = bindingFromKeyboardEvent(ev);
+    if (!binding) return;
+
+    if (!binding.isModifier) {
+      // Non-modifier key pressed: finish immediately.
+      finishCapture(binding);
+    } else {
+      // Modifier key pressed: update the "Press a key" label to show current combo,
+      // but wait for either a non-modifier or a keyup to finish.
+      if (els.pttKeyLabel) els.pttKeyLabel.textContent = vkLabel(binding);
+    }
+  };
+
+  const onKeyUp = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    // If a key is released while we're still capturing, it means the user
+    // wanted to bind just that modifier (or modifier combo).
+    const binding = bindingFromKeyboardEvent(ev);
+    if (binding) finishCapture(binding);
+  };
+
   // Capture-phase so the keypress doesn't trigger sidebar/sheet shortcuts.
-  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('keyup', onKeyUp, true);
   // Safety: bail after 6 seconds if the user changed their mind.
   setTimeout(finish, 6000);
 }

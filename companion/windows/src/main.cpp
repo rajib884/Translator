@@ -910,7 +910,15 @@ LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
           wantAlt   = conn->binding.alt;
           wantWin   = conn->binding.win;
         }
-        if (vk == 0 || k->vkCode != vk) continue;
+        if (vk == 0) continue;
+
+        DWORD hookVk = k->vkCode;
+        if (hookVk == VK_LSHIFT || hookVk == VK_RSHIFT) hookVk = VK_SHIFT;
+        else if (hookVk == VK_LCONTROL || hookVk == VK_RCONTROL) hookVk = VK_CONTROL;
+        else if (hookVk == VK_LMENU || hookVk == VK_RMENU) hookVk = VK_MENU;
+
+        if (hookVk != vk) continue;
+
         if (isDown) {
           // Modifier check only on press — the user may release modifiers
           // before the main key, and we still want a clean UP event.
