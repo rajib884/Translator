@@ -9,6 +9,12 @@ const LIVE_URL = (apiKey) =>
 const DEFAULT_MODEL = 'models/gemini-3.1-flash-live-preview';
 const GOAWAY_SAFETY_MS = 2000;
 const RECONNECT_BACKOFF_MS = 1500;
+const RECONNECT_MAX_MS = 30000;
+const MAX_RECONNECT_ATTEMPTS = 8;
+// Close codes the server uses to signal something we cannot fix by reconnecting
+// (auth failure, policy violation, internal-error-after-policy). Treat as fatal
+// so we don't hammer the endpoint forever and so the user sees a real error.
+const FATAL_CLOSE_CODES = new Set([1008, 1011]);
 
 const DEFAULT_SYSTEM_PROMPT_TEMPLATE =
 `You are a strict real-time translation engine. You translate spoken audio between {source} and {target} in BOTH directions:
@@ -92,6 +98,12 @@ class GeminiLiveClient {
     this._reconnectTimer = null;
     this._goAwayTimer = null;
     this._setupComplete = false;
+    // Reset to 0 on a successful setupComplete; bumped on every non-clean close
+    // so the backoff ratchets up and we give up after MAX_RECONNECT_ATTEMPTS.
+    this._reconnectAttempts = 0;
+    // Single TextDecoder reused for binary frames (allocation is cheap but
+    // keeping one matches the per-instance lifetime of everything else here).
+    this._textDecoder = new TextDecoder();
   }
 
   _setState(s) {
@@ -116,6 +128,7 @@ class GeminiLiveClient {
     }
     this.resumeHandle = null;
     this._setupComplete = false;
+    this._reconnectAttempts = 0;
     this._setState('idle');
   }
 
@@ -133,7 +146,11 @@ class GeminiLiveClient {
       this._setState('error');
       return;
     }
-    this.ws.binaryType = 'blob';
+    // Use ArrayBuffer (not Blob) so _onMessage can decode synchronously.
+    // Async handlers (await ev.data.text()) let the browser deliver subsequent
+    // frames in arbitrary order, which corrupts setupComplete / turnComplete
+    // sequencing on bursty conversations.
+    this.ws.binaryType = 'arraybuffer';
     this._setState('connecting');
     this.ws.onopen = () => this._onOpen();
     this.ws.onmessage = (ev) => this._onMessage(ev);
@@ -187,11 +204,12 @@ class GeminiLiveClient {
     this.onLog('info', this.resumeHandle ? 'Resuming session…' : 'Opening session…');
   }
 
-  async _onMessage(ev) {
+  // Synchronous on purpose — see the binaryType comment in _connect. If you
+  // re-introduce an await here, frames will be processed out of order.
+  _onMessage(ev) {
     let text;
     if (typeof ev.data === 'string') text = ev.data;
-    else if (ev.data instanceof Blob) text = await ev.data.text();
-    else if (ev.data instanceof ArrayBuffer) text = new TextDecoder().decode(ev.data);
+    else if (ev.data instanceof ArrayBuffer) text = this._textDecoder.decode(ev.data);
     else return;
 
     let msg;
@@ -202,6 +220,10 @@ class GeminiLiveClient {
 
     if (msg.setupComplete !== undefined) {
       this._setupComplete = true;
+      // Reaching setupComplete means the endpoint accepted our key and config.
+      // Any future close is "happened after a working session", so the failure
+      // budget resets and the next disconnect starts at the base backoff.
+      this._reconnectAttempts = 0;
       this._setState('connected');
       this.onLog('info', 'Connected to Gemini Live');
       return;
@@ -258,8 +280,46 @@ class GeminiLiveClient {
       this._setState('idle');
       return;
     }
+
+    // Fatal: server explicitly rejected us. Reconnecting won't help — the user
+    // needs to act (fix API key, accept terms, etc.). Surface clearly and stop.
+    if (FATAL_CLOSE_CODES.has(ev.code)) {
+      const detail = ev.reason ? `: ${ev.reason}` : '';
+      this.onLog('error',
+        `Connection rejected (${ev.code}${detail}). Check your API key and try again.`);
+      this.shouldRun = false;
+      this._reconnectAttempts = 0;
+      this._setState('error');
+      return;
+    }
+
+    // Clean closes (e.g., our own GoAway-triggered reconnect) don't burn the
+    // retry budget — we expect them and reconnect quickly with the saved handle.
+    const isClean = ev.code === 1000;
+    if (!isClean) {
+      this._reconnectAttempts++;
+      if (this._reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        this.onLog('error',
+          `Giving up after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts. Check your network and API key.`);
+        this.shouldRun = false;
+        this._reconnectAttempts = 0;
+        this._setState('error');
+        return;
+      }
+    }
+
     this._setState('reconnecting');
-    const delay = ev.code === 1000 ? 250 : RECONNECT_BACKOFF_MS;
+    // Exponential backoff with jitter: 1.5s → 3s → 6s → … capped at 30s. The
+    // jitter keeps multiple simultaneous sessions from re-handshaking in lockstep.
+    let delay;
+    if (isClean) {
+      delay = 250;
+    } else {
+      const exp = Math.min(
+        RECONNECT_MAX_MS,
+        RECONNECT_BACKOFF_MS * Math.pow(2, this._reconnectAttempts - 1));
+      delay = exp + Math.random() * 500;
+    }
     this._reconnectTimer = setTimeout(() => this._connect(), delay);
   }
 

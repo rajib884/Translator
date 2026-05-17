@@ -324,6 +324,12 @@ class TTSPlayer {
     this.sources = new Set();
     this._level = 0;
     this._rafId = 0;
+    // Serialises sink reconfiguration against chunk playback. _applyDevices
+    // tears down and rebuilds the analyser→destination connections across
+    // multiple awaits (setSinkId, play); a playChunk landing mid-window would
+    // schedule a BufferSource into a disconnected graph and play silently.
+    // playChunk awaits this queue so chunks always see a fully-connected sink.
+    this._applyDevicesQueue = Promise.resolve();
   }
 
   // Strip empties to a single '' (default), de-dupe, and keep order.
@@ -368,7 +374,17 @@ class TTSPlayer {
     try { this.analyser && this.analyser.disconnect(); } catch (_) {}
   }
 
-  async _applyDevices(ids) {
+  // Public entry point — chains onto _applyDevicesQueue so concurrent callers
+  // (and any playChunks waiting on the queue) run in a well-defined order.
+  _applyDevices(ids) {
+    const next = this._applyDevicesQueue
+      .catch(() => {})                       // never let one failure poison the chain
+      .then(() => this._doApplyDevices(ids));
+    this._applyDevicesQueue = next;
+    return next;
+  }
+
+  async _doApplyDevices(ids) {
     if (!this.ctx || !this.analyser) return;
 
     this._tearDownSinks();
@@ -437,6 +453,10 @@ class TTSPlayer {
 
   async playChunk(base64Pcm) {
     await this.ensureCtx();
+    // Wait for any in-flight sink reconfiguration before scheduling. The queue
+    // is also awaited inside _applyDevices itself, so this is a no-op when the
+    // graph is already settled.
+    await this._applyDevicesQueue.catch(() => {});
     const bin = atob(base64Pcm);
     const n = bin.length;
     const bytes = new Uint8Array(n);
