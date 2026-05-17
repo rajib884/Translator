@@ -143,7 +143,8 @@ bool is_origin_allowed(const std::string& origin) {
          starts_with(origin, "http://localhost") ||
          starts_with(origin, "https://localhost") ||
          starts_with(origin, "http://127.0.0.1") ||
-         starts_with(origin, "https://127.0.0.1");
+         starts_with(origin, "https://127.0.0.1") ||
+         origin == "https://rajib884.github.io";
 }
 
 std::string header_value(const std::string& req, const std::string& name) {
@@ -1107,7 +1108,9 @@ void handle_client(SOCKET accepted) {
       "Access-Control-Allow-Private-Network: true\r\n";
 
   if (!is_origin_allowed(origin)) {
-    send_text(client.s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+    // Include the CORS header so the browser can read the 403 body and show
+    // a clear "403 Forbidden" error instead of a misleading "CORS header missing".
+    send_text(client.s, "HTTP/1.1 403 Forbidden\r\n" + cors + "Content-Length: 0\r\n\r\n");
     return;
   }
 
