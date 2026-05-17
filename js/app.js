@@ -543,6 +543,7 @@ const state = {
   sessions: new Map(),
   activeSessionId: null,
   ttsCoordinator: new TTSCoordinator(),
+  micPassthrough: new LiveAudio.MicPassthrough(),
 
   // 'simple' hides the tab strip and advanced settings sections; 'advanced'
   // shows everything. Sessions and configs are unaffected — flipping back to
@@ -594,7 +595,7 @@ function readConfigFromUI() {
     vad:    currentVadConfig(),
     audioSource:    els.audioSource.value || 'mic',
     micDeviceId:    els.audioInput.value || '',
-    outputDeviceId: els.audioOutput.value || '',
+    outputDeviceIds: getSelectedOutputDeviceIds(),
     companionApp:   els.companionApp ? els.companionApp.value : '',
     // 'auto' = automatic VAD on Gemini's side, 'ptt' = client signals activity
     // via the companion-app global hotkey. The hotkey binding itself is global
@@ -972,8 +973,10 @@ function loadSessionConfigIntoUI(session) {
   // active session's preference.
   els.audioInput.value = cfg.micDeviceId;
   els.audioInput.dataset.preferred = cfg.micDeviceId;
-  els.audioOutput.value = cfg.outputDeviceId;
-  els.audioOutput.dataset.preferred = cfg.outputDeviceId;
+  const outIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
+  cfg.outputDeviceIds = outIds;
+  setSelectedOutputDeviceIds(outIds);
+  els.audioOutput.dataset.preferred = JSON.stringify(outIds);
   if (els.companionApp) {
     els.companionApp.value = cfg.companionApp || '';
     els.companionApp.dataset.preferred = cfg.companionApp || '';
@@ -1134,6 +1137,8 @@ function restoreSessionsFromStorage() {
   for (const entry of entries) {
     const cfg = Object.assign({}, fallback, entry.config || {});
     cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+    cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
+    delete cfg.outputDeviceId;
     const session = new Session({
       id: entry.id || newSessionId(),
       config: cfg,
@@ -1165,7 +1170,8 @@ function savePrefs() {
       voice:  els.voice.value,
       input:  els.audioInput.value,
       audio:  els.audioSource.value,
-      output: els.audioOutput.value,
+      outputs: getSelectedOutputDeviceIds(),
+      passthroughDeviceIds: getPassthroughDeviceIds(),
       mode:   els.modeSelect.value,
       dir:    els.dirSelect.value,
       promptTemplate: state.systemPromptTemplate || '',
@@ -1429,8 +1435,10 @@ function fillLanguages() {
   els.audioInput.dataset.preferred = prefs.input || '';
   els.audioInput.value  = prefs.input  || '';
   els.audioSource.value = prefs.audio  || 'mic';
-  els.audioOutput.dataset.preferred = prefs.output || '';
-  els.audioOutput.value = prefs.output || '';
+  const prefOutIds = normalizeOutputDeviceIds(prefs.outputs, prefs.output);
+  els.audioOutput.dataset.preferred = JSON.stringify(prefOutIds);
+  els.audioOutput.dataset.preferredPassthrough = JSON.stringify(prefs.passthroughDeviceIds || []);
+  setSelectedOutputDeviceIds(prefOutIds);
   if (els.companionApp) {
     els.companionApp.dataset.preferred = prefs.companionApp || '';
     els.companionApp.value = prefs.companionApp || '';
@@ -1493,10 +1501,78 @@ function updateAudioOutputSupport() {
   const canSelect = LiveAudio.canSelectOutputDevice && LiveAudio.canSelectOutputDevice();
   const canList = !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices);
   const supported = canSelect && canList;
-  els.audioOutput.disabled = !supported;
+  setOutputDeviceListDisabled(!supported);
   if (!supported) {
     els.audioOutputHint.textContent = 'This browser does not allow web apps to choose a speaker.';
   }
+}
+
+function setOutputDeviceListDisabled(disabled) {
+  if (!els.audioOutput) return;
+  els.audioOutput.classList.toggle('is-disabled', !!disabled);
+  els.audioOutput.dataset.disabled = disabled ? 'true' : 'false';
+  els.audioOutput.querySelectorAll('input[type=checkbox]').forEach((cb) => {
+    cb.disabled = !!disabled;
+  });
+}
+
+function isOutputDeviceListDisabled() {
+  return !!(els.audioOutput && els.audioOutput.dataset.disabled === 'true');
+}
+
+// Reads what's currently ticked. Empty array means "none selected", which
+// downstream we treat as "system default" so a session never goes silent.
+function getSelectedOutputDeviceIds() {
+  if (!els.audioOutput) return [];
+  return Array.from(els.audioOutput.querySelectorAll('input.dev-tts:checked'))
+    .map((cb) => cb.value);
+}
+
+function setSelectedOutputDeviceIds(ids) {
+  if (!els.audioOutput) return;
+  const want = new Set((ids || []).map((id) => id || ''));
+  els.audioOutput.querySelectorAll('input.dev-tts').forEach((cb) => {
+    cb.checked = want.has(cb.value);
+  });
+}
+
+function getPassthroughDeviceIds() {
+  if (!els.audioOutput) return [];
+  return Array.from(els.audioOutput.querySelectorAll('input.dev-passthrough:checked'))
+    .map((cb) => cb.value);
+}
+
+// Starts/stops the global mic passthrough based on which devices have the
+// mic icon toggled on. Completely independent of translation sessions.
+async function applyPassthrough() {
+  const ids = getPassthroughDeviceIds();
+  const micId = els.audioInput ? els.audioInput.value || '' : '';
+  try {
+    await state.micPassthrough.update(micId, ids);
+    if (ids.length > 0 && !state.micPassthrough.running) {
+      log('warn', 'Mic passthrough could not start (check browser permissions).');
+    }
+  } catch (e) {
+    log('warn', 'Mic passthrough error: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// Coerce legacy single-string saves and stray inputs into a clean array.
+function normalizeOutputDeviceIds(arr, legacySingle) {
+  let raw;
+  if (Array.isArray(arr)) raw = arr;
+  else if (typeof arr === 'string') raw = [arr];
+  else if (legacySingle != null) raw = [legacySingle];
+  else raw = [];
+  const seen = new Set();
+  const out = [];
+  for (const v of raw) {
+    const s = v == null ? '' : String(v);
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
 }
 
 function inputDeviceLabel(device, index) {
@@ -1561,18 +1637,29 @@ async function refreshAudioInputDevices() {
 }
 
 async function refreshAudioOutputDevices() {
-  if (!els.audioOutput || els.audioOutput.disabled) return;
+  if (!els.audioOutput || isOutputDeviceListDisabled()) return;
   try {
-    const selected = els.audioOutput.value || els.audioOutput.dataset.preferred || '';
+    let preferred = [];
+    try { preferred = JSON.parse(els.audioOutput.dataset.preferred || '[]'); }
+    catch (_) { preferred = []; }
+    if (!Array.isArray(preferred)) preferred = [];
+
+    let prefPassthrough = [];
+    try { prefPassthrough = JSON.parse(els.audioOutput.dataset.preferredPassthrough || '[]'); }
+    catch (_) { prefPassthrough = []; }
+    if (!Array.isArray(prefPassthrough)) prefPassthrough = [];
+
+    const currently = new Set(getSelectedOutputDeviceIds());
+    const currentPt = new Set(getPassthroughDeviceIds());
+    // Anything currently ticked wins over stale dataset values.
+    const wantedTts = new Set([...currently, ...preferred.map((v) => v || '')]);
+    const wantedPt  = new Set([...currentPt, ...prefPassthrough.map((v) => v || '')]);
+
     const devices = await navigator.mediaDevices.enumerateDevices();
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
     const seen = new Set();
     const frag = document.createDocumentFragment();
-
-    const defaultOpt = document.createElement('option');
-    defaultOpt.value = '';
-    defaultOpt.textContent = 'System default';
-    frag.appendChild(defaultOpt);
+    frag.appendChild(buildDeviceOption('', 'System default', wantedTts.has(''), wantedPt.has('')));
     seen.add('');
 
     outputs.forEach((device, index) => {
@@ -1580,45 +1667,100 @@ async function refreshAudioOutputDevices() {
       if (id === 'default') return;
       if (seen.has(id)) return;
       seen.add(id);
-      const opt = document.createElement('option');
-      opt.value = id;
-      opt.textContent = outputDeviceLabel(device, index);
-      frag.appendChild(opt);
+      frag.appendChild(buildDeviceOption(id, outputDeviceLabel(device, index), wantedTts.has(id), wantedPt.has(id)));
     });
 
     els.audioOutput.innerHTML = '';
     els.audioOutput.appendChild(frag);
-    els.audioOutput.value = seen.has(selected) ? selected : '';
-    els.audioOutput.dataset.preferred = els.audioOutput.value;
+    // Drop ids that no longer map to a present device.
+    els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
+    els.audioOutput.dataset.preferredPassthrough = JSON.stringify(getPassthroughDeviceIds());
 
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
       els.audioOutputHint.textContent = hasLabels
-        ? 'Changes apply immediately to translated speech when supported by the browser.'
+        ? 'Tick speakers for translated audio; tap the mic icon to also route your microphone there.'
         : 'Device names may appear after microphone permission.';
     } else {
       els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
     }
     savePrefs();
+    applyPassthrough();
   } catch (e) {
-    els.audioOutput.disabled = true;
+    setOutputDeviceListDisabled(true);
     els.audioOutputHint.textContent = 'Could not read audio output devices.';
     log('warn', 'Audio output devices unavailable: ' + (e && e.message ? e.message : e));
   }
 }
 
+function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
+  const row = document.createElement('div');
+  row.className = 'device-option';
+
+  // Left side: TTS checkbox + device name
+  const ttsLabel = document.createElement('label');
+  ttsLabel.className = 'device-tts-label';
+  const ttsCb = document.createElement('input');
+  ttsCb.type = 'checkbox';
+  ttsCb.className = 'dev-tts';
+  ttsCb.value = value;
+  ttsCb.checked = !!ttsChecked;
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'device-name';
+  nameSpan.textContent = label;
+  ttsLabel.appendChild(ttsCb);
+  ttsLabel.appendChild(nameSpan);
+
+  // Right side: passthrough mic toggle (decoupled from session lifecycle)
+  const ptLabel = document.createElement('label');
+  ptLabel.className = 'passthrough-toggle';
+  ptLabel.title = 'Pass microphone audio to this device (runs independently of sessions)';
+  const ptCb = document.createElement('input');
+  ptCb.type = 'checkbox';
+  ptCb.className = 'dev-passthrough';
+  ptCb.value = value;
+  ptCb.checked = !!passthroughChecked;
+  const ptIcon = document.createElement('span');
+  ptIcon.className = 'pt-icon';
+  ptIcon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  ptLabel.appendChild(ptCb);
+  ptLabel.appendChild(ptIcon);
+
+  row.appendChild(ttsLabel);
+  row.appendChild(ptLabel);
+  return row;
+}
+
 async function changeAudioOutput() {
-  els.audioOutput.dataset.preferred = els.audioOutput.value;
+  const ids = getSelectedOutputDeviceIds();
+  els.audioOutput.dataset.preferred = JSON.stringify(ids);
   onSettingsChange();
   const session = activeSession();
   if (!session || !session.player) return;
   try {
-    await session.player.setOutputDevice(els.audioOutput.value);
-    log('info', 'Audio output changed: ' + (els.audioOutput.selectedOptions[0]?.textContent || 'System default'));
+    await session.player.setOutputDevices(ids);
+    const labels = describeSelectedOutputs(ids);
+    log('info', 'Audio output changed: ' + labels);
   } catch (e) {
     log('error', 'Audio output change failed: ' + (e && e.message ? e.message : e));
     await refreshAudioOutputDevices();
   }
+}
+
+function describeSelectedOutputs(ids) {
+  if (!ids || ids.length === 0) return 'System default';
+  const names = ids.map((id) => {
+    const cb = els.audioOutput.querySelector(`input.dev-tts[value="${cssEscape(id)}"]`);
+    if (!cb) return id || 'System default';
+    const span = cb.closest('.device-option') && cb.closest('.device-option').querySelector('.device-name');
+    return span ? span.textContent : (id || 'System default');
+  });
+  return names.join(', ');
+}
+
+function cssEscape(s) {
+  if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(s || '');
+  return String(s || '').replace(/["\\]/g, '\\$&');
 }
 
 // ─── Per-session capture/player factories ────────────────────────────────────
@@ -1685,6 +1827,8 @@ async function changeAudioInput() {
     log('error', 'Microphone change failed: ' + (e && e.message ? e.message : e));
     await refreshAudioInputDevices();
   }
+  // Passthrough uses the same mic — restart it with the new device.
+  applyPassthrough();
 }
 
 // ─── Status pill / per-session display ────────────────────────────────────────
@@ -1990,7 +2134,7 @@ async function startSession(session) {
 
   if (isAudio) {
     session.player = new LiveAudio.TTSPlayer({
-      outputDeviceId: cfg.outputDeviceId,
+      outputDeviceIds: normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId),
       onLevel: (l) => setOutLevelFor(session, l),
       onActiveChange: (active) => {
         const s = session.client && session.client.state;
@@ -2491,7 +2635,14 @@ function wireUI() {
     sel.addEventListener('change', onSettingsChange);
   }
   els.audioInput.addEventListener('change', changeAudioInput);
-  els.audioOutput.addEventListener('change', changeAudioOutput);
+  els.audioOutput.addEventListener('change', (e) => {
+    if (e.target.classList.contains('dev-passthrough')) {
+      savePrefs();
+      applyPassthrough();
+    } else {
+      changeAudioOutput();
+    }
+  });
   // API key is global, not per-session — savePrefs only.
   els.apiKey.addEventListener('change', savePrefs);
 
@@ -2574,6 +2725,7 @@ function wireUI() {
         try { session.player && session.player.destroy(); } catch (_) {}
       }
     }
+    try { state.micPassthrough.stop(); } catch (_) {}
     if (state.pip) state.pip.close();
   });
   window.addEventListener('focus', () => detectCompanionService());

@@ -307,87 +307,132 @@ class CompanionAudioCapture {
 }
 
 class TTSPlayer {
-  constructor({ onLevel, onActiveChange, outputDeviceId = '' } = {}) {
+  constructor({ onLevel, onActiveChange, outputDeviceIds, outputDeviceId } = {}) {
     this.onLevel = onLevel || (() => {});
     this.onActiveChange = onActiveChange || (() => {});
-    this.outputDeviceId = outputDeviceId || '';
+    this.outputDeviceIds = TTSPlayer._normalizeIds(
+      Array.isArray(outputDeviceIds) ? outputDeviceIds : (outputDeviceId != null ? [outputDeviceId] : []));
     this.ctx = null;
     this.outputNode = null;
-    this.outputStreamNode = null;
-    this.outputEl = null;
     this.analyser = null;
     this._analyserBuf = null;
+    // One entry per active sink. Either { useDestination: true } for the
+    // ctx.destination fallback, or { deviceId, streamDest, audioEl } for a
+    // MediaStreamDestination + <audio> pair (one per requested device).
+    this.sinks = [];
     this.nextStart = 0;
     this.sources = new Set();
     this._level = 0;
     this._rafId = 0;
   }
 
+  // Strip empties to a single '' (default), de-dupe, and keep order.
+  static _normalizeIds(ids) {
+    const seen = new Set();
+    const out = [];
+    for (const raw of (ids || [])) {
+      const id = raw || '';
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+    return out;
+  }
+
   async ensureCtx() {
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      await this._configureOutput();
+      // Sources feed an analyser so the meter reflects what is actually
+      // playing out the speakers, not what we have queued. Without this, the
+      // level decays to zero as soon as the model finishes streaming chunks,
+      // even though several seconds of audio may still be buffered.
+      this.analyser = this.ctx.createAnalyser();
+      this.analyser.fftSize = 1024;
+      this.analyser.smoothingTimeConstant = 0;
+      this._analyserBuf = new Float32Array(this.analyser.fftSize);
+      this.outputNode = this.analyser;
+      await this._applyDevices(this.outputDeviceIds);
     }
     if (this.ctx.state === 'suspended') await this.ctx.resume();
   }
 
-  async _configureOutput() {
-    if (!this.ctx) return;
-
-    let sink;
-    if (typeof this.ctx.setSinkId === 'function') {
-      try {
-        await this.ctx.setSinkId(this.outputDeviceId || '');
-      } catch (e) {
-        if (!this.outputDeviceId) throw e;
-        this.outputDeviceId = '';
-        await this.ctx.setSinkId('');
+  _tearDownSinks() {
+    for (const s of this.sinks) {
+      if (s.audioEl) {
+        try { s.audioEl.pause(); } catch (_) {}
+        s.audioEl.srcObject = null;
       }
-      sink = this.ctx.destination;
-    } else if (TTSPlayer.canSelectOutputDevice()) {
-      this.outputStreamNode = this.ctx.createMediaStreamDestination();
-      this.outputEl = new Audio();
-      this.outputEl.autoplay = true;
-      this.outputEl.playsInline = true;
-      this.outputEl.srcObject = this.outputStreamNode.stream;
-      try {
-        await this.outputEl.setSinkId(this.outputDeviceId || '');
-      } catch (e) {
-        if (!this.outputDeviceId) throw e;
-        this.outputDeviceId = '';
-        await this.outputEl.setSinkId('');
-      }
-      try { await this.outputEl.play(); } catch (_) {}
-      sink = this.outputStreamNode;
-    } else {
-      sink = this.ctx.destination;
+      try { s.streamDest && s.streamDest.disconnect(); } catch (_) {}
     }
-
-    // Sources feed an analyser so the meter reflects what is actually playing
-    // out the speakers, not what we have queued. Without this, the level
-    // decays to zero as soon as the model finishes streaming chunks, even
-    // though several seconds of audio may still be buffered.
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-    this.analyser.smoothingTimeConstant = 0;
-    this.analyser.connect(sink);
-    this._analyserBuf = new Float32Array(this.analyser.fftSize);
-    this.outputNode = this.analyser;
+    this.sinks = [];
+    try { this.analyser && this.analyser.disconnect(); } catch (_) {}
   }
 
-  async setOutputDevice(deviceId) {
-    this.outputDeviceId = deviceId || '';
+  async _applyDevices(ids) {
+    if (!this.ctx || !this.analyser) return;
 
-    if (!this.ctx) return;
+    this._tearDownSinks();
 
-    if (typeof this.ctx.setSinkId === 'function') {
-      await this.ctx.setSinkId(this.outputDeviceId);
+    const list = (ids && ids.length) ? ids.slice() : [''];
+    const canSink = TTSPlayer.canSelectOutputDevice();
+    // If the only request is the system default — or the platform can't
+    // re-route at all — connect straight to ctx.destination. Cheaper, and
+    // it's the only thing that works on browsers without setSinkId.
+    const onlyDefault = list.length === 1 && list[0] === '';
+    if (onlyDefault || !canSink) {
+      this.analyser.connect(this.ctx.destination);
+      this.sinks.push({ useDestination: true });
+      if (!canSink) this.outputDeviceIds = [''];
       return;
     }
 
-    if (this.outputEl && typeof this.outputEl.setSinkId === 'function') {
-      await this.outputEl.setSinkId(this.outputDeviceId);
+    const accepted = [];
+    for (const id of list) {
+      const dest = this.ctx.createMediaStreamDestination();
+      this.analyser.connect(dest);
+      const el = new Audio();
+      el.autoplay = true;
+      el.playsInline = true;
+      el.srcObject = dest.stream;
+      let resolvedId = id;
+      try {
+        await el.setSinkId(id || '');
+      } catch (e) {
+        // Requested device disappeared or was rejected. Fall back to the
+        // system default for this sink so the session still produces audio.
+        try { await el.setSinkId(''); resolvedId = ''; }
+        catch (_) {
+          try { this.analyser.disconnect(dest); } catch (_) {}
+          el.srcObject = null;
+          continue;
+        }
+      }
+      try { await el.play(); } catch (_) {}
+      this.sinks.push({ deviceId: resolvedId, streamDest: dest, audioEl: el });
+      accepted.push(resolvedId);
     }
+
+    // Reflect what actually stuck (e.g. fallbacks to default), de-duped.
+    this.outputDeviceIds = TTSPlayer._normalizeIds(accepted);
+
+    // If every requested sink failed, fall back to ctx.destination so audio
+    // still plays somewhere instead of going silent.
+    if (this.sinks.length === 0) {
+      this.analyser.connect(this.ctx.destination);
+      this.sinks.push({ useDestination: true });
+      this.outputDeviceIds = [''];
+    }
+  }
+
+  async setOutputDevices(ids) {
+    const normalized = TTSPlayer._normalizeIds(ids);
+    this.outputDeviceIds = normalized;
+    if (!this.ctx) return;
+    await this._applyDevices(normalized);
+  }
+
+  async setOutputDevice(deviceId) {
+    await this.setOutputDevices([deviceId || '']);
   }
 
   async playChunk(base64Pcm) {
@@ -482,15 +527,8 @@ class TTSPlayer {
     this.hush();
     if (this._rafId) cancelAnimationFrame(this._rafId);
     this._rafId = 0;
-    if (this.outputEl) {
-      try { this.outputEl.pause(); } catch (_) {}
-      this.outputEl.srcObject = null;
-    }
-    try { this.analyser && this.analyser.disconnect(); } catch (_) {}
-    try { this.outputStreamNode && this.outputStreamNode.disconnect(); } catch (_) {}
+    this._tearDownSinks();
     try { this.ctx && this.ctx.close(); } catch (_) {}
-    this.outputEl = null;
-    this.outputStreamNode = null;
     this.outputNode = null;
     this.analyser = null;
     this._analyserBuf = null;
@@ -524,4 +562,73 @@ function canSelectOutputDevice() {
          TTSPlayer.canSelectOutputDevice();
 }
 
-window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, abToBase64, canCaptureDisplayAudio, canSelectOutputDevice };
+// ─── Mic passthrough ─────────────────────────────────────────────────────────
+// Independently routes microphone audio to one or more output devices (e.g.
+// a virtual cable). Completely decoupled from translation sessions so the user
+// can stop/restart sessions without breaking their audio routing.
+class MicPassthrough {
+  constructor() {
+    this.running = false;
+    this.ctx = null;
+    this.stream = null;
+    this.source = null;
+    this.sinks = []; // { deviceId, streamDest, audioEl }
+  }
+
+  async start(micDeviceId, deviceIds) {
+    await this.stop();
+    if (!deviceIds || deviceIds.length === 0) return;
+
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
+    });
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.source = this.ctx.createMediaStreamSource(this.stream);
+
+    for (const id of deviceIds) {
+      const dest = this.ctx.createMediaStreamDestination();
+      this.source.connect(dest);
+      const el = new Audio();
+      el.autoplay = true;
+      el.playsInline = true;
+      el.srcObject = dest.stream;
+      try {
+        await el.setSinkId(id || '');
+      } catch (e) {
+        try { await el.setSinkId(''); } catch (_) {}
+      }
+      try { await el.play(); } catch (_) {}
+      this.sinks.push({ deviceId: id, streamDest: dest, audioEl: el });
+    }
+    this.running = this.sinks.length > 0;
+  }
+
+  async stop() {
+    for (const s of this.sinks) {
+      try { s.audioEl.pause(); } catch (_) {}
+      s.audioEl.srcObject = null;
+      try { s.streamDest.disconnect(); } catch (_) {}
+    }
+    this.sinks = [];
+    try { this.source && this.source.disconnect(); } catch (_) {}
+    this.source = null;
+    if (this.stream) {
+      this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
+      this.stream = null;
+    }
+    try { this.ctx && this.ctx.close(); } catch (_) {}
+    this.ctx = null;
+    this.running = false;
+  }
+
+  // Restarts with new settings. Cheap no-op when deviceIds is empty.
+  async update(micDeviceId, deviceIds) {
+    if (!deviceIds || deviceIds.length === 0) {
+      if (this.running) await this.stop();
+      return;
+    }
+    await this.start(micDeviceId, deviceIds);
+  }
+}
+
+window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, abToBase64, canCaptureDisplayAudio, canSelectOutputDevice };

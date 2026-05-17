@@ -210,11 +210,14 @@
 
         <section class="section advanced-only" id="audio-output-section">
           <div class="field">
-            <label for="audio-output">Audio output</label>
-            <select id="audio-output">
-              <option value="">System default</option>
-            </select>
-            <p class="hint" id="audio-output-hint">Choose where translated speech plays. Device names may appear after microphone permission.</p>
+            <label id="audio-output-label">Audio output</label>
+            <div id="audio-output" class="device-list" role="group" aria-labelledby="audio-output-label">
+              <label class="device-option">
+                <input type="checkbox" value="" />
+                <span>System default</span>
+              </label>
+            </div>
+            <p class="hint" id="audio-output-hint">Tick one or more speakers; translated speech plays on every checked device. Device names may appear after microphone permission.</p>
           </div>
         </section>
 
