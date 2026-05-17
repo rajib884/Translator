@@ -11,6 +11,10 @@ const GOAWAY_SAFETY_MS = 2000;
 const RECONNECT_BACKOFF_MS = 1500;
 const RECONNECT_MAX_MS = 30000;
 const MAX_RECONNECT_ATTEMPTS = 8;
+// Drop audio frames when the WS send buffer is congested. 256 KB is several
+// seconds of 16 kHz/16-bit PCM after base64 + JSON envelope — past that, the
+// uplink is the bottleneck and queueing more would only grow memory.
+const BACKPRESSURE_BYTES = 256 * 1024;
 // Close codes the server uses to signal something we cannot fix by reconnecting
 // (auth failure, policy violation, internal-error-after-policy). Treat as fatal
 // so we don't hammer the endpoint forever and so the user sees a real error.
@@ -104,6 +108,10 @@ class GeminiLiveClient {
     // Single TextDecoder reused for binary frames (allocation is cheap but
     // keeping one matches the per-instance lifetime of everything else here).
     this._textDecoder = new TextDecoder();
+    // Backpressure bookkeeping. _droppedFrames is reset whenever the buffer
+    // drains; we log the first drop and every 50th to surface persistent
+    // congestion without flooding the log.
+    this._droppedFrames = 0;
   }
 
   _setState(s) {
@@ -133,6 +141,10 @@ class GeminiLiveClient {
   }
 
   _connect() {
+    // Any pending reconnect timer that resolved into this call is now consumed;
+    // any other lingering timer (e.g. from a quick stop()/start() cycle) would
+    // re-fire onto a fresh ws and double-schedule. Clear unconditionally.
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     if (!this.apiKey) {
       this.onLog('error', 'Missing API key');
       this._setState('error');
@@ -326,6 +338,19 @@ class GeminiLiveClient {
   sendAudio(arrayBuffer) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this._setupComplete) return;
+    // Backpressure: if the uplink can't keep up, dropping a few PCM frames is
+    // strictly better than growing the WS send queue without bound. Real-time
+    // audio doesn't benefit from delayed delivery — the model already missed
+    // the moment by the time the buffer drains.
+    if (this.ws.bufferedAmount > BACKPRESSURE_BYTES) {
+      this._droppedFrames++;
+      if (this._droppedFrames === 1 || this._droppedFrames % 50 === 0) {
+        this.onLog('warn',
+          `Network congested — dropped ${this._droppedFrames} audio frame${this._droppedFrames === 1 ? '' : 's'}.`);
+      }
+      return;
+    }
+    if (this._droppedFrames > 0) this._droppedFrames = 0;
     const b64 = window.LiveAudio.abToBase64(arrayBuffer);
     this.ws.send(JSON.stringify({
       realtimeInput: {

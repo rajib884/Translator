@@ -1593,7 +1593,14 @@ async function applyPassthrough() {
   const micId = els.audioInput ? els.audioInput.value || '' : '';
   try {
     await state.micPassthrough.update(micId, ids);
-    if (ids.length > 0 && !state.micPassthrough.running) {
+    // Drain per-sink warnings so the user learns which specific device
+    // failed and why, instead of a generic "could not start".
+    const warnings = state.micPassthrough.warnings || [];
+    for (const w of warnings) {
+      const label = describeSelectedOutputs([w.deviceId || '']);
+      log('warn', `Mic passthrough to ${label}: ${w.reason}.`);
+    }
+    if (ids.length > 0 && !state.micPassthrough.running && warnings.length === 0) {
       log('warn', 'Mic passthrough could not start (check browser permissions).');
     }
   } catch (e) {
@@ -1729,7 +1736,9 @@ async function refreshAudioOutputDevices() {
       els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
     }
     savePrefs();
-    applyPassthrough();
+    // Await so the device-refresh path doesn't race a still-applying passthrough
+    // start (the audio element may not yet have finished setSinkId/play).
+    await applyPassthrough();
   } catch (e) {
     setOutputDeviceListDisabled(true);
     els.audioOutputHint.textContent = 'Could not read audio output devices.';
@@ -2321,6 +2330,14 @@ async function stopPipeline() {
 }
 
 async function stopSession(session) {
+  // Idempotency guard. Stop can be triggered by user click, WS close, the
+  // display-share track ending, or page unload — sometimes concurrently. The
+  // body below isn't safe to run twice (player.destroy and friends throw on a
+  // freed AudioContext), so we early-return on subsequent calls. The flag
+  // stays true after we finish — once stopped, a session is only restarted
+  // through startSession which resets the state we care about.
+  if (!session || session._stopping) return;
+  session._stopping = true;
   state.ttsCoordinator.unregister(session);
   if (state.pttClient) state.pttClient.unsubscribe(session.id);
   session.pttHeld = false;
@@ -2347,6 +2364,7 @@ async function stopSession(session) {
     els.sessionAge.textContent = '00:00';
   }
   refreshBulkActionButtons();
+  session._stopping = false;
 }
 
 function setControlsLocked(locked) {

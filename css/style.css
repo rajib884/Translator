@@ -360,11 +360,16 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 .tab-chip[data-status="queued"]       .tab-status-text { color: var(--accent-2); }
 .tab-chip[data-status="error"]        .tab-status-text { color: var(--bad); }
 
-/* When the session is muted (paused/waiting/queued) dim the meters so the
-   user can see at a glance that the model is NOT receiving audio. */
-.tab-chip[data-status="paused"]  .tab-meter-fill,
-.tab-chip[data-status="waiting"] .tab-meter-fill,
-.tab-chip[data-status="queued"]  .tab-meter-fill {
+/* When the session is muted (paused / waiting / queued) or the WebSocket is
+   not yet up (connecting / reconnecting) dim the meters so the user can see
+   at a glance that the model is NOT receiving audio. The mic itself is still
+   live — the meter would otherwise show real levels and mislead the user
+   into thinking they're being heard while frames are being dropped. */
+.tab-chip[data-status="paused"]       .tab-meter-fill,
+.tab-chip[data-status="waiting"]      .tab-meter-fill,
+.tab-chip[data-status="queued"]       .tab-meter-fill,
+.tab-chip[data-status="connecting"]   .tab-meter-fill,
+.tab-chip[data-status="reconnecting"] .tab-meter-fill {
   background: var(--fg-2) !important;
   opacity: 0.55;
 }

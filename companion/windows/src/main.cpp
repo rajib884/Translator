@@ -59,6 +59,10 @@ namespace {
 constexpr int kPort = 52341;
 constexpr int kOutputRate = 16000;
 constexpr int kMaxFrameSamples = 1600;
+// Realistic ceiling for a single web page across a handful of sessions plus
+// some polling traffic. Past this we 503 new connections; the local-only
+// audience makes this purely a fork-bomb guardrail, not a throughput knob.
+constexpr int kMaxConnections = 32;
 constexpr GUID kAudioSubtypeIeeeFloat =
     {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 
@@ -858,6 +862,9 @@ struct HotkeyConnection {
 std::mutex g_hotkey_mutex;
 std::vector<std::shared_ptr<HotkeyConnection>> g_hotkey_connections;
 std::atomic<bool> g_hook_started{false};
+// Live connection count. Bumped before spawning the worker thread, decremented
+// when handle_client returns (or when accept() rejects with 503).
+std::atomic<int> g_connection_count{0};
 
 bool ws_send_text(HotkeyConnection& conn, const std::string& text) {
   uint8_t hdr[4];
@@ -1091,12 +1098,33 @@ void hotkey_session_loop(SOCKET sock) {
 }
 
 // ─── HTTP / WebSocket router ────────────────────────────────────────────────
+
+// Maximum total header bytes we'll accumulate before giving up. 64 KB covers
+// every realistic browser request (extensions can add a lot of cookies +
+// Sec-CH-* headers), while still being a hard ceiling against a slowloris-style
+// peer dripping bytes forever.
+constexpr size_t kMaxHeaderBytes = 64 * 1024;
+
 void handle_client(SOCKET accepted) {
   SocketGuard client{accepted};
-  char buf[8192] = {};
-  int n = recv(client.s, buf, sizeof(buf) - 1, 0);
-  if (n <= 0) return;
-  std::string req(buf, n);
+  // Drain bytes until we see the end-of-headers marker (or the cap, or the
+  // peer disconnects). The previous single 8 KB recv would silently truncate
+  // headers from clients that ship a lot of metadata.
+  std::string req;
+  req.reserve(4096);
+  char chunk[4096];
+  for (;;) {
+    int n = recv(client.s, chunk, sizeof(chunk), 0);
+    if (n <= 0) return;
+    req.append(chunk, n);
+    if (req.find("\r\n\r\n") != std::string::npos) break;
+    if (req.size() > kMaxHeaderBytes) {
+      send_text(client.s,
+                "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n");
+      return;
+    }
+  }
   const std::string target = request_target(req);
   const std::string path = path_only(target);
   const std::string origin = header_value(req, "Origin");
@@ -1218,7 +1246,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   while (true) {
     SOCKET client = accept(server.s, nullptr, nullptr);
     if (client == INVALID_SOCKET) continue;
-    std::thread(handle_client, client).detach();
+
+    // Reject when we're already at the cap. Sending 503 (instead of just
+    // closing) gives the calling page a structured error to surface instead
+    // of a confusing connection-refused.
+    if (g_connection_count.load(std::memory_order_acquire) >= kMaxConnections) {
+      dlog("connection refused: at cap (%d)", kMaxConnections);
+      const std::string body = "Too many concurrent connections";
+      const std::string resp =
+          "HTTP/1.1 503 Service Unavailable\r\n"
+          "Content-Type: text/plain\r\n"
+          "Connection: close\r\n"
+          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+      send(client, resp.c_str(), static_cast<int>(resp.size()), 0);
+      closesocket(client);
+      continue;
+    }
+
+    g_connection_count.fetch_add(1, std::memory_order_acq_rel);
+    std::thread([client] {
+      handle_client(client);
+      g_connection_count.fetch_sub(1, std::memory_order_acq_rel);
+    }).detach();
   }
 
   WSACleanup();

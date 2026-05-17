@@ -98,84 +98,105 @@ class AudioCapture {
     const wantMic = mode === 'mic' || mode === 'both';
     const wantDisplay = mode === 'display' || mode === 'both';
 
-    if (wantMic) {
-      const baseAudio = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-      };
-      let s;
-      try {
-        const audio = { ...baseAudio };
-        if (micDeviceId) audio.deviceId = { exact: micDeviceId };
-        s = await navigator.mediaDevices.getUserMedia({ audio });
-      } catch (e) {
-        if (!micDeviceId) throw e;
-        s = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+    // Everything below the first await acquires a real OS resource: a mic
+    // permission grant, a display-share grant, an AudioContext, a Blob URL.
+    // If any one of them throws partway, the previously-acquired resources
+    // would leak (mic indicator stuck on, ghost AudioContexts, retained
+    // Blob URL). Wrap the whole body so any thrown exception unwinds via
+    // _abortStart() before rethrowing.
+    try {
+      if (wantMic) {
+        const baseAudio = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        };
+        let s;
+        try {
+          const audio = { ...baseAudio };
+          if (micDeviceId) audio.deviceId = { exact: micDeviceId };
+          s = await navigator.mediaDevices.getUserMedia({ audio });
+        } catch (e) {
+          if (!micDeviceId) throw e;
+          s = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+        }
+        this.streams.push({ kind: 'mic', stream: s });
       }
-      this.streams.push({ kind: 'mic', stream: s });
-    }
 
-    if (wantDisplay) {
-      // Chrome requires `video: true` to even surface the audio option in the picker.
-      let displayStream;
-      try {
-        displayStream = await navigator.mediaDevices.getDisplayMedia({
+      if (wantDisplay) {
+        // Chrome requires `video: true` to even surface the audio option in the picker.
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
         });
-      } catch (e) {
-        // If the user cancels or browser refuses, clean up mic if it was acquired and rethrow.
-        this._releaseStreams();
-        throw e;
+        if (displayStream.getAudioTracks().length === 0) {
+          displayStream.getTracks().forEach((t) => t.stop());
+          throw new Error('No audio track. Pick a tab and tick "Share tab audio".');
+        }
+        // We don't need the video — stop it so the indicator is quieter and CPU is lower.
+        displayStream.getVideoTracks().forEach((t) => t.stop());
+        const audioTrack = displayStream.getAudioTracks()[0];
+        audioTrack.addEventListener('ended', () => this.onDisplayEnded());
+        this.streams.push({ kind: 'display', stream: displayStream });
       }
-      if (displayStream.getAudioTracks().length === 0) {
-        displayStream.getTracks().forEach((t) => t.stop());
-        this._releaseStreams();
-        throw new Error('No audio track. Pick a tab and tick "Share tab audio".');
+
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (this.ctx.state === 'suspended') await this.ctx.resume();
+
+      const blob = new Blob([PCM16_WORKLET_SRC], { type: 'application/javascript' });
+      this._workletUrl = URL.createObjectURL(blob);
+      await this.ctx.audioWorklet.addModule(this._workletUrl);
+
+      // Force mono so the worklet always reads inputs[0][0]. Sources at different
+      // channel counts (stereo display vs mono mic) get downmixed before delivery.
+      this.node = new AudioWorkletNode(this.ctx, 'pcm16-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: 1,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'speakers',
+      });
+      this.node.port.onmessage = (ev) => {
+        const m = ev.data;
+        if (m.type === 'audio') this.onChunk(m.buffer);
+        else if (m.type === 'level') {
+          if (m.level > this._level) this._level = m.level;
+        }
+      };
+
+      // Connect every input stream to the same worklet — Web Audio sums them.
+      for (const s of this.streams) {
+        const src = this.ctx.createMediaStreamSource(s.stream);
+        src.connect(this.node);
+        this.sources.push(src);
       }
-      // We don't need the video — stop it so the indicator is quieter and CPU is lower.
-      displayStream.getVideoTracks().forEach((t) => t.stop());
-      const audioTrack = displayStream.getAudioTracks()[0];
-      audioTrack.addEventListener('ended', () => this.onDisplayEnded());
-      this.streams.push({ kind: 'display', stream: displayStream });
+      // Worklet output isn't connected to destination — no monitor playback.
+
+      this._startMeter();
+    } catch (e) {
+      this._abortStart();
+      throw e;
     }
+  }
 
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (this.ctx.state === 'suspended') await this.ctx.resume();
-
-    const blob = new Blob([PCM16_WORKLET_SRC], { type: 'application/javascript' });
-    this._workletUrl = URL.createObjectURL(blob);
-    await this.ctx.audioWorklet.addModule(this._workletUrl);
-
-    // Force mono so the worklet always reads inputs[0][0]. Sources at different
-    // channel counts (stereo display vs mono mic) get downmixed before delivery.
-    this.node = new AudioWorkletNode(this.ctx, 'pcm16-processor', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [1],
-      channelCount: 1,
-      channelCountMode: 'explicit',
-      channelInterpretation: 'speakers',
-    });
-    this.node.port.onmessage = (ev) => {
-      const m = ev.data;
-      if (m.type === 'audio') this.onChunk(m.buffer);
-      else if (m.type === 'level') {
-        if (m.level > this._level) this._level = m.level;
-      }
-    };
-
-    // Connect every input stream to the same worklet — Web Audio sums them.
-    for (const s of this.streams) {
-      const src = this.ctx.createMediaStreamSource(s.stream);
-      src.connect(this.node);
-      this.sources.push(src);
+  // Cleanup helper for failed start(). Releases everything we may have
+  // allocated regardless of which step blew up. Safe to call when partial.
+  _abortStart() {
+    for (const s of this.sources) { try { s.disconnect(); } catch (_) {} }
+    this.sources = [];
+    try { this.node && this.node.disconnect(); } catch (_) {}
+    this.node = null;
+    this._releaseStreams();
+    if (this._workletUrl) {
+      URL.revokeObjectURL(this._workletUrl);
+      this._workletUrl = null;
     }
-    // Worklet output isn't connected to destination — no monitor playback.
-
-    this._startMeter();
+    if (this.ctx) {
+      try { this.ctx.close(); } catch (_) {}
+      this.ctx = null;
+    }
   }
 
   _startMeter() {
@@ -593,10 +614,16 @@ class MicPassthrough {
     this.stream = null;
     this.source = null;
     this.sinks = []; // { deviceId, streamDest, audioEl }
+    // Diagnostic surface: warnings accumulate per start() and the caller
+    // (applyPassthrough in app.js) drains and logs them. Previously these
+    // errors were swallowed inside inner try/catches, so users had no idea
+    // why one of their selected speakers wasn't receiving the mic.
+    this.warnings = [];
   }
 
   async start(micDeviceId, deviceIds) {
     await this.stop();
+    this.warnings = [];
     if (!deviceIds || deviceIds.length === 0) return;
 
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -612,13 +639,30 @@ class MicPassthrough {
       el.autoplay = true;
       el.playsInline = true;
       el.srcObject = dest.stream;
+      let resolvedId = id;
+      let setSinkErr = null;
       try {
         await el.setSinkId(id || '');
       } catch (e) {
-        try { await el.setSinkId(''); } catch (_) {}
+        setSinkErr = e;
+        // Fall back to the system default so something still plays, but record
+        // the failure so the user knows their pick didn't stick.
+        try { await el.setSinkId(''); resolvedId = ''; }
+        catch (e2) {
+          // Even default failed — drop this sink instead of silently keeping
+          // a disconnected audio element around.
+          try { this.source.disconnect(dest); } catch (_) {}
+          el.srcObject = null;
+          this.warnings.push({ deviceId: id, reason: (e2 && e2.message) || (setSinkErr && setSinkErr.message) || 'setSinkId failed' });
+          continue;
+        }
+        this.warnings.push({ deviceId: id, reason: `requested device unavailable (${(setSinkErr && setSinkErr.message) || 'setSinkId failed'}); fell back to system default` });
       }
-      try { await el.play(); } catch (_) {}
-      this.sinks.push({ deviceId: id, streamDest: dest, audioEl: el });
+      try { await el.play(); }
+      catch (e) {
+        this.warnings.push({ deviceId: resolvedId, reason: `autoplay blocked (${(e && e.message) || 'play() rejected'})` });
+      }
+      this.sinks.push({ deviceId: resolvedId, streamDest: dest, audioEl: el });
     }
     this.running = this.sinks.length > 0;
   }
