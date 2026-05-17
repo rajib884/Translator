@@ -7,7 +7,10 @@
   --line-soft: #1c2230;
   --fg-0: #e8ecf3;
   --fg-1: #aab2c4;
-  --fg-2: #6b7488;
+  /* WCAG 1.4.3 AA: contrast vs --bg-1 (#11141b) ≈ 5.6:1 — passes for the small
+     11px hints, age, status, and chip-status text that use this color. The
+     previous #6b7488 was ~3.4:1 and failed AA on most small-text instances. */
+  --fg-2: #8a93a8;
   --accent: #7c9cff;
   --accent-2: #a78bfa;
   --good: #4ade80;

@@ -29,7 +29,11 @@
     </div>
     <div class="status">
       <span id="session-age" class="age mono" aria-label="Session age">00:00</span>
-      <span id="status-pill" class="pill pill-idle">
+      <!-- role=status + aria-live=polite + aria-atomic announces transitions
+           between Idle / Listening / Speaking / Reconnecting / Error to screen
+           readers without interrupting the user's current speech. -->
+      <span id="status-pill" class="pill pill-idle"
+            role="status" aria-live="polite" aria-atomic="true">
         <span class="dot" aria-hidden="true"></span>
         <span id="status-text">Idle</span>
       </span>
@@ -38,11 +42,15 @@
 
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-backdrop" data-close="sidebar"></div>
-    <div class="sidebar-inner" role="complementary" aria-label="Settings">
+    <!-- On desktop this is a permanent landmark (role=complementary). On
+         mobile (<1024px) openSheet() promotes it to role=dialog aria-modal=true
+         and traps focus; closeSheet() restores it back to a landmark. -->
+    <div class="sidebar-inner" role="complementary" aria-label="Settings"
+         tabindex="-1" id="sidebar-inner" aria-labelledby="sidebar-title">
       <div class="sheet-handle"></div>
       <div class="sheet-head">
-        <h2>Settings</h2>
-        <button class="icon-btn close-btn" data-close="sidebar" aria-label="Close">×</button>
+        <h2 id="sidebar-title">Settings</h2>
+        <button class="icon-btn close-btn" type="button" data-close="sidebar" aria-label="Close">×</button>
       </div>
       <div class="sheet-body">
 
@@ -51,7 +59,8 @@
             <label for="api-key">Gemini API key</label>
             <div class="input-row">
               <input type="password" id="api-key" placeholder="Paste key" autocomplete="off" spellcheck="false" />
-              <button id="btn-show-key" class="icon-btn small" type="button" aria-label="Show or hide key">
+              <button id="btn-show-key" class="icon-btn small" type="button"
+                      aria-label="Show or hide key" aria-pressed="false">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
               </button>
             </div>
@@ -260,14 +269,19 @@
   </nav>
 
   <main class="conv">
-    <div id="turns-host" class="turns-host" aria-live="polite"></div>
+    <!-- The active session's panel gets aria-live + aria-relevant="additions"
+         applied in JS (createSessionDOM / setActiveSession). Keeping it on the
+         host caused every tab switch and every trim past MAX_TURNS to spam the
+         screen reader with the entire transcript. -->
+    <div id="turns-host" class="turns-host"></div>
   </main>
 
   <footer class="controls">
     <button id="btn-start" class="btn primary" type="button">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg></span><span class="btn-tx">Start</span>
     </button>
-    <button id="btn-pause" class="icon-btn" type="button" disabled title="Pause mic">
+    <button id="btn-pause" class="icon-btn" type="button" disabled
+            title="Pause mic" aria-label="Pause mic" aria-pressed="false">
       <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
       <svg class="icon icon-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
     </button>
@@ -277,7 +291,8 @@
     <button id="btn-stop" class="btn danger" type="button" disabled>
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>
     </button>
-    <button id="btn-pip-quick" class="icon-btn quick" type="button" title="Pop out current translation">
+    <button id="btn-pip-quick" class="icon-btn quick" type="button"
+            title="Pop out current translation" aria-label="Pop out current translation">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><path d="M18 14v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5"/></svg>
     </button>
   </footer>
@@ -285,11 +300,12 @@
   <!-- System prompt editor sheet -->
   <div class="sheet" id="prompt-sheet">
     <div class="sheet-backdrop" data-close="prompt-sheet"></div>
-    <div class="sheet-content" role="dialog" aria-label="System prompt">
+    <div class="sheet-content" role="dialog" aria-modal="true" tabindex="-1"
+         aria-labelledby="prompt-sheet-title">
       <div class="sheet-handle"></div>
       <div class="sheet-head">
-        <h2>System prompt</h2>
-        <button class="icon-btn close-btn" data-close="prompt-sheet" aria-label="Close">×</button>
+        <h2 id="prompt-sheet-title">System prompt</h2>
+        <button class="icon-btn close-btn" type="button" data-close="prompt-sheet" aria-label="Close">×</button>
       </div>
       <div class="sheet-body">
         <p class="hint">Sent to Gemini at the start of every session. <code>{source}</code> / <code>{target}</code> are replaced with the selected languages. The default depends on Mode + Direction — <em>Reset</em> loads the current default.</p>
@@ -306,11 +322,12 @@
   <!-- Log sheet -->
   <div class="sheet" id="log-sheet">
     <div class="sheet-backdrop" data-close="log-sheet"></div>
-    <div class="sheet-content" role="dialog" aria-label="Log">
+    <div class="sheet-content" role="dialog" aria-modal="true" tabindex="-1"
+         aria-labelledby="log-sheet-title">
       <div class="sheet-handle"></div>
       <div class="sheet-head">
-        <h2>Log</h2>
-        <button class="icon-btn close-btn" data-close="log-sheet" aria-label="Close">×</button>
+        <h2 id="log-sheet-title">Log</h2>
+        <button class="icon-btn close-btn" type="button" data-close="log-sheet" aria-label="Close">×</button>
       </div>
       <div id="log" class="log mono"></div>
     </div>

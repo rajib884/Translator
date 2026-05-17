@@ -616,17 +616,32 @@ function newSessionId() {
 // Active chip gets a thick accent bar on top + bg-0 background to clearly
 // indicate which session's transcript fills the panel below.
 function createSessionDOM(session) {
+  // Stable DOM ids let the chip and panel cross-reference via aria-controls /
+  // aria-labelledby. Session ids already start with "s_…" so they're safe.
+  const tabId = 'tab-' + session.id;
+  const panelId = 'panel-' + session.id;
+
   const chip = document.createElement('div');
   chip.className = 'tab-chip';
+  chip.id = tabId;
   chip.dataset.sessionId = session.id;
   chip.dataset.status = session.status;
   chip.dataset.audio  = session.isAudio ? 'true' : 'false';
   chip.setAttribute('role', 'tab');
+  // Initial selection state — will be flipped by setActiveSession. Inactive
+  // tabs are tabindex=-1 so Tab key lands once on the tablist (on the active
+  // tab), then arrow keys move within the strip — the standard WAI-ARIA tab pattern.
+  chip.setAttribute('aria-selected', 'false');
+  chip.setAttribute('aria-controls', panelId);
+  chip.setAttribute('tabindex', '-1');
+  // tab-close is a real <button> so it's reachable by keyboard (Tab into the
+  // tab, then Shift+Tab back out — or, more practically, the button shows up
+  // as a separate stop while inside the tablist).
   chip.innerHTML =
     '<div class="tab-chip-head">' +
       '<span class="tab-status-dot" aria-hidden="true"></span>' +
       '<span class="tab-label"></span>' +
-      '<span class="tab-close" role="button" aria-label="Close session" title="Close session">×</span>' +
+      '<button class="tab-close" type="button" aria-label="Close session" title="Close session" tabindex="-1">×</button>' +
     '</div>' +
     '<div class="tab-chip-mid">' +
       '<span class="tab-status-text">Idle</span>' +
@@ -648,7 +663,14 @@ function createSessionDOM(session) {
 
   const turns = document.createElement('div');
   turns.className = 'session-turns';
+  turns.id = panelId;
   turns.dataset.sessionId = session.id;
+  // Tabpanel semantics + label binding back to the chip. aria-live is added
+  // by setActiveSession only on the active panel (see H3 fix) so SRs don't
+  // announce inactive transcripts.
+  turns.setAttribute('role', 'tabpanel');
+  turns.setAttribute('aria-labelledby', tabId);
+  turns.setAttribute('tabindex', '0');
   els.turnsHost.appendChild(turns);
   session.transcriptEl = turns;
   renderSessionEmptyState(session);
@@ -904,13 +926,35 @@ function setActiveSession(id) {
 
   const prev = activeSession();
   if (prev) {
-    if (prev.tabEl) prev.tabEl.classList.remove('is-active');
-    if (prev.transcriptEl) prev.transcriptEl.classList.remove('is-active');
+    if (prev.tabEl) {
+      prev.tabEl.classList.remove('is-active');
+      // Roving tabindex: inactive tabs are skipped by Tab key; arrow keys
+      // within the tablist move focus + selection (see wireUI).
+      prev.tabEl.setAttribute('aria-selected', 'false');
+      prev.tabEl.setAttribute('tabindex', '-1');
+    }
+    if (prev.transcriptEl) {
+      prev.transcriptEl.classList.remove('is-active');
+      // Remove the live region from the previously active panel so SRs don't
+      // announce additions on a panel the user can no longer see.
+      prev.transcriptEl.removeAttribute('aria-live');
+      prev.transcriptEl.removeAttribute('aria-relevant');
+    }
   }
   state.activeSessionId = id;
   const next = state.sessions.get(id);
-  if (next.tabEl) next.tabEl.classList.add('is-active');
-  if (next.transcriptEl) next.transcriptEl.classList.add('is-active');
+  if (next.tabEl) {
+    next.tabEl.classList.add('is-active');
+    next.tabEl.setAttribute('aria-selected', 'true');
+    next.tabEl.setAttribute('tabindex', '0');
+  }
+  if (next.transcriptEl) {
+    next.transcriptEl.classList.add('is-active');
+    // Only announce additions on the visible panel; aria-relevant=additions
+    // skips the noise from MAX_TURNS-driven trimming at the top of the list.
+    next.transcriptEl.setAttribute('aria-live', 'polite');
+    next.transcriptEl.setAttribute('aria-relevant', 'additions');
+  }
 
   loadSessionConfigIntoUI(next);
   refreshSessionDisplay(next);
@@ -2079,6 +2123,8 @@ function applyControlButtonsForActiveSession() {
     els.btnPause.disabled = true;
     els.btnPause.classList.remove('is-paused');
     els.btnPause.title = 'Pause mic';
+    els.btnPause.setAttribute('aria-label', 'Pause mic');
+    els.btnPause.setAttribute('aria-pressed', 'false');
     setControlsLocked(false);
     return;
   }
@@ -2088,6 +2134,9 @@ function applyControlButtonsForActiveSession() {
   els.btnPause.disabled = !session.running;
   els.btnPause.classList.toggle('is-paused', !!session.paused);
   els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  // Keep aria-label and aria-pressed in sync so SR users hear the right state.
+  els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
+  els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
   setControlsLocked(session.running);
 }
 
@@ -2339,18 +2388,139 @@ function togglePause() {
 }
 
 // ─── Sheets ──────────────────────────────────────────────────────────────────
+// Modal dialog plumbing: focus trap, focus restore on close, and ESC handling
+// for the topmost open sheet. On desktop the sidebar is a landmark, not a
+// dialog — we only promote it to role=dialog while it's modally open on mobile.
+
+// Tracks the trigger element and trap state per opened modal so we can restore
+// focus exactly where the user came from, even when sheets are layered (e.g.
+// opening Log from inside Settings).
+const modalState = new Map(); // sheetId -> { opener, trapHandler, content, restoreRole }
+
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function getFocusableIn(container) {
+  if (!container) return [];
+  return Array.from(container.querySelectorAll(FOCUSABLE_SELECTOR))
+    .filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+}
+
+// The sidebar's modal-ness depends on viewport: on desktop it's docked, so
+// opening it is a no-op and we must not trap focus. Mirrors the CSS breakpoint.
+function isSidebarDocked() {
+  return window.matchMedia('(min-width: 1024px)').matches;
+}
+
 function openSheet(id) {
   const el = document.getElementById(id);
-  if (el) el.classList.add('is-open');
+  if (!el) return;
+  if (el.classList.contains('is-open')) return;
+
+  // Sidebar on desktop is permanently visible; openSheet shouldn't promote it
+  // to a modal or move focus there.
+  const isSidebar = id === 'sidebar';
+  if (isSidebar && isSidebarDocked()) {
+    el.classList.add('is-open');
+    return;
+  }
+
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const content = el.querySelector('.sheet-content, .sidebar-inner');
+  el.classList.add('is-open');
+
+  let restoreRole = null;
+  if (isSidebar && content) {
+    // Promote landmark → dialog only while modal; remember to flip back on close.
+    restoreRole = content.getAttribute('role');
+    content.setAttribute('role', 'dialog');
+    content.setAttribute('aria-modal', 'true');
+  }
+
+  const trapHandler = (ev) => {
+    if (ev.key !== 'Tab') return;
+    const focusables = getFocusableIn(content);
+    if (focusables.length === 0) {
+      ev.preventDefault();
+      if (content) content.focus();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (ev.shiftKey && (active === first || !content.contains(active))) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && (active === last || !content.contains(active))) {
+      ev.preventDefault();
+      first.focus();
+    }
+  };
+  if (content) content.addEventListener('keydown', trapHandler);
+
+  modalState.set(id, { opener, trapHandler, content, restoreRole });
+
+  // Defer focus by one frame so the slide-up animation doesn't fight the
+  // mobile keyboard or scroll the body.
+  requestAnimationFrame(() => {
+    const focusables = getFocusableIn(content);
+    const target = focusables[0] || content;
+    if (target) {
+      try { target.focus({ preventScroll: false }); }
+      catch (_) { try { target.focus(); } catch (__) {} }
+    }
+  });
 }
+
 function closeSheet(id) {
   const el = document.getElementById(id);
-  if (el) el.classList.remove('is-open');
+  if (!el) return;
+  if (!el.classList.contains('is-open')) return;
+  el.classList.remove('is-open');
+
+  const state = modalState.get(id);
+  if (!state) return;                  // wasn't opened modally (e.g., docked sidebar)
+  modalState.delete(id);
+
+  if (state.content && state.trapHandler) {
+    state.content.removeEventListener('keydown', state.trapHandler);
+  }
+  if (state.content && state.restoreRole !== null) {
+    state.content.setAttribute('role', state.restoreRole);
+    state.content.removeAttribute('aria-modal');
+  }
+  // Restore focus to whoever opened the sheet. If they vanished (e.g., a tab
+  // was closed), fall back to body so focus isn't stuck on a detached element.
+  if (state.opener && document.contains(state.opener)) {
+    try { state.opener.focus({ preventScroll: true }); }
+    catch (_) { try { state.opener.focus(); } catch (__) {} }
+  }
+}
+
+// Returns the id of the topmost open modal sheet, or null if none. Iteration
+// order matches the modalState insertion order (Map preserves it), so the last
+// opened wins — that's the right one to close on Escape.
+function topmostOpenSheet() {
+  let last = null;
+  for (const id of modalState.keys()) last = id;
+  return last;
 }
 
 function clearConversation() {
   const session = activeSession();
   if (!session) return;
+  // No confirmation when there's nothing to lose — empty state is the only
+  // child, so clearing is a visual no-op anyway.
+  const turnCount = session.transcriptEl
+    ? session.transcriptEl.querySelectorAll(':scope > .turn').length
+    : 0;
+  if (turnCount > 0 && !window.confirm('Clear this session\'s conversation?')) return;
   session.liveTurn = null;
   if (session.transcriptEl) {
     session.transcriptEl.innerHTML = '';
@@ -2586,7 +2756,11 @@ function wireUI() {
     onSettingsChange();
   });
   els.btnShowKey.addEventListener('click', () => {
-    els.apiKey.type = els.apiKey.type === 'password' ? 'text' : 'password';
+    const willShow = els.apiKey.type === 'password';
+    els.apiKey.type = willShow ? 'text' : 'password';
+    // aria-pressed reflects whether the key is currently revealed — gives
+    // screen-reader users a clear "this toggle is on/off" announcement.
+    els.btnShowKey.setAttribute('aria-pressed', willShow ? 'true' : 'false');
   });
   els.modeSelect.addEventListener('change', () => {
     updateUIVisibility();
@@ -2685,6 +2859,49 @@ function wireUI() {
       const chip = ev.target.closest('.tab-chip');
       if (chip) setActiveSession(chip.dataset.sessionId);
     });
+
+    // WAI-ARIA tab pattern: arrow keys move focus + selection within the
+    // tablist; Home/End jump to the ends; Delete closes the focused tab; Enter
+    // is redundant with click but supported for completeness. Letting arrows
+    // also activate the tab (auto-activation) is fine for our use because the
+    // panel switch is cheap and matches the user's mental model.
+    els.tabList.addEventListener('keydown', (ev) => {
+      const chip = ev.target.closest('.tab-chip');
+      if (!chip || !els.tabList.contains(chip)) return;
+      const keys = new Set(['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Delete', 'Enter', ' ']);
+      if (!keys.has(ev.key)) return;
+
+      // Only consider currently visible chips — simple mode hides everything
+      // but the active one, and arrow nav over an invisible target is jarring.
+      const chips = Array.from(els.tabList.querySelectorAll('.tab-chip'))
+        .filter((c) => c.offsetParent !== null);
+      if (chips.length === 0) return;
+      const here = chips.indexOf(chip);
+
+      if (ev.key === 'Delete') {
+        ev.preventDefault();
+        closeSession(state.sessions.get(chip.dataset.sessionId));
+        return;
+      }
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        setActiveSession(chip.dataset.sessionId);
+        return;
+      }
+
+      let nextIdx;
+      if (ev.key === 'ArrowLeft')  nextIdx = here <= 0 ? chips.length - 1 : here - 1;
+      else if (ev.key === 'ArrowRight') nextIdx = here >= chips.length - 1 ? 0 : here + 1;
+      else if (ev.key === 'Home')  nextIdx = 0;
+      else /* End */               nextIdx = chips.length - 1;
+      ev.preventDefault();
+      const target = chips[nextIdx];
+      if (!target) return;
+      setActiveSession(target.dataset.sessionId);
+      // setActiveSession moves tabindex=0 to the new chip; focus it explicitly
+      // so the user's keyboard caret follows their selection.
+      try { target.focus(); } catch (_) {}
+    });
   }
 
   // Empty-state "Settings" button is created dynamically per session — use
@@ -2710,10 +2927,13 @@ function wireUI() {
     if (tgt) closeSheet(tgt.getAttribute('data-close'));
   });
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape') {
-      closeSheet('sidebar');
-      closeSheet('prompt-sheet');
-      closeSheet('log-sheet');
+    if (ev.key !== 'Escape') return;
+    // Close only the topmost open modal so layered sheets (e.g. Log opened
+    // from inside Settings) close one at a time, matching native dialog UX.
+    const id = topmostOpenSheet();
+    if (id) {
+      ev.preventDefault();
+      closeSheet(id);
     }
   });
 
