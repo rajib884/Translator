@@ -371,6 +371,21 @@
         <h2 id="log-sheet-title">Log</h2>
         <button class="icon-btn close-btn" type="button" data-close="log-sheet" aria-label="Close">×</button>
       </div>
+      <!-- Dev tools row. Sits inside the Log sheet so it's out of the main
+           settings flow but still discoverable when the user is already
+           troubleshooting. Buttons act on the active session's GeminiLive
+           client; they're disabled when there's no connected session. -->
+      <div class="log-toolbar" id="log-toolbar">
+        <span class="log-toolbar-label">Test:</span>
+        <button id="btn-test-goaway" class="btn ghost small" type="button"
+                title="Inject a synthetic GoAway message and let the client reconnect">
+          Simulate GoAway
+        </button>
+        <button id="btn-test-wsclose" class="btn ghost small" type="button"
+                title="Force-close the WebSocket and let the reconnect ladder run">
+          Force-close WS
+        </button>
+      </div>
       <div id="log" class="log mono"></div>
     </div>
   </div>

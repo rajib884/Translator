@@ -385,6 +385,42 @@ class GeminiLiveClient {
     if (!this._setupComplete) return;
     this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
   }
+
+  // ─── Test hooks ─────────────────────────────────────────────────────────
+  // Inject a synthetic GoAway message and run it through the normal handler.
+  // Useful to exercise the reconnect + session-resumption path without
+  // waiting for the server to actually send one (which can take minutes).
+  // timeLeftSec controls the announced grace period; the existing handler
+  // schedules a clean close at (timeLeft * 1000 - GOAWAY_SAFETY_MS).
+  simulateGoAway(timeLeftSec = 3) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.onLog('warn', 'simulateGoAway ignored: WebSocket not open.');
+      return;
+    }
+    if (!this._setupComplete) {
+      this.onLog('warn', 'simulateGoAway ignored: setup not complete yet.');
+      return;
+    }
+    const fake = { goAway: { timeLeft: `${Math.max(1, timeLeftSec | 0)}s` } };
+    this.onLog('info', `[test] Injecting fake GoAway (${timeLeftSec}s).`);
+    // Synthesise an event-like object so _onMessage's existing JSON path runs
+    // unchanged — same code path the real server would hit.
+    this._onMessage({ data: JSON.stringify(fake) });
+  }
+
+  // Force-close the underlying WebSocket with a non-1000 code. shouldRun is
+  // unchanged, so the close triggers the normal reconnect ladder — useful to
+  // verify backoff + resume-handle behaviour without unplugging anything.
+  forceCloseWebSocket(code = 4000, reason = 'test force-close') {
+    if (!this.ws) {
+      this.onLog('warn', 'forceCloseWebSocket ignored: no active WebSocket.');
+      return;
+    }
+    this.onLog('info', `[test] Force-closing WebSocket (${code} ${reason}).`);
+    try { this.ws.close(code, reason); } catch (e) {
+      this.onLog('warn', 'forceCloseWebSocket failed: ' + (e && e.message ? e.message : e));
+    }
+  }
 }
 
 window.GeminiLive = {

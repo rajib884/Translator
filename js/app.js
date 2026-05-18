@@ -252,6 +252,8 @@ const els = {
   turnsHost:     $('turns-host'),
   modeSwitch:    $('mode-switch'),
   log:           $('log'),
+  btnTestGoaway: $('btn-test-goaway'),
+  btnTestWsclose:$('btn-test-wsclose'),
 };
 
 // ─── Session ─────────────────────────────────────────────────────────────────
@@ -625,6 +627,11 @@ const state = {
   // so they're preserved verbatim — if MAX_SESSIONS is bumped up in a future
   // build (or the user deletes a visible session), the old ones can return.
   archivedSessions: [],
+
+  // PIP-pane prefs: { displayMode: 'both'|'input'|'output', fontStep: int }
+  // Owned by the PipController but persisted in this global prefs blob so a
+  // re-pop-out picks up the user's last choices instead of resetting.
+  pipPrefs: { displayMode: 'both', fontStep: 1 },
 
   // 'simple' hides the tab strip and advanced settings sections; 'advanced'
   // shows everything. Sessions and configs are unaffected — flipping back to
@@ -1445,6 +1452,7 @@ function savePrefs() {
       vadSilence:  els.vadSilence ? Number(els.vadSilence.value) : null,
       uiMode:      state.uiMode || 'simple',
       pttBinding:  state.pttBinding || null,
+      pipPrefs:    state.pipPrefs || null,
     }));
   } catch (_) {}
 }
@@ -1730,6 +1738,18 @@ function fillLanguages() {
   // Restore the global PTT binding (single hotkey shared across sessions).
   if (prefs.pttBinding && Number.isFinite(prefs.pttBinding.vkCode)) {
     state.pttBinding = prefs.pttBinding;
+  }
+  // Restore PIP-pane prefs (display mode + font size). Validate so a hand-
+  // edited localStorage entry can't crash the PIP at open time.
+  if (prefs.pipPrefs && typeof prefs.pipPrefs === 'object') {
+    const dm = prefs.pipPrefs.displayMode;
+    const fs = prefs.pipPrefs.fontStep;
+    if (dm === 'both' || dm === 'input' || dm === 'output') {
+      state.pipPrefs.displayMode = dm;
+    }
+    if (Number.isInteger(fs) && fs >= 0 && fs <= 3) {
+      state.pipPrefs.fontStep = fs;
+    }
   }
   setUIMode(prefs.uiMode === 'advanced' ? 'advanced' : 'simple');
 
@@ -2441,6 +2461,12 @@ function refreshSessionDisplay(session) {
     els.statusText.textContent = text;
     if (state.pip) {
       state.pip.setStatus(text, eff === 'translating' || eff === 'connected');
+      // The PIP repaints its body background tint from the effective status
+      // so the user sees an at-a-glance visual cue (calm while listening,
+      // lit-up while speaking, amber on reconnect, red on error) even when
+      // they can't read the small status text.
+      state.pip.setEffectiveStatus(eff);
+      state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
     }
   }
 }
@@ -2654,6 +2680,7 @@ function applyControlButtonsForActiveSession() {
     els.btnPause.setAttribute('aria-label', 'Pause mic');
     els.btnPause.setAttribute('aria-pressed', 'false');
     setControlsLocked(false);
+    if (state.pip) state.pip.setRunning(false, false, true);
     return;
   }
   els.btnStart.disabled = session.running;
@@ -2666,6 +2693,10 @@ function applyControlButtonsForActiveSession() {
   els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
   els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
   setControlsLocked(session.running);
+  // Mirror into PIP so its Start/Stop/Pause/Hush buttons stay in sync — eg.
+  // when togglePause runs from the main control bar, the PIP's pause label
+  // flips on the same frame.
+  if (state.pip) state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
 }
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
@@ -3199,22 +3230,71 @@ function confirmDiscardPromptEdits() {
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
+// PIP_DISPLAY_MODES: keys are persisted in prefs; do not rename.
+const PIP_DISPLAY_MODES = ['both', 'input', 'output'];
+// Font-size steps in rem multipliers. Index 1 ('normal') is the default; the
+// step is small enough to be useful on tiny PiP windows without overflowing.
+const PIP_FONT_STEPS = [0.78, 1.00, 1.22, 1.50];
+const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
+
 class PipController {
-  constructor() {
+  constructor({ onStart, onStop, onPause, onHush, onClear, onPrefsChange } = {}) {
     this.win = null;
+    this.doc = null;
+
+    // Callbacks back into the main page. PIP runs in a same-origin window, so
+    // closures here execute in the main JS context — these wire the PIP's
+    // Start/Stop/Pause/Hush buttons to the same actions the main controls
+    // already trigger. Callers pass them so PipController stays decoupled
+    // from main-page globals.
+    this.onStart = onStart || (() => {});
+    this.onStop = onStop || (() => {});
+    this.onPause = onPause || (() => {});
+    this.onHush = onHush || (() => {});
+    this.onClear = onClear || (() => {});
+    this.onPrefsChange = onPrefsChange || (() => {});
+    this.onClose = () => {};
+
+    // Element references — set by _setup, nulled by _cleanup.
     this.statusEl = null;
     this.dotEl = null;
     this.inputLabelEl = null;
     this.outputLabelEl = null;
     this.inputEl = null;
     this.outputEl = null;
+    this.inputRowEl = null;
+    this.outputRowEl = null;
+    this.transcriptPaneEl = null;
+    this.settingsPaneEl = null;
+    this.btnTabTranscriptEl = null;
+    this.btnTabSettingsEl = null;
+    this.btnStartStopEl = null;
+    this.btnPauseEl = null;
+    this.btnHushEl = null;
+    this.btnClearEl = null;
+    this.displaySegEl = null;
+    this.fontDecEl = null;
+    this.fontIncEl = null;
+    this.fontLabelEl = null;
+
+    // Persisted view state. setDisplayMode / setFontStep update these and
+    // fire onPrefsChange so the main page can save into prefs.
+    this._displayMode = 'both';
+    this._fontStep = 1;
+    this._activeTab = 'transcript';
+
+    // Mirror of upstream state — used both to seed _setup on (re)open and to
+    // update the visible DOM whenever the main page calls a setter.
     this._currentInput = '';
     this._currentOutput = '';
     this._currentStatus = 'Idle';
     this._currentLive = false;
+    this._currentEffStatus = 'idle';
+    this._currentRunning = false;
+    this._currentPaused = false;
+    this._currentIsAudio = true;
     this._inLang = '';
     this._outLang = '';
-    this.onClose = () => {};
   }
 
   static isDocPipSupported() {
@@ -3227,11 +3307,13 @@ class PipController {
     if (this.isOpen()) { try { this.win.focus(); } catch (_) {} return; }
     if (PipController.isDocPipSupported()) {
       this.win = await window.documentPictureInPicture.requestWindow({
-        width: 460, height: 300,
+        // Slightly taller default so the new tabs + settings pane don't push
+        // the transcript out of view on first paint. Width unchanged.
+        width: 460, height: 360,
       });
     } else {
       this.win = window.open('', 'live-translator-pip',
-        'width=460,height=300,resizable=yes,scrollbars=yes,noopener=no');
+        'width=460,height=360,resizable=yes,scrollbars=yes,noopener=no');
       if (!this.win) throw new Error('Popup blocked. Allow popups for this site.');
     }
     this._setup();
@@ -3241,6 +3323,7 @@ class PipController {
 
   _setup() {
     const doc = this.win.document;
+    this.doc = doc;
     doc.documentElement.lang = 'en';
     // Pull the palette from the main document's CSS variables so the PiP
     // window can never drift from the app theme. Falls back to literal
@@ -3251,12 +3334,16 @@ class PipController {
     const palette = {
       bg0:    v('--bg-0',      '#0b0d12'),
       bg1:    v('--bg-1',      '#11141b'),
+      bg2:    v('--bg-2',      '#161a23'),
       bg3:    v('--bg-3',      '#1d2230'),
       fg0:    v('--fg-0',      '#e8ecf3'),
       fg1:    v('--fg-1',      '#aab2c4'),
       fg2:    v('--fg-2',      '#8a93a8'),
       accent: v('--accent',    '#7c9cff'),
       accent2:v('--accent-2',  '#a78bfa'),
+      warn:   v('--warn',      '#f0b429'),
+      bad:    v('--bad',       '#ef4444'),
+      good:   v('--good',      '#34d399'),
       line:   v('--line-soft', '#1c2230'),
     };
     const style = doc.createElement('style');
@@ -3266,35 +3353,141 @@ class PipController {
         background: ${palette.bg0}; color: ${palette.fg0};
         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
         display: flex; flex-direction: column; overflow: hidden;
+        /* Scales every font-size in the pane that uses 1em units. setFontStep
+           rewrites this on the fly so the user can shrink the whole PIP body
+           down to fit a 200px sliver on a phone. */
+        --pip-scale: 1;
+        transition: background-color 0.25s ease, color 0.25s ease;
       }
       header {
         display: flex; align-items: center; gap: 8px;
-        padding: 8px 14px; border-bottom: 1px solid ${palette.line};
+        padding: 6px 12px; border-bottom: 1px solid ${palette.line};
         background: ${palette.bg1}; flex: 0 0 auto;
+        font-size: 12px;
       }
       .pip-pill {
         display: inline-flex; align-items: center; gap: 6px;
-        padding: 4px 10px; border-radius: 999px;
-        font-size: 11px; font-weight: 600;
+        padding: 3px 9px; border-radius: 999px;
+        font-size: 10.5px; font-weight: 600;
         background: ${palette.bg3};
       }
       .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${palette.fg2}; }
       .pip-dot.live { background: ${palette.accent}; animation: pip-pulse 0.8s infinite; }
       @keyframes pip-pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
-      .pip-brand { font-weight: 600; font-size: 13px; }
-      main {
-        flex: 1; padding: 14px 16px; overflow-y: auto;
-        display: flex; flex-direction: column; gap: 12px;
+      .pip-brand { font-weight: 600; font-size: 12px; }
+
+      /* ─── Tabs ─── */
+      .pip-tabs {
+        display: flex; flex: 0 0 auto;
+        background: ${palette.bg1};
+        border-bottom: 1px solid ${palette.line};
       }
+      .pip-tab {
+        flex: 1; padding: 8px 6px;
+        background: transparent; border: 0; color: ${palette.fg2};
+        font: inherit; font-size: 11.5px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.05em;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+      }
+      .pip-tab[aria-selected="true"] {
+        color: ${palette.fg0};
+        border-bottom-color: ${palette.accent};
+      }
+      .pip-tab:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -3px; }
+
+      /* ─── Panes ─── */
+      .pip-pane { display: none; flex: 1; min-height: 0; overflow: hidden; }
+      .pip-pane.is-active { display: flex; flex-direction: column; }
+
+      /* Transcript pane */
+      .pip-transcript {
+        padding: 14px 16px; overflow-y: auto;
+        display: flex; flex-direction: column; gap: 12px;
+        flex: 1; min-height: 0;
+      }
+      .pip-row { transition: opacity 0.2s ease; }
+      .pip-row.is-hidden { display: none; }
       .pip-label {
-        font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
-        text-transform: uppercase; color: ${palette.fg2}; margin-bottom: 4px;
+        font-size: calc(10px * var(--pip-scale)); font-weight: 700;
+        letter-spacing: 0.6px; text-transform: uppercase;
+        color: ${palette.fg2}; margin-bottom: 4px;
       }
       .pip-input-lab { color: ${palette.accent}; }
       .pip-output-lab { color: ${palette.accent2}; }
-      .pip-input { font-size: 15px; color: ${palette.fg1}; line-height: 1.45; word-wrap: break-word; }
-      .pip-output { font-size: 20px; font-weight: 500; line-height: 1.4; word-wrap: break-word; }
+      .pip-input  { font-size: calc(15px * var(--pip-scale)); color: ${palette.fg1};
+                    line-height: 1.45; word-wrap: break-word; }
+      .pip-output { font-size: calc(20px * var(--pip-scale)); font-weight: 500;
+                    line-height: 1.4; word-wrap: break-word; }
       .pip-empty { color: ${palette.fg2}; font-style: italic; }
+
+      /* Settings pane */
+      .pip-settings {
+        padding: 12px 14px; overflow-y: auto;
+        display: flex; flex-direction: column; gap: 14px;
+        flex: 1; min-height: 0;
+      }
+      .pip-field { display: flex; flex-direction: column; gap: 6px; }
+      .pip-field-label {
+        font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
+        text-transform: uppercase; color: ${palette.fg2};
+      }
+      .pip-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .pip-btn {
+        background: ${palette.bg3}; color: ${palette.fg0};
+        border: 1px solid ${palette.line}; border-radius: 8px;
+        padding: 8px 12px; font: inherit; font-size: 12.5px; font-weight: 600;
+        cursor: pointer; min-height: 36px;
+        display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      }
+      .pip-btn:hover:not(:disabled) { background: ${palette.bg2}; }
+      .pip-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+      .pip-btn.primary  { background: ${palette.accent}; color: #0b0d12; border-color: transparent; }
+      .pip-btn.warn     { background: ${palette.warn};   color: #0b0d12; border-color: transparent; }
+      .pip-btn.danger   { background: ${palette.bad};    color: #fff;    border-color: transparent; }
+      .pip-btn.flex { flex: 1 1 0; }
+      .pip-btn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: 2px; }
+
+      /* Segmented (display mode + font size) */
+      .pip-seg {
+        display: flex; gap: 0;
+        background: ${palette.bg3}; border: 1px solid ${palette.line};
+        border-radius: 8px; padding: 2px; overflow: hidden;
+      }
+      .pip-seg-opt {
+        flex: 1; background: transparent; color: ${palette.fg1};
+        border: 0; border-radius: 6px; padding: 7px 8px;
+        font: inherit; font-size: 12px; font-weight: 600;
+        cursor: pointer; min-height: 32px;
+      }
+      .pip-seg-opt.is-active {
+        background: ${palette.accent}; color: #0b0d12;
+      }
+      .pip-seg-opt:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -1px; }
+      .pip-font-row {
+        display: flex; align-items: center; gap: 8px;
+      }
+      .pip-font-row .pip-btn { padding: 7px 12px; min-width: 44px; }
+      .pip-font-label {
+        flex: 1; text-align: center; font-size: 11px;
+        color: ${palette.fg2}; text-transform: uppercase; letter-spacing: 0.06em;
+      }
+
+      /* State-driven background tints. Applied to body via setEffectiveStatus.
+         Each state pulls toward the corresponding semantic colour at low
+         opacity so the PIP visibly shifts (calm blue while listening, lit-up
+         while speaking, amber on reconnect, red on error) without becoming
+         hard to read. The tab-strip + header keep their darker chrome so the
+         tints don't fight with text contrast. */
+      body.pip-state-idle         { background: ${palette.bg0}; }
+      body.pip-state-connecting   { background: color-mix(in srgb, ${palette.warn}   12%, ${palette.bg0}); }
+      body.pip-state-connected    { background: color-mix(in srgb, ${palette.good}   10%, ${palette.bg0}); }
+      body.pip-state-translating  { background: color-mix(in srgb, ${palette.accent} 18%, ${palette.bg0}); }
+      body.pip-state-queued       { background: color-mix(in srgb, ${palette.accent2} 12%, ${palette.bg0}); }
+      body.pip-state-waiting      { background: color-mix(in srgb, ${palette.warn}   10%, ${palette.bg0}); }
+      body.pip-state-paused       { background: color-mix(in srgb, ${palette.warn}   12%, ${palette.bg0}); }
+      body.pip-state-reconnecting { background: color-mix(in srgb, ${palette.warn}   18%, ${palette.bg0}); }
+      body.pip-state-error        { background: color-mix(in srgb, ${palette.bad}    18%, ${palette.bg0}); }
     `;
     doc.head.appendChild(style);
     doc.body.innerHTML = `
@@ -3304,28 +3497,213 @@ class PipController {
         <span style="flex:1"></span>
         <span class="pip-pill"><span class="pip-dot" id="pipdot"></span><span id="pipstatus">Idle</span></span>
       </header>
-      <main>
-        <div>
-          <div class="pip-label pip-input-lab" id="pipinlab">You</div>
-          <div class="pip-input pip-empty" id="pipin">—</div>
+      <div class="pip-tabs" role="tablist" aria-label="Pop-out tabs">
+        <button class="pip-tab" id="pipTabTranscript" role="tab" aria-selected="true"
+                aria-controls="pipPaneTranscript" type="button">Transcript</button>
+        <button class="pip-tab" id="pipTabSettings" role="tab" aria-selected="false"
+                aria-controls="pipPaneSettings" type="button">Settings</button>
+      </div>
+
+      <section class="pip-pane is-active" id="pipPaneTranscript"
+               role="tabpanel" aria-labelledby="pipTabTranscript">
+        <div class="pip-transcript">
+          <div class="pip-row" id="pipInputRow">
+            <div class="pip-label pip-input-lab" id="pipinlab">You</div>
+            <div class="pip-input pip-empty" id="pipin">—</div>
+          </div>
+          <div class="pip-row" id="pipOutputRow">
+            <div class="pip-label pip-output-lab" id="pipoutlab">Translation</div>
+            <div class="pip-output pip-empty" id="pipout">—</div>
+          </div>
         </div>
-        <div>
-          <div class="pip-label pip-output-lab" id="pipoutlab">Translation</div>
-          <div class="pip-output pip-empty" id="pipout">—</div>
+      </section>
+
+      <section class="pip-pane" id="pipPaneSettings"
+               role="tabpanel" aria-labelledby="pipTabSettings" hidden>
+        <div class="pip-settings">
+          <div class="pip-field">
+            <div class="pip-field-label">Session</div>
+            <div class="pip-row-actions">
+              <button class="pip-btn primary flex" id="pipBtnStartStop" type="button">Start</button>
+              <button class="pip-btn flex" id="pipBtnPause" type="button" disabled>Pause mic</button>
+            </div>
+            <div class="pip-row-actions">
+              <button class="pip-btn warn flex" id="pipBtnHush" type="button" disabled>Silence</button>
+              <button class="pip-btn flex" id="pipBtnClear" type="button">Clear</button>
+            </div>
+          </div>
+
+          <div class="pip-field">
+            <div class="pip-field-label">Show</div>
+            <div class="pip-seg" id="pipDisplaySeg" role="radiogroup" aria-label="Show">
+              <button class="pip-seg-opt" data-mode="both"   role="radio" aria-checked="true"  type="button">Both</button>
+              <button class="pip-seg-opt" data-mode="input"  role="radio" aria-checked="false" type="button">Source</button>
+              <button class="pip-seg-opt" data-mode="output" role="radio" aria-checked="false" type="button">Translation</button>
+            </div>
+          </div>
+
+          <div class="pip-field">
+            <div class="pip-field-label">Text size</div>
+            <div class="pip-font-row">
+              <button class="pip-btn" id="pipFontDec" type="button" aria-label="Smaller text">A−</button>
+              <span class="pip-font-label" id="pipFontLabel">sm</span>
+              <button class="pip-btn" id="pipFontInc" type="button" aria-label="Larger text">A+</button>
+            </div>
+          </div>
         </div>
-      </main>
+      </section>
     `;
+
     this.statusEl = doc.getElementById('pipstatus');
     this.dotEl = doc.getElementById('pipdot');
     this.inputLabelEl = doc.getElementById('pipinlab');
     this.outputLabelEl = doc.getElementById('pipoutlab');
     this.inputEl = doc.getElementById('pipin');
     this.outputEl = doc.getElementById('pipout');
+    this.inputRowEl = doc.getElementById('pipInputRow');
+    this.outputRowEl = doc.getElementById('pipOutputRow');
 
+    this.transcriptPaneEl = doc.getElementById('pipPaneTranscript');
+    this.settingsPaneEl = doc.getElementById('pipPaneSettings');
+    this.btnTabTranscriptEl = doc.getElementById('pipTabTranscript');
+    this.btnTabSettingsEl = doc.getElementById('pipTabSettings');
+
+    this.btnStartStopEl = doc.getElementById('pipBtnStartStop');
+    this.btnPauseEl = doc.getElementById('pipBtnPause');
+    this.btnHushEl = doc.getElementById('pipBtnHush');
+    this.btnClearEl = doc.getElementById('pipBtnClear');
+    this.displaySegEl = doc.getElementById('pipDisplaySeg');
+    this.fontDecEl = doc.getElementById('pipFontDec');
+    this.fontIncEl = doc.getElementById('pipFontInc');
+    this.fontLabelEl = doc.getElementById('pipFontLabel');
+
+    // Tabs.
+    this.btnTabTranscriptEl.addEventListener('click', () => this.setActiveTab('transcript'));
+    this.btnTabSettingsEl.addEventListener('click', () => this.setActiveTab('settings'));
+
+    // Session actions — pure forwarders into the main page. The PIP doesn't
+    // know about activeSession() or the session lifecycle; the main page's
+    // existing startPipeline/stopPipeline/togglePause/hush handle that.
+    this.btnStartStopEl.addEventListener('click', () => {
+      if (this._currentRunning) this.onStop();
+      else this.onStart();
+    });
+    this.btnPauseEl.addEventListener('click', () => this.onPause());
+    this.btnHushEl.addEventListener('click', () => this.onHush());
+    this.btnClearEl.addEventListener('click', () => this.onClear());
+
+    // Display-mode segmented.
+    this.displaySegEl.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.pip-seg-opt');
+      if (!btn) return;
+      const mode = btn.dataset.mode;
+      if (!PIP_DISPLAY_MODES.includes(mode)) return;
+      this.setDisplayMode(mode, /* persist */ true);
+    });
+
+    // Font size — clamp to [0, PIP_FONT_STEPS.length - 1].
+    this.fontDecEl.addEventListener('click', () => this.setFontStep(this._fontStep - 1, true));
+    this.fontIncEl.addEventListener('click', () => this.setFontStep(this._fontStep + 1, true));
+
+    // Replay current state into the freshly-built DOM.
     this.setStatus(this._currentStatus, this._currentLive);
+    this.setEffectiveStatus(this._currentEffStatus);
+    this.setRunning(this._currentRunning, this._currentPaused, this._currentIsAudio);
     if (this._inLang) this.setLangs(this._inLang, this._outLang);
     this.setInput(this._currentInput);
     this.setOutput(this._currentOutput);
+    this.setDisplayMode(this._displayMode, /* persist */ false);
+    this.setFontStep(this._fontStep, /* persist */ false);
+    this.setActiveTab(this._activeTab);
+  }
+
+  setActiveTab(tab) {
+    if (tab !== 'transcript' && tab !== 'settings') tab = 'transcript';
+    this._activeTab = tab;
+    if (!this.btnTabTranscriptEl) return;
+    const onTranscript = tab === 'transcript';
+    this.btnTabTranscriptEl.setAttribute('aria-selected', onTranscript ? 'true' : 'false');
+    this.btnTabSettingsEl.setAttribute('aria-selected', onTranscript ? 'false' : 'true');
+    if (this.transcriptPaneEl) {
+      this.transcriptPaneEl.classList.toggle('is-active', onTranscript);
+      this.transcriptPaneEl.hidden = !onTranscript;
+    }
+    if (this.settingsPaneEl) {
+      this.settingsPaneEl.classList.toggle('is-active', !onTranscript);
+      this.settingsPaneEl.hidden = onTranscript;
+    }
+  }
+
+  setDisplayMode(mode, persist) {
+    if (!PIP_DISPLAY_MODES.includes(mode)) mode = 'both';
+    this._displayMode = mode;
+    if (this.displaySegEl) {
+      for (const btn of this.displaySegEl.querySelectorAll('.pip-seg-opt')) {
+        const isThis = btn.dataset.mode === mode;
+        btn.classList.toggle('is-active', isThis);
+        btn.setAttribute('aria-checked', isThis ? 'true' : 'false');
+      }
+    }
+    const showInput  = mode === 'both' || mode === 'input';
+    const showOutput = mode === 'both' || mode === 'output';
+    if (this.inputRowEl)  this.inputRowEl.classList.toggle('is-hidden', !showInput);
+    if (this.outputRowEl) this.outputRowEl.classList.toggle('is-hidden', !showOutput);
+    if (persist) this.onPrefsChange(this._exportPrefs());
+  }
+
+  setFontStep(step, persist) {
+    const max = PIP_FONT_STEPS.length - 1;
+    step = Math.max(0, Math.min(max, step | 0));
+    this._fontStep = step;
+    if (this.doc && this.doc.body) {
+      this.doc.body.style.setProperty('--pip-scale', String(PIP_FONT_STEPS[step]));
+    }
+    if (this.fontLabelEl) this.fontLabelEl.textContent = PIP_FONT_LABELS[step];
+    if (this.fontDecEl) this.fontDecEl.disabled = step <= 0;
+    if (this.fontIncEl) this.fontIncEl.disabled = step >= max;
+    if (persist) this.onPrefsChange(this._exportPrefs());
+  }
+
+  _exportPrefs() {
+    return { displayMode: this._displayMode, fontStep: this._fontStep };
+  }
+
+  // Called from refreshSessionDisplay so the bg colour tracks the same
+  // effectiveStatus the chip + topbar pill use.
+  setEffectiveStatus(eff) {
+    this._currentEffStatus = eff || 'idle';
+    if (!this.doc || !this.doc.body) return;
+    // Drop any previously-set pip-state-* class before applying the new one.
+    const body = this.doc.body;
+    for (const cls of Array.from(body.classList)) {
+      if (cls.startsWith('pip-state-')) body.classList.remove(cls);
+    }
+    body.classList.add('pip-state-' + this._currentEffStatus);
+  }
+
+  // Updates the Start/Stop and Pause/Hush controls. Passed running + paused
+  // separately so the PIP doesn't need to interpret status strings.
+  setRunning(running, paused, isAudio) {
+    this._currentRunning = !!running;
+    this._currentPaused = !!paused;
+    this._currentIsAudio = isAudio === undefined ? true : !!isAudio;
+    if (!this.btnStartStopEl) return;
+    if (this._currentRunning) {
+      this.btnStartStopEl.textContent = 'Stop';
+      this.btnStartStopEl.classList.remove('primary');
+      this.btnStartStopEl.classList.add('danger');
+    } else {
+      this.btnStartStopEl.textContent = 'Start';
+      this.btnStartStopEl.classList.add('primary');
+      this.btnStartStopEl.classList.remove('danger');
+    }
+    if (this.btnPauseEl) {
+      this.btnPauseEl.disabled = !this._currentRunning;
+      this.btnPauseEl.textContent = this._currentPaused ? 'Resume mic' : 'Pause mic';
+    }
+    if (this.btnHushEl) {
+      this.btnHushEl.disabled = !this._currentRunning || !this._currentIsAudio;
+    }
   }
 
   setStatus(text, live) {
@@ -3367,9 +3745,16 @@ class PipController {
 
   _cleanup() {
     this.win = null;
+    this.doc = null;
     this.statusEl = this.dotEl = null;
     this.inputEl = this.outputEl = null;
     this.inputLabelEl = this.outputLabelEl = null;
+    this.inputRowEl = this.outputRowEl = null;
+    this.transcriptPaneEl = this.settingsPaneEl = null;
+    this.btnTabTranscriptEl = this.btnTabSettingsEl = null;
+    this.btnStartStopEl = this.btnPauseEl = this.btnHushEl = this.btnClearEl = null;
+    this.displaySegEl = null;
+    this.fontDecEl = this.fontIncEl = this.fontLabelEl = null;
     this.onClose();
   }
 
@@ -3384,7 +3769,28 @@ async function togglePip() {
     state.pip.close();
     return;
   }
-  const pip = new PipController();
+  const pip = new PipController({
+    onStart: () => startPipeline(),
+    onStop:  () => stopPipeline(),
+    onPause: () => togglePause(),
+    onHush: () => {
+      const session = activeSession();
+      if (session) state.ttsCoordinator.hush(session);
+    },
+    onClear: () => clearConversation(),
+    onPrefsChange: (prefs) => {
+      // Mirror PIP-side prefs (display mode + font size) into global prefs so
+      // they stick across pop-out sessions and page reloads. The PIP class
+      // owns the values; the main page only persists them.
+      state.pipPrefs = Object.assign({}, state.pipPrefs || {}, prefs);
+      savePrefs();
+    },
+  });
+  // Seed PIP-side state BEFORE open() so _setup paints with the user's saved
+  // preferences instead of flashing the defaults for one frame.
+  const seedPrefs = state.pipPrefs || {};
+  if (seedPrefs.displayMode) pip._displayMode = seedPrefs.displayMode;
+  if (Number.isInteger(seedPrefs.fontStep)) pip._fontStep = seedPrefs.fontStep;
   try {
     await pip.open();
   } catch (e) {
@@ -3397,8 +3803,13 @@ async function togglePip() {
   const session = activeSession();
   if (session) {
     seedPipFromSession(session);
+    // refreshSessionDisplay also drives PIP setEffectiveStatus + setRunning,
+    // which need the just-opened PIP to be present in state.pip first.
+    refreshSessionDisplay(session);
   } else {
     pip.setStatus(els.statusText.textContent, false);
+    pip.setEffectiveStatus('idle');
+    pip.setRunning(false, false, true);
     pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
   }
   log('info', PipController.isDocPipSupported() ? 'Pop-out window opened.' : 'Pop-out (popup fallback) opened.');
@@ -3516,6 +3927,29 @@ function wireUI() {
 
   els.btnMenu.addEventListener('click', () => openSheet('sidebar'));
   els.btnLog.addEventListener('click', () => openSheet('log-sheet'));
+
+  // Dev test hooks in the Log sheet. Both operate on the active session's
+  // live GeminiLive client; warn cleanly if there isn't one yet.
+  if (els.btnTestGoaway) {
+    els.btnTestGoaway.addEventListener('click', () => {
+      const session = activeSession();
+      if (!session || !session.client) {
+        log('warn', 'No active session to test. Start a session first.');
+        return;
+      }
+      session.client.simulateGoAway(3);
+    });
+  }
+  if (els.btnTestWsclose) {
+    els.btnTestWsclose.addEventListener('click', () => {
+      const session = activeSession();
+      if (!session || !session.client) {
+        log('warn', 'No active session to test. Start a session first.');
+        return;
+      }
+      session.client.forceCloseWebSocket(4000, 'test force-close');
+    });
+  }
   els.btnEditPrompt.addEventListener('click', openPromptEditor);
   els.btnSavePrompt.addEventListener('click', savePromptEditor);
   els.btnResetPrompt.addEventListener('click', resetPromptEditor);

@@ -851,6 +851,19 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .row-end { display: flex; gap: 8px; justify-content: flex-end; }
 
 /* ─── Log ─── */
+.log-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-1);
+}
+.log-toolbar-label {
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg-2);
+}
+.log-toolbar .btn.small {
+  min-height: 30px; padding: 4px 10px; font-size: 12px;
+}
 .log {
   padding: 10px 14px;
   font-size: 11.5px; line-height: 1.55;
