@@ -799,4 +799,103 @@ class MicPassthrough {
   }
 }
 
-window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, abToBase64, normalizeOutputIds, canCaptureDisplayAudio, canSelectOutputDevice };
+// Ephemeral mic-preview meter for the settings panel. Opens a short-lived
+// getUserMedia stream (and own AudioContext), pushes levels to onLevel until
+// stop() or the auto-close timer fires. Decoupled from any session — when the
+// user starts an actual session the preview is torn down so the OS doesn't
+// keep two mic indicators alive.
+class InputPreview {
+  constructor({ onLevel, onAutoStop, autoStopMs = 10000 } = {}) {
+    this.onLevel = onLevel || (() => {});
+    this.onAutoStop = onAutoStop || (() => {});
+    this.autoStopMs = autoStopMs;
+    this.stream = null;
+    this.ctx = null;
+    this.src = null;
+    this.analyser = null;
+    this._buf = null;
+    this._rafId = 0;
+    this._stopTimer = 0;
+    this.running = false;
+  }
+
+  async start(micDeviceId) {
+    await this.stop();
+    const baseAudio = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    };
+    try {
+      const audio = { ...baseAudio };
+      if (micDeviceId) audio.deviceId = { exact: micDeviceId };
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio });
+    } catch (e) {
+      // Fallback to default mic if the requested deviceId isn't available
+      // anymore (device unplugged between selection and preview).
+      if (!micDeviceId) throw e;
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+    }
+
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    this.src = this.ctx.createMediaStreamSource(this.stream);
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.analyser.smoothingTimeConstant = 0;
+    this._buf = new Float32Array(this.analyser.fftSize);
+    this.src.connect(this.analyser);
+
+    this.running = true;
+    let level = 0;
+    let last = performance.now();
+    const tick = () => {
+      if (!this.running) return;
+      const now = performance.now();
+      const dt = Math.max(0, (now - last) / 1000);
+      last = now;
+      this.analyser.getFloatTimeDomainData(this._buf);
+      let peak = 0;
+      for (let i = 0; i < this._buf.length; i++) {
+        const a = this._buf[i] < 0 ? -this._buf[i] : this._buf[i];
+        if (a > peak) peak = a;
+      }
+      if (peak > level) level = peak;
+      else level *= Math.exp(-dt / 0.1);
+      this.onLevel(level);
+      this._rafId = requestAnimationFrame(tick);
+    };
+    this._rafId = requestAnimationFrame(tick);
+
+    this._stopTimer = setTimeout(() => {
+      this._stopTimer = 0;
+      const wasRunning = this.running;
+      this.stop().then(() => {
+        if (wasRunning) this.onAutoStop();
+      });
+    }, this.autoStopMs);
+  }
+
+  async stop() {
+    const wasRunning = this.running;
+    this.running = false;
+    if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = 0; }
+    if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+    try { this.src && this.src.disconnect(); } catch (_) {}
+    this.src = null;
+    this.analyser = null;
+    this._buf = null;
+    if (this.stream) {
+      this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
+      this.stream = null;
+    }
+    if (this.ctx) {
+      try { await this.ctx.close(); } catch (_) {}
+      this.ctx = null;
+    }
+    if (wasRunning) this.onLevel(0);
+  }
+}
+
+window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, InputPreview, abToBase64, normalizeOutputIds, canCaptureDisplayAudio, canSelectOutputDevice };

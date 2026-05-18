@@ -214,9 +214,22 @@
           </div>
           <div class="field" id="mic-section">
             <label for="audio-input">Microphone</label>
-            <select id="audio-input">
-              <option value="">System default</option>
-            </select>
+            <div class="input-row">
+              <select id="audio-input">
+                <option value="">System default</option>
+              </select>
+              <button id="btn-mic-preview" class="icon-btn small" type="button"
+                      aria-label="Preview microphone level"
+                      aria-pressed="false"
+                      title="Preview microphone level (10s)">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <use href="#icon-mic"/>
+                </svg>
+              </button>
+            </div>
+            <div class="mic-preview-meter" id="mic-preview-meter" aria-hidden="true">
+              <div class="mic-preview-fill" id="mic-preview-fill"></div>
+            </div>
             <p class="live-line" id="audio-input-live" aria-live="polite"></p>
             <p class="hint" id="audio-input-hint">Choose the microphone used for speech input. Device names may appear after permission.</p>
           </div>

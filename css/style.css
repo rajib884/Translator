@@ -762,6 +762,37 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   animation: live-pulse 1.6s ease-out infinite;
 }
 
+/* Mic preview meter + toggle button. The meter only takes layout when the
+   user clicks "Preview" — otherwise it stays display:none and the panel
+   doesn't reserve vertical space for it. */
+.mic-preview-meter {
+  display: none;
+  margin: 6px 0 0;
+  height: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.mic-preview-meter.is-active { display: block; }
+.mic-preview-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg,
+    var(--accent) 0%,
+    var(--accent) 65%,
+    var(--warn)  85%,
+    var(--bad)   100%);
+  transition: width 0.06s linear;
+  will-change: width;
+}
+#btn-mic-preview { flex-shrink: 0; }
+#btn-mic-preview.is-active {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-2));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+#btn-mic-preview.is-active .icon { animation: live-pulse 1.6s ease-out infinite; }
+
 /* Right: mic passthrough toggle (decoupled from sessions) */
 .passthrough-toggle {
   display: flex; align-items: center; justify-content: center;

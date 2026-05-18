@@ -191,6 +191,9 @@ const els = {
   audioInput:    $('audio-input'),
   audioInputHint:$('audio-input-hint'),
   audioInputLive:$('audio-input-live'),
+  btnMicPreview:    $('btn-mic-preview'),
+  micPreviewMeter:  $('mic-preview-meter'),
+  micPreviewFill:   $('mic-preview-fill'),
   audioSource:   segProxy($('audio-source-segmented')),
   audioHint:     $('audio-source-hint'),
   companionApp:      $('companion-app'),
@@ -614,6 +617,9 @@ const state = {
   activeSessionId: null,
   ttsCoordinator: new TTSCoordinator(),
   micPassthrough: new LiveAudio.MicPassthrough(),
+  // Lazily allocated InputPreview for the settings panel's mic visualizer.
+  // Stays null until the user clicks the preview button.
+  inputPreview: null,
 
   // 'simple' hides the tab strip and advanced settings sections; 'advanced'
   // shows everything. Sessions and configs are unaffected — flipping back to
@@ -1778,6 +1784,66 @@ async function applyPassthrough() {
   refreshActiveDeviceIndicators();
 }
 
+// ─── Input device preview ────────────────────────────────────────────────────
+// Opens a short-lived mic stream just for the visualizer in the settings
+// panel. Auto-closes after ~10 s so we don't keep the OS mic indicator on
+// indefinitely when the user forgets to stop it.
+const MIC_PREVIEW_MS = 10000;
+
+function paintMicPreviewLevel(level) {
+  if (!els.micPreviewFill) return;
+  els.micPreviewFill.style.width = levelToPct(level) + '%';
+}
+
+function setMicPreviewActive(active) {
+  if (els.btnMicPreview) {
+    els.btnMicPreview.classList.toggle('is-active', !!active);
+    els.btnMicPreview.setAttribute('aria-pressed', active ? 'true' : 'false');
+    els.btnMicPreview.title = active
+      ? 'Stop microphone preview'
+      : 'Preview microphone level (10s)';
+    els.btnMicPreview.setAttribute('aria-label',
+      active ? 'Stop microphone preview' : 'Preview microphone level');
+  }
+  if (els.micPreviewMeter) {
+    els.micPreviewMeter.classList.toggle('is-active', !!active);
+  }
+  if (!active) paintMicPreviewLevel(0);
+}
+
+async function stopMicPreview() {
+  if (state.inputPreview && state.inputPreview.running) {
+    try { await state.inputPreview.stop(); } catch (_) {}
+  }
+  setMicPreviewActive(false);
+}
+
+async function startMicPreview() {
+  if (!state.inputPreview) {
+    state.inputPreview = new LiveAudio.InputPreview({
+      onLevel: (l) => paintMicPreviewLevel(l),
+      onAutoStop: () => setMicPreviewActive(false),
+      autoStopMs: MIC_PREVIEW_MS,
+    });
+  }
+  const micId = els.audioInput ? els.audioInput.value || '' : '';
+  try {
+    await state.inputPreview.start(micId);
+    setMicPreviewActive(true);
+  } catch (e) {
+    setMicPreviewActive(false);
+    log('warn', 'Mic preview failed: ' + (e && e.message ? e.message : e));
+  }
+}
+
+async function toggleMicPreview() {
+  if (state.inputPreview && state.inputPreview.running) {
+    await stopMicPreview();
+  } else {
+    await startMicPreview();
+  }
+}
+
 // Coerce legacy single-string saves and stray inputs into a clean array, then
 // hand off to the shared LiveAudio.normalizeOutputIds for de-dup + empty
 // coercion. The legacy migration (string → [string], legacySingle fallback)
@@ -2197,6 +2263,12 @@ function createCompanionCapture(session) {
 async function changeAudioInput() {
   els.audioInput.dataset.preferred = els.audioInput.value;
   onSettingsChange();
+  // Keep the preview meter pointed at the user's current pick — restart it
+  // against the new device so the visualizer doesn't keep listening to the
+  // old one until the auto-stop timer fires.
+  if (state.inputPreview && state.inputPreview.running) {
+    startMicPreview();
+  }
   const session = activeSession();
   if (!session || !session.running) return;
 
@@ -2526,6 +2598,11 @@ async function startPipeline() {
 
 async function startSession(session) {
   if (session.running) return;
+
+  // Release the preview mic if it's open — the live session is about to grab
+  // the same device and the user no longer needs the standalone visualizer
+  // (the per-session tab meter takes over).
+  await stopMicPreview();
 
   const apiKey = els.apiKey.value.trim();
   if (!apiKey) {
@@ -3294,6 +3371,9 @@ function wireUI() {
     sel.addEventListener('change', onSettingsChange);
   }
   els.audioInput.addEventListener('change', changeAudioInput);
+  if (els.btnMicPreview) {
+    els.btnMicPreview.addEventListener('click', () => { toggleMicPreview(); });
+  }
   els.audioOutput.addEventListener('change', (e) => {
     if (e.target.classList.contains('dev-passthrough')) {
       savePrefs();
@@ -3453,6 +3533,7 @@ function wireUI() {
       }
     }
     try { state.micPassthrough.stop(); } catch (_) {}
+    try { state.inputPreview && state.inputPreview.stop(); } catch (_) {}
     if (state.pip) state.pip.close();
   });
   window.addEventListener('focus', () => detectCompanionService());
