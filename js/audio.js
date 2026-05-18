@@ -153,6 +153,10 @@ class AudioCapture {
     this.streams = [];
     this.sources = [];
     this.node = null;
+    // The deviceId the OS actually selected when we asked for "system default"
+    // (or whichever device the caller specified). Surfaced so the UI can show
+    // "System default (Realtek Microphone)" instead of a confusing bare label.
+    this.actualMicDeviceId = '';
     this._workletUrl = null;
     // Meter ticks while a worklet node exists; the moment capture is torn
     // down, isActive flips false and the tail (Infinity) lets the loop end on
@@ -192,6 +196,13 @@ class AudioCapture {
           s = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
         }
         this.streams.push({ kind: 'mic', stream: s });
+        // Record which physical mic actually got picked. `getSettings().deviceId`
+        // is the OS-resolved id even when we asked for the default.
+        const track = s.getAudioTracks()[0];
+        if (track && typeof track.getSettings === 'function') {
+          const settings = track.getSettings();
+          this.actualMicDeviceId = settings && settings.deviceId ? settings.deviceId : '';
+        }
       }
 
       if (wantDisplay) {

@@ -295,6 +295,9 @@ class GeminiLiveClient {
 
   _onClose(ev) {
     this.ws = null;
+    // Capture whether setup ever completed BEFORE flipping the flag — used
+    // below to decide whether a saved resume handle is likely stale.
+    const closedBeforeSetup = !this._setupComplete;
     this._setupComplete = false;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog(ev.code === 1000 ? 'info' : 'warn',
@@ -303,6 +306,17 @@ class GeminiLiveClient {
     if (!this.shouldRun) {
       this._setState('idle');
       return;
+    }
+
+    // If the connection died before we got setupComplete and we were trying
+    // to resume, the handle is the most likely cause — handles are valid for
+    // ~2 hours after session termination, and stale ones never recover. Drop
+    // it once so the next attempt starts a fresh session instead of burning
+    // through MAX_RECONNECT_ATTEMPTS with the same dead handle.
+    if (closedBeforeSetup && this.resumeHandle && !FATAL_CLOSE_CODES.has(ev.code)) {
+      this.onLog('warn', 'Resume handle did not take — starting a fresh session.');
+      this.resumeHandle = null;
+      try { this.onResumeHandle(null); } catch (_) {}
     }
 
     // Fatal: server explicitly rejected us. Reconnecting won't help — the user

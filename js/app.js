@@ -203,6 +203,7 @@ const els = {
   audioOutput:   $('audio-output'),
   audioOutputSection: $('audio-output-section'),
   audioOutputHint:$('audio-output-hint'),
+  btnDetectDevices: $('btn-detect-devices'),
   modeSelect:    segProxy($('mode-segmented')),
   modeHint:      $('mode-hint'),
   dirSelect:     segProxy($('dir-segmented')),
@@ -284,6 +285,9 @@ class Session {
     this.pendingInput = '';
     this.pendingOutput = '';
     this.pendingScheduled = false;
+    // Full finalized turn history kept in memory so the export captures
+    // everything — the DOM only retains MAX_TURNS for performance.
+    this.history = []; // [{ input, output, finalizedAt }]
 
     // DOM owned by this session.
     this.tabEl = null;             // .tab-chip
@@ -323,6 +327,17 @@ class TTSCoordinator {
     this.currentSpeakerId = null;
     this.queue = [];                 // session ids waiting in FIFO order
     this.entries = new Map();        // id -> { session, player, buffered, wantsToSpeak, turnComplete }
+    // Optional callback invoked the moment a session is promoted to speaker
+    // (PiP uses this to follow whoever's actually talking, decoupled from
+    // which session is currently active in the UI).
+    this.onSpeakerStart = null;
+  }
+
+  _setCurrentSpeaker(id) {
+    this.currentSpeakerId = id;
+    if (id && typeof this.onSpeakerStart === 'function') {
+      try { this.onSpeakerStart(id); } catch (_) {}
+    }
   }
 
   register(session, player) {
@@ -440,7 +455,7 @@ class TTSCoordinator {
 
   _requestSpeak(sessionId) {
     if (!this.currentSpeakerId) {
-      this.currentSpeakerId = sessionId;
+      this._setCurrentSpeaker(sessionId);
     } else if (!this.queue.includes(sessionId)) {
       this.queue.push(sessionId);
     }
@@ -467,7 +482,7 @@ class TTSCoordinator {
       const nextId = this.queue.shift();
       const entry = this.entries.get(nextId);
       if (!entry) continue;
-      this.currentSpeakerId = nextId;
+      this._setCurrentSpeaker(nextId);
       // The newly-promoted session was "Queued"; it's about to be "Speaking".
       // playChunk's onActiveChange will fire the proper status flip, but we
       // refresh here too so the queued indicator clears in the same frame
@@ -639,6 +654,18 @@ const state = {
   // re-pop-out picks up the user's last choices instead of resetting.
   pipPrefs: { displayMode: 'both', fontStep: 1 },
 
+  // Most recent deviceId the OS picked when something requested "System
+  // default" for the mic. Surfaced in the input dropdown so the user can see
+  // which physical device is actually being recorded.
+  resolvedMicDeviceId: '',
+  // The session that most recently produced TTS audio. PiP tracks this rather
+  // than the active session so it follows whoever's actually speaking; once
+  // a session has spoken, PiP stays on it until another session speaks.
+  lastSpeakingSessionId: null,
+  // The session id the PiP is currently mirroring. Used to suppress redundant
+  // re-seeds when chunk callbacks happen on the same session repeatedly.
+  pipFollowingSessionId: null,
+
   // 'simple' hides the tab strip and advanced settings sections; 'advanced'
   // shows everything. Sessions and configs are unaffected — flipping back to
   // advanced reveals all existing tabs untouched.
@@ -655,6 +682,19 @@ const state = {
   systemPromptTemplate: null,
   companionAvailable: false,
   companionApps: [],
+};
+
+// Mirror the TTS coordinator's "who's speaking now" signal into PiP follow
+// state. We point PiP at whichever session just started speaking; once that
+// session falls silent, the PiP stays parked there until another session
+// starts to speak (which is what the user asked for — last-speaker wins).
+state.ttsCoordinator.onSpeakerStart = (sessionId) => {
+  state.lastSpeakingSessionId = sessionId;
+  const session = state.sessions.get(sessionId);
+  if (!session || !state.pip) return;
+  if (state.pipFollowingSessionId === sessionId) return;
+  state.pipFollowingSessionId = sessionId;
+  seedPipFromSession(session);
 };
 
 function setUIMode(mode) {
@@ -1143,9 +1183,14 @@ function setActiveSession(id) {
   // Per-session meters live inside the chip and keep painting themselves on
   // every level callback; no global meter to reset here.
 
-  // PiP follows the active session: relabel and replay the session's transcript
-  // so what's on the popout matches what's in the main window.
-  if (state.pip) seedPipFromSession(next);
+  // PiP follows the last-speaking session, not the active session — so a tab
+  // switch by itself doesn't yank the popout off the session that just spoke.
+  // Exception: if nothing has spoken yet (no follow target), default to the
+  // newly active session so the popout isn't blank.
+  if (state.pip && !state.pipFollowingSessionId) {
+    state.pipFollowingSessionId = next.id;
+    seedPipFromSession(next);
+  }
 
   // Auto-scroll the new tab's transcript to the bottom so the latest turn is
   // in view (transcripts can be scrolled up while the user is reading old ones).
@@ -1264,6 +1309,25 @@ async function closeSession(session) {
   // session if there is one. They're FIFO: the first archived entry is the
   // oldest excess from restore time.
   maybePromoteArchivedSession();
+  // If PiP was tracking this session, drop the anchor and re-seed from a
+  // surviving session so the popout doesn't stay stuck on a removed one.
+  // (Re-seed before the setActiveSession path below so it sees a clean
+  // state.pipFollowingSessionId and can pick a sensible default.)
+  const wasFollowing = state.pipFollowingSessionId === session.id;
+  if (state.lastSpeakingSessionId === session.id) state.lastSpeakingSessionId = null;
+  if (wasFollowing) {
+    state.pipFollowingSessionId = null;
+    if (state.pip) {
+      // Defer to setActiveSession's "no follow target, seed from active"
+      // path when this was the active session too; otherwise pick any
+      // remaining session so the popout has live content.
+      const fallback = state.sessions.values().next().value;
+      if (fallback && state.activeSessionId !== session.id) {
+        state.pipFollowingSessionId = fallback.id;
+        seedPipFromSession(fallback);
+      }
+    }
+  }
   refreshAddSessionButton();
   refreshBulkActionButtons();
 
@@ -1362,12 +1426,18 @@ async function stopAllSessions() {
 }
 
 // ─── Persistence (sessions) ──────────────────────────────────────────────────
+// Cap how many history turns we persist per session. The DOM is already
+// trimmed to MAX_TURNS for perf; localStorage has a per-origin budget (~5MB
+// across all keys), and 500 turns × ~200 chars ≈ 100KB per session is plenty
+// of headroom while still surviving long sessions through a reload.
+const MAX_PERSISTED_HISTORY = 500;
 function saveSessions() {
   try {
     const visible = [...state.sessions.values()].map((s) => ({
       id: s.id,
       config: s.config,
       resumeHandle: s.resumeHandle || null,
+      history: (s.history || []).slice(-MAX_PERSISTED_HISTORY),
     }));
     // Append archivedSessions (extras we hid at restore time) so they're
     // preserved across writes. They never become active sessions in this
@@ -1420,6 +1490,17 @@ function restoreSessionsFromStorage() {
       config: cfg,
     });
     session.resumeHandle = entry.resumeHandle || null;
+    if (Array.isArray(entry.history)) {
+      // Defensive: only accept well-formed entries so a corrupted store can't
+      // crash the renderer or the export downstream.
+      session.history = entry.history
+        .filter((h) => h && typeof h === 'object')
+        .map((h) => ({
+          input: typeof h.input === 'string' ? h.input : '',
+          output: typeof h.output === 'string' ? h.output : '',
+          finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
+        }));
+    }
     state.sessions.set(session.id, session);
     createSessionDOM(session);
   }
@@ -1960,6 +2041,68 @@ function outputDeviceLabel(device, index) {
   return `Speaker ${index + 1}`;
 }
 
+// `select.value = X` silently falls back to the first option when X has no
+// matching <option>. That's the cause of "non-default device gets selected"
+// when a stored deviceId disappears. This helper finds the option explicitly
+// and falls back to '' (System default) when missing.
+function selectOptionByValue(selectEl, value) {
+  if (!selectEl) return;
+  const wanted = value == null ? '' : String(value);
+  let match = null;
+  for (const opt of selectEl.options) {
+    if (opt.value === wanted) { match = opt; break; }
+  }
+  if (!match) {
+    for (const opt of selectEl.options) {
+      if (opt.value === '') { match = opt; break; }
+    }
+  }
+  if (match) {
+    selectEl.selectedIndex = match.index;
+  }
+}
+
+// One-shot: ask for mic permission, immediately release the stream, then
+// re-render the device lists. This is the recommended way to surface device
+// names without committing the browser to a long-lived recording — useful at
+// startup when no session is running yet.
+async function detectAudioDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    log('warn', 'This browser does not support detecting devices.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Stop immediately — we only needed the permission grant.
+    stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
+    await refreshAudioInputDevices();
+    await refreshAudioOutputDevices();
+    log('info', 'Audio devices detected.');
+  } catch (e) {
+    log('warn', 'Could not detect devices: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// Re-runs enumerate-and-render when the data is likely stale (input dropdown
+// only has the placeholder, or no device labels yet). Cheap; harmless when
+// nothing has changed.
+async function refreshDeviceListsIfStale() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devs.filter((d) => d.kind === 'audioinput');
+    const outputs = devs.filter((d) => d.kind === 'audiooutput');
+    const inputsLackLabels = inputs.length > 0 && inputs.every((d) => !d.label);
+    const outputsLackLabels = outputs.length > 0 && outputs.every((d) => !d.label);
+    // Always refresh if dropdowns are still empty (just placeholder), or if
+    // labels are still hidden (permission may have been granted since).
+    const inputEmpty = els.audioInput && els.audioInput.options.length <= 1;
+    const outputEmpty = els.audioOutput && els.audioOutput.querySelectorAll('.device-option').length <= 1;
+    if (inputEmpty || inputsLackLabels) refreshAudioInputDevices();
+    if (outputEmpty || outputsLackLabels) refreshAudioOutputDevices();
+  } catch (_) { /* device enumeration failures are non-fatal here */ }
+}
+
 async function refreshAudioInputDevices() {
   if (!els.audioInput || els.audioInput.disabled) return;
   try {
@@ -1969,9 +2112,23 @@ async function refreshAudioInputDevices() {
     const seen = new Set();
     const frag = document.createDocumentFragment();
 
+    // "System default" gets a richer label when we know which physical device
+    // the OS resolved it to. Two sources, in priority order:
+    //   1. state.resolvedMicDeviceId — captured by AudioCapture post-start
+    //      from track.getSettings().deviceId (most authoritative; this is the
+    //      device actually being recorded).
+    //   2. The 'default' entry from enumerateDevices (browsers expose this
+    //      pre-session, label like "Default - Realtek Microphone").
+    const resolved = state.resolvedMicDeviceId
+      ? inputs.find((d) => d.deviceId === state.resolvedMicDeviceId)
+      : null;
+    const defaultEntry = inputs.find((d) => d.deviceId === 'default');
+    let defaultLabel = 'System default';
+    if (resolved && resolved.label) defaultLabel = `System default (${resolved.label})`;
+    else if (defaultEntry && defaultEntry.label) defaultLabel = defaultEntry.label;
     const defaultOpt = document.createElement('option');
     defaultOpt.value = '';
-    defaultOpt.textContent = 'System default';
+    defaultOpt.textContent = defaultLabel;
     frag.appendChild(defaultOpt);
     seen.add('');
 
@@ -1992,14 +2149,19 @@ async function refreshAudioInputDevices() {
 
     els.audioInput.innerHTML = '';
     els.audioInput.appendChild(frag);
-    els.audioInput.value = seen.has(selected) ? selected : '';
-    els.audioInput.dataset.preferred = els.audioInput.value;
+    // Explicitly find and select the option rather than relying on
+    // `select.value = X`, which silently falls back to the first option when
+    // X isn't present — that's the root of the "selects a non-default device"
+    // report when a stored deviceId vanishes between sessions.
+    const target = seen.has(selected) ? selected : '';
+    selectOptionByValue(els.audioInput, target);
+    els.audioInput.dataset.preferred = target;
 
     if (inputs.length) {
       const hasLabels = inputs.some((d) => d.label);
       els.audioInputHint.textContent = hasLabels
         ? 'Changes apply immediately; Mic + app audio asks you to pick app audio again.'
-        : 'Device names may appear after microphone permission.';
+        : 'Device names may appear after microphone permission — click Start once to grant it.';
     } else {
       els.audioInputHint.textContent = 'No microphones were reported by this browser.';
     }
@@ -2038,7 +2200,15 @@ async function refreshAudioOutputDevices() {
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
     const seen = new Set();
     const frag = document.createDocumentFragment();
-    frag.appendChild(buildDeviceOption('', 'System default', wantedTts.has(''), wantedPt.has('')));
+    // Same idea as the input dropdown: surface which physical device the OS
+    // actually resolved "System default" to. Web Audio doesn't tell us the
+    // actual physical sink for ctx.destination, so the 'default' device entry
+    // from enumerateDevices is our best signal.
+    const defaultOutEntry = outputs.find((d) => d.deviceId === 'default');
+    const sysDefaultLabel = (defaultOutEntry && defaultOutEntry.label)
+      ? defaultOutEntry.label
+      : 'System default';
+    frag.appendChild(buildDeviceOption('', sysDefaultLabel, wantedTts.has(''), wantedPt.has('')));
     seen.add('');
 
     outputs.forEach((device, index) => {
@@ -2485,15 +2655,15 @@ function refreshSessionDisplay(session) {
   if (isActive(session)) {
     els.statusPill.className = 'pill ' + def.cls;
     els.statusText.textContent = text;
-    if (state.pip) {
-      state.pip.setStatus(text, eff === 'translating' || eff === 'connected');
-      // The PIP repaints its body background tint from the effective status
-      // so the user sees an at-a-glance visual cue (calm while listening,
-      // lit-up while speaking, amber on reconnect, red on error) even when
-      // they can't read the small status text.
-      state.pip.setEffectiveStatus(eff);
-      state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
-    }
+  }
+  // PiP mirrors the followed session's status, not the active one — so the
+  // popout stays consistent with the transcript it's showing. setEffectiveStatus
+  // drives the background tint (calm listening, lit speaking, amber reconnect,
+  // red error); setRunning toggles the playing/paused/idle visual.
+  if (state.pip && state.pipFollowingSessionId === session.id) {
+    state.pip.setStatus(text, eff === 'translating' || eff === 'connected');
+    state.pip.setEffectiveStatus(eff);
+    state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
   }
 }
 
@@ -2549,7 +2719,7 @@ function flushPending(session) {
     t.inputText += session.pendingInput;
     t.inputTextNode.nodeValue = t.inputText;
     session.pendingInput = '';
-    if (state.pip && isActive(session)) state.pip.setInput(t.inputText);
+    if (state.pip && state.pipFollowingSessionId === session.id) state.pip.setInput(t.inputText);
     if (!t.outputText) t.root.classList.add('is-thinking');
   }
   if (session.pendingOutput) {
@@ -2562,7 +2732,7 @@ function flushPending(session) {
       }
       t.outputText += session.pendingOutput;
       t.outputTextNode.nodeValue = t.outputText;
-      if (state.pip && isActive(session)) state.pip.setOutput(t.outputText);
+      if (state.pip && state.pipFollowingSessionId === session.id) state.pip.setOutput(t.outputText);
     }
     session.pendingOutput = '';
   }
@@ -2641,7 +2811,7 @@ function ensureLiveTurn(session) {
     outputText: '',
   };
 
-  if (state.pip && isActive(session)) {
+  if (state.pip && state.pipFollowingSessionId === session.id) {
     state.pip.setLangs(langName(session.config.source), langName(session.config.target));
     state.pip.setInput('');
     state.pip.setOutput('');
@@ -2663,6 +2833,15 @@ function finalizeTurn(session) {
   if (!t.inputText.trim())  { t.inputEl.classList.add('empty');  t.inputTextNode.nodeValue = '(silence)'; }
   if (t.outputEl && !t.outputText.trim()) { t.outputEl.classList.add('empty'); t.outputTextNode.nodeValue = '(no translation)'; }
   t.root.classList.remove('live');
+  // Persist into the per-session history so the export survives DOM trimming.
+  // Skip turns that produced literally nothing (mic open but no speech) so the
+  // exported file isn't padded with (silence)/(no translation) noise.
+  const inText = t.inputText.trim();
+  const outText = t.outputEl ? t.outputText.trim() : '';
+  if (inText || outText) {
+    session.history.push({ input: inText, output: outText, finalizedAt: Date.now() });
+    saveSessions();
+  }
   session.liveTurn = null;
 }
 
@@ -2878,6 +3057,11 @@ async function startSession(session) {
       await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
     }
     session.currentAudioMode = audioMode;
+    // Capture which physical mic getUserMedia resolved to so the dropdown's
+    // "System default" label can grow into "System default (X)".
+    if (session.capture && session.capture.actualMicDeviceId) {
+      state.resolvedMicDeviceId = session.capture.actualMicDeviceId;
+    }
     await refreshAudioInputDevices();
     await refreshAudioOutputDevices();
     refreshActiveDeviceIndicators();
@@ -3041,6 +3225,11 @@ function openSheet(id) {
   // Sidebar on desktop is permanently visible; openSheet shouldn't promote it
   // to a modal or move focus there.
   const isSidebar = id === 'sidebar';
+  // Re-probe device labels every time the sidebar comes up. Once mic
+  // permission is granted (by a previous session start, by user action in
+  // browser UI, or by another tab), enumerateDevices starts returning labels
+  // — but only after we call it again. This is cheap and silent.
+  if (isSidebar) refreshDeviceListsIfStale();
   if (isSidebar && isSidebarDocked()) {
     el.classList.add('is-open');
     return;
@@ -3138,8 +3327,12 @@ function clearConversation() {
   const turnCount = session.transcriptEl
     ? session.transcriptEl.querySelectorAll(':scope > .turn').length
     : 0;
-  if (turnCount > 0 && !window.confirm('Clear this session\'s conversation?')) return;
+  if ((turnCount > 0 || session.history.length > 0) &&
+      !window.confirm('Clear this session\'s conversation?')) return;
   session.liveTurn = null;
+  session.history = [];
+  session.pendingInput = '';
+  session.pendingOutput = '';
   if (session.transcriptEl) {
     session.transcriptEl.innerHTML = '';
     renderSessionEmptyState(session);
@@ -3148,16 +3341,24 @@ function clearConversation() {
 }
 
 function conversationTurns(session) {
-  if (!session || !session.transcriptEl) return [];
-  return Array.from(session.transcriptEl.querySelectorAll(':scope > .turn')).map((turn, index) => {
-    const input = turn.querySelector('.turn-row.input .turn-text');
-    const output = turn.querySelector('.turn-row.output .turn-text');
-    return {
-      index: index + 1,
-      input: input ? input.textContent.trim() : '',
-      output: output ? output.textContent.trim() : '',
-    };
-  });
+  if (!session) return [];
+  // Pull from the in-memory history (survives the MAX_TURNS DOM trim) plus
+  // the in-progress live turn so a quick export-mid-conversation isn't off
+  // by one. Drain any pending chunks first so the live turn's text is fresh.
+  if (session.pendingScheduled) flushPending(session);
+  const out = session.history.map((h, i) => ({
+    index: i + 1,
+    input: h.input || '',
+    output: h.output || '',
+  }));
+  if (session.liveTurn) {
+    const inText = (session.liveTurn.inputText || '').trim();
+    const outText = (session.liveTurn.outputText || '').trim();
+    if (inText || outText) {
+      out.push({ index: out.length + 1, input: inText, output: outText });
+    }
+  }
+  return out;
 }
 
 function downloadText(filename, text, type) {
@@ -4061,15 +4262,27 @@ async function togglePip() {
     return;
   }
   state.pip = pip;
-  pip.onClose = () => { if (state.pip === pip) state.pip = null; };
+  pip.onClose = () => {
+    if (state.pip === pip) state.pip = null;
+    // Forget the follow target on close so the next pop-out starts on
+    // whatever session is currently active rather than a stale memory.
+    state.pipFollowingSessionId = null;
+  };
 
-  const session = activeSession();
-  if (session) {
-    seedPipFromSession(session);
+  // Prefer the session that spoke most recently; if nothing has spoken yet,
+  // fall back to the active tab. Either way, anchor the follow target so
+  // chunk callbacks know where to route updates.
+  const followSession = (state.lastSpeakingSessionId
+    ? state.sessions.get(state.lastSpeakingSessionId)
+    : null) || activeSession();
+  if (followSession) {
+    state.pipFollowingSessionId = followSession.id;
+    seedPipFromSession(followSession);
     // refreshSessionDisplay also drives PIP setEffectiveStatus + setRunning,
     // which need the just-opened PIP to be present in state.pip first.
-    refreshSessionDisplay(session);
+    refreshSessionDisplay(followSession);
   } else {
+    state.pipFollowingSessionId = null;
     pip.setStatus(els.statusText.textContent, false);
     pip.setEffectiveStatus('idle');
     pip.setRunning(false, false, true);
@@ -4167,6 +4380,9 @@ function wireUI() {
   els.audioInput.addEventListener('change', changeAudioInput);
   if (els.btnMicPreview) {
     els.btnMicPreview.addEventListener('click', () => { toggleMicPreview(); });
+  }
+  if (els.btnDetectDevices) {
+    els.btnDetectDevices.addEventListener('click', detectAudioDevices);
   }
   els.audioOutput.addEventListener('change', (e) => {
     if (e.target.classList.contains('dev-passthrough')) {
@@ -4413,6 +4629,22 @@ function wireUI() {
     if (!hasActiveAudio()) return;
     refreshActiveDeviceIndicators();
   }, 2000);
+
+  // Watch microphone permission state. The moment it flips to 'granted'
+  // (from a previous session, an OS prompt, or another tab), re-enumerate so
+  // device names appear without needing a start-stop dance. Permissions API
+  // for 'microphone' is widely supported; if missing, devicechange still
+  // covers most cases.
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: 'microphone' }).then((perm) => {
+      perm.addEventListener && perm.addEventListener('change', () => {
+        if (perm.state === 'granted') {
+          refreshAudioInputDevices();
+          refreshAudioOutputDevices();
+        }
+      });
+    }).catch(() => { /* not all browsers expose microphone perms — ignore */ });
+  }
 }
 
 // True when any session is running OR mic passthrough is live — i.e. there

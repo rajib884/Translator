@@ -218,6 +218,9 @@
               <select id="audio-input">
                 <option value="">System default</option>
               </select>
+              <button id="btn-detect-devices" class="icon-btn small" type="button" aria-label="Detect device names" title="Detect device names (grants mic permission)">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              </button>
               <button id="btn-mic-preview" class="icon-btn small" type="button"
                       aria-label="Preview microphone level"
                       aria-pressed="false"
@@ -259,6 +262,10 @@
                 <label class="device-tts-label">
                   <input type="checkbox" class="dev-tts" value="" checked />
                   <span class="device-name">System default</span>
+                </label>
+                <label class="passthrough-toggle" title="Pass microphone audio to this device">
+                  <input type="checkbox" class="dev-passthrough" value="" />
+                  <span class="pt-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span>
                 </label>
               </div>
             </div>
