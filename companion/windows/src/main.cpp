@@ -1,12 +1,12 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <initguid.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
 #include <avrt.h>
 #include <bcrypt.h>
-#include <initguid.h>
 #include <ksmedia.h>
 #include <psapi.h>
 
@@ -63,8 +63,11 @@ constexpr int kMaxFrameSamples = 1600;
 // some polling traffic. Past this we 503 new connections; the local-only
 // audience makes this purely a fork-bomb guardrail, not a throughput knob.
 constexpr int kMaxConnections = 32;
-// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT from <ksmedia.h> is the canonical name;
-// the GUID storage comes from <initguid.h> being included first.
+// MinGW's ksmedia.h declares KSDATAFORMAT_SUBTYPE_IEEE_FLOAT as an extern in
+// some SDK versions, so keep local storage for the GUID we need at runtime.
+const GUID kKsDataFormatSubtypeIeeeFloat = {
+    0x00000003, 0x0000, 0x0010,
+    {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 
 struct SocketGuard {
   SOCKET s = INVALID_SOCKET;
@@ -364,7 +367,7 @@ bool is_float_format(const WAVEFORMATEX* fmt) {
   if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
   if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
     auto ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(fmt);
-    return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    return IsEqualGUID(ext->SubFormat, kKsDataFormatSubtypeIeeeFloat);
   }
   return false;
 }
