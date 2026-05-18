@@ -1306,7 +1306,8 @@ function maybePromoteArchivedSession() {
 }
 
 // Disables the "+" affordance and explains why when we're at the per-window
-// session cap. Cheap to call after any sessions-map mutation.
+// session cap. Cheap to call after any sessions-map mutation. Also pushes
+// the new count into the PIP so its cycle button can show/hide.
 function refreshAddSessionButton() {
   if (!els.btnNewSession) return;
   const atLimit = state.sessions.size >= MAX_SESSIONS;
@@ -1314,6 +1315,7 @@ function refreshAddSessionButton() {
   els.btnNewSession.title = atLimit
     ? `Maximum ${MAX_SESSIONS} sessions — close one to add another`
     : 'New session';
+  if (typeof refreshPipSessionCount === 'function') refreshPipSessionCount();
 }
 
 // Bulk-action button state. Start-all only makes sense when at least one
@@ -3238,20 +3240,29 @@ const PIP_FONT_STEPS = [0.78, 1.00, 1.22, 1.50];
 const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
 
 class PipController {
-  constructor({ onStart, onStop, onPause, onHush, onClear, onPrefsChange } = {}) {
+  constructor({ onStart, onStop, onPause, onHush, onClear,
+                onCycleSession, onPttDown, onPttUp, onPrefsChange } = {}) {
     this.win = null;
     this.doc = null;
 
     // Callbacks back into the main page. PIP runs in a same-origin window, so
     // closures here execute in the main JS context — these wire the PIP's
-    // Start/Stop/Pause/Hush buttons to the same actions the main controls
-    // already trigger. Callers pass them so PipController stays decoupled
-    // from main-page globals.
+    // header buttons to the same actions the main controls already trigger.
+    // Callers pass them so PipController stays decoupled from main-page
+    // globals.
     this.onStart = onStart || (() => {});
     this.onStop = onStop || (() => {});
     this.onPause = onPause || (() => {});
     this.onHush = onHush || (() => {});
     this.onClear = onClear || (() => {});
+    // Cycle through running/idle sessions when more than one exists. Hidden
+    // when the count is <= 1.
+    this.onCycleSession = onCycleSession || (() => {});
+    // PTT button — press-and-hold. Placeholder for now: main page receives
+    // the down/up signals and decides whether to wire them through to the
+    // active session's GeminiLive client (manualActivity path) or just log.
+    this.onPttDown = onPttDown || (() => {});
+    this.onPttUp   = onPttUp   || (() => {});
     this.onPrefsChange = onPrefsChange || (() => {});
     this.onClose = () => {};
 
@@ -3264,11 +3275,13 @@ class PipController {
     this.outputEl = null;
     this.inputRowEl = null;
     this.outputRowEl = null;
-    this.transcriptPaneEl = null;
-    this.settingsPaneEl = null;
-    this.btnTabTranscriptEl = null;
-    this.btnTabSettingsEl = null;
+    // Header action buttons + settings slide-over.
     this.btnStartStopEl = null;
+    this.btnPttEl = null;
+    this.btnCycleEl = null;
+    this.btnSettingsToggleEl = null;
+    this.settingsPanelEl = null;
+    this.settingsBackdropEl = null;
     this.btnPauseEl = null;
     this.btnHushEl = null;
     this.btnClearEl = null;
@@ -3281,7 +3294,9 @@ class PipController {
     // fire onPrefsChange so the main page can save into prefs.
     this._displayMode = 'both';
     this._fontStep = 1;
-    this._activeTab = 'transcript';
+    this._settingsOpen = false;
+    this._sessionCount = 1;
+    this._pttHeld = false;
 
     // Mirror of upstream state — used both to seed _setup on (re)open and to
     // update the visible DOM whenever the main page calls a setter.
@@ -3307,13 +3322,14 @@ class PipController {
     if (this.isOpen()) { try { this.win.focus(); } catch (_) {} return; }
     if (PipController.isDocPipSupported()) {
       this.win = await window.documentPictureInPicture.requestWindow({
-        // Slightly taller default so the new tabs + settings pane don't push
-        // the transcript out of view on first paint. Width unchanged.
-        width: 460, height: 360,
+        // Compact default; the new single-row header lets us reclaim the
+        // ~44 px the old tab bar used. User can resize, container queries
+        // collapse buttons as it shrinks.
+        width: 380, height: 280,
       });
     } else {
       this.win = window.open('', 'live-translator-pip',
-        'width=460,height=360,resizable=yes,scrollbars=yes,noopener=no');
+        'width=380,height=280,resizable=yes,scrollbars=yes,noopener=no');
       if (!this.win) throw new Error('Popup blocked. Allow popups for this site.');
     }
     this._setup();
@@ -3325,6 +3341,9 @@ class PipController {
     const doc = this.win.document;
     this.doc = doc;
     doc.documentElement.lang = 'en';
+    // Container queries (below) need a known container. Body is the natural
+    // root and `inline-size` lets buttons hide based on PIP width without JS.
+    doc.documentElement.style.height = '100%';
     // Pull the palette from the main document's CSS variables so the PiP
     // window can never drift from the app theme. Falls back to literal
     // hex values when a custom property is missing (host page didn't ship
@@ -3353,57 +3372,106 @@ class PipController {
         background: ${palette.bg0}; color: ${palette.fg0};
         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
         display: flex; flex-direction: column; overflow: hidden;
-        /* Scales every font-size in the pane that uses 1em units. setFontStep
-           rewrites this on the fly so the user can shrink the whole PIP body
-           down to fit a 200px sliver on a phone. */
+        /* Container query target — every responsive hide rule below keys off
+           the body's inline-size, so the PIP collapses gracefully as the user
+           drags it down to a tiny sliver. */
+        container: pip / inline-size;
         --pip-scale: 1;
         transition: background-color 0.25s ease, color 0.25s ease;
       }
+
+      /* ─── Header (single compact action row) ─── */
       header {
-        display: flex; align-items: center; gap: 8px;
-        padding: 6px 12px; border-bottom: 1px solid ${palette.line};
+        display: flex; align-items: center; gap: 4px;
+        padding: 4px 6px;
+        border-bottom: 1px solid ${palette.line};
         background: ${palette.bg1}; flex: 0 0 auto;
         font-size: 12px;
+        min-height: 0;
       }
+      /* The pill is the priority element — never hides. Its label collapses
+         to just the dot when space gets very tight. */
       .pip-pill {
-        display: inline-flex; align-items: center; gap: 6px;
-        padding: 3px 9px; border-radius: 999px;
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 3px 8px; border-radius: 999px;
         font-size: 10.5px; font-weight: 600;
         background: ${palette.bg3};
+        flex-shrink: 0;
       }
       .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${palette.fg2}; }
       .pip-dot.live { background: ${palette.accent}; animation: pip-pulse 0.8s infinite; }
       @keyframes pip-pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
-      .pip-brand { font-weight: 600; font-size: 12px; }
 
-      /* ─── Tabs ─── */
-      .pip-tabs {
-        display: flex; flex: 0 0 auto;
-        background: ${palette.bg1};
-        border-bottom: 1px solid ${palette.line};
+      /* Brand sits at the far right, takes leftover space, and is the FIRST
+         thing to disappear when the user shrinks the PIP. */
+      .pip-brand-wrap {
+        flex: 1 1 0; min-width: 0;
+        display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+        color: ${palette.fg2}; font-size: 11px;
+        overflow: hidden;
       }
-      .pip-tab {
-        flex: 1; padding: 8px 6px;
-        background: transparent; border: 0; color: ${palette.fg2};
-        font: inherit; font-size: 11.5px; font-weight: 600;
-        text-transform: uppercase; letter-spacing: 0.05em;
+      .pip-brand-text {
+        font-weight: 600;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .pip-brand-globe { flex-shrink: 0; font-size: 11px; opacity: 0.6; }
+
+      /* Header icon buttons. Square 28px so the whole header stays compact;
+         touch targets still get the 44px effective via padding+focus ring. */
+      .pip-iconbtn {
+        flex-shrink: 0;
+        width: 28px; height: 28px; padding: 0;
+        background: transparent; color: ${palette.fg1};
+        border: 1px solid transparent;
+        border-radius: 6px;
+        font: inherit; font-size: 14px; line-height: 1;
         cursor: pointer;
-        border-bottom: 2px solid transparent;
+        display: inline-flex; align-items: center; justify-content: center;
       }
-      .pip-tab[aria-selected="true"] {
-        color: ${palette.fg0};
-        border-bottom-color: ${palette.accent};
+      .pip-iconbtn:hover:not(:disabled) { background: ${palette.bg3}; color: ${palette.fg0}; }
+      .pip-iconbtn:disabled { opacity: 0.35; cursor: not-allowed; }
+      .pip-iconbtn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -1px; }
+      /* Start/Stop tint — green when stopped (ready to start), red when running. */
+      .pip-iconbtn.pip-startstop[data-running="false"] { color: ${palette.good}; }
+      .pip-iconbtn.pip-startstop[data-running="true"]  { color: ${palette.bad}; }
+      .pip-iconbtn.pip-ptt[data-held="true"] {
+        background: ${palette.accent}; color: #0b0d12;
       }
-      .pip-tab:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -3px; }
+      .pip-iconbtn.pip-settings-toggle[data-open="true"] {
+        background: ${palette.bg3}; color: ${palette.accent};
+      }
+      .pip-iconbtn.is-hidden { display: none; }
 
-      /* ─── Panes ─── */
-      .pip-pane { display: none; flex: 1; min-height: 0; overflow: hidden; }
-      .pip-pane.is-active { display: flex; flex-direction: column; }
+      /* ─── Container-query responsive hiding ─────────────────────────
+         Priority of disappearance as the PIP gets narrower:
+           > 360px   everything visible
+           ≤ 360px   brand text drops, only globe stays
+           ≤ 310px   brand wrap fully drops
+           ≤ 270px   pill label drops (pill becomes just the dot)
+           ≤ 240px   PTT button drops
+           ≤ 210px   cycle button drops
+         Settings cog + Start/Stop always remain — they're the essentials. */
+      @container pip (max-width: 360px) {
+        .pip-brand-text { display: none; }
+      }
+      @container pip (max-width: 310px) {
+        .pip-brand-wrap { display: none; }
+      }
+      @container pip (max-width: 270px) {
+        .pip-pill-label { display: none; }
+        .pip-pill { padding: 5px 6px; }
+      }
+      @container pip (max-width: 240px) {
+        .pip-iconbtn.pip-ptt { display: none; }
+      }
+      @container pip (max-width: 210px) {
+        .pip-iconbtn.pip-cycle { display: none; }
+      }
 
-      /* Transcript pane */
-      .pip-transcript {
-        padding: 14px 16px; overflow-y: auto;
-        display: flex; flex-direction: column; gap: 12px;
+      /* ─── Transcript ─── */
+      main.pip-transcript {
+        padding: 12px 14px; overflow-y: auto;
+        display: flex; flex-direction: column; gap: 10px;
         flex: 1; min-height: 0;
       }
       .pip-row { transition: opacity 0.2s ease; }
@@ -3421,64 +3489,97 @@ class PipController {
                     line-height: 1.4; word-wrap: break-word; }
       .pip-empty { color: ${palette.fg2}; font-style: italic; }
 
-      /* Settings pane */
-      .pip-settings {
-        padding: 12px 14px; overflow-y: auto;
+      /* ─── Settings slide-over panel ─────────────────────────────────
+         Sits on top of the transcript, slides in from the right. Backdrop
+         is interactive (closes the panel on click) but very subtle so the
+         underlying transcript stays readable. */
+      .pip-settings-backdrop {
+        position: absolute; inset: 0;
+        background: rgba(0, 0, 0, 0.35);
+        opacity: 0; pointer-events: none;
+        transition: opacity 0.18s ease;
+        z-index: 5;
+      }
+      .pip-settings-backdrop.is-open { opacity: 1; pointer-events: auto; }
+      .pip-settings-panel {
+        position: absolute; top: 0; right: 0; bottom: 0;
+        width: min(280px, 92vw);
+        background: ${palette.bg1};
+        border-left: 1px solid ${palette.line};
+        transform: translateX(100%);
+        transition: transform 0.22s ease-out;
+        z-index: 6;
+        display: flex; flex-direction: column;
+        overflow: hidden;
+      }
+      .pip-settings-panel.is-open { transform: translateX(0); }
+      .pip-settings-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 10px 8px 14px;
+        border-bottom: 1px solid ${palette.line};
+        flex: 0 0 auto;
+      }
+      .pip-settings-title {
+        font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase; color: ${palette.fg1};
+      }
+      .pip-settings-body {
+        padding: 12px 14px;
         display: flex; flex-direction: column; gap: 14px;
-        flex: 1; min-height: 0;
+        overflow-y: auto; flex: 1; min-height: 0;
       }
       .pip-field { display: flex; flex-direction: column; gap: 6px; }
       .pip-field-label {
         font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
         text-transform: uppercase; color: ${palette.fg2};
       }
-      .pip-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .pip-row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
       .pip-btn {
         background: ${palette.bg3}; color: ${palette.fg0};
-        border: 1px solid ${palette.line}; border-radius: 8px;
-        padding: 8px 12px; font: inherit; font-size: 12.5px; font-weight: 600;
-        cursor: pointer; min-height: 36px;
+        border: 1px solid ${palette.line}; border-radius: 7px;
+        padding: 7px 10px; font: inherit; font-size: 12px; font-weight: 600;
+        cursor: pointer; min-height: 34px;
         display: inline-flex; align-items: center; justify-content: center; gap: 6px;
       }
       .pip-btn:hover:not(:disabled) { background: ${palette.bg2}; }
       .pip-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-      .pip-btn.primary  { background: ${palette.accent}; color: #0b0d12; border-color: transparent; }
-      .pip-btn.warn     { background: ${palette.warn};   color: #0b0d12; border-color: transparent; }
-      .pip-btn.danger   { background: ${palette.bad};    color: #fff;    border-color: transparent; }
+      .pip-btn.warn   { background: ${palette.warn}; color: #0b0d12; border-color: transparent; }
+      .pip-btn.danger { background: ${palette.bad};  color: #fff;    border-color: transparent; }
       .pip-btn.flex { flex: 1 1 0; }
       .pip-btn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: 2px; }
 
-      /* Segmented (display mode + font size) */
       .pip-seg {
         display: flex; gap: 0;
         background: ${palette.bg3}; border: 1px solid ${palette.line};
-        border-radius: 8px; padding: 2px; overflow: hidden;
+        border-radius: 7px; padding: 2px; overflow: hidden;
       }
       .pip-seg-opt {
         flex: 1; background: transparent; color: ${palette.fg1};
-        border: 0; border-radius: 6px; padding: 7px 8px;
-        font: inherit; font-size: 12px; font-weight: 600;
-        cursor: pointer; min-height: 32px;
+        border: 0; border-radius: 5px; padding: 6px 6px;
+        font: inherit; font-size: 11.5px; font-weight: 600;
+        cursor: pointer; min-height: 28px;
       }
-      .pip-seg-opt.is-active {
-        background: ${palette.accent}; color: #0b0d12;
-      }
+      .pip-seg-opt.is-active { background: ${palette.accent}; color: #0b0d12; }
       .pip-seg-opt:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -1px; }
-      .pip-font-row {
-        display: flex; align-items: center; gap: 8px;
-      }
-      .pip-font-row .pip-btn { padding: 7px 12px; min-width: 44px; }
+      .pip-font-row { display: flex; align-items: center; gap: 6px; }
+      .pip-font-row .pip-btn { padding: 6px 10px; min-width: 40px; }
       .pip-font-label {
         flex: 1; text-align: center; font-size: 11px;
         color: ${palette.fg2}; text-transform: uppercase; letter-spacing: 0.06em;
       }
 
+      /* The transcript area needs to be the positioning context for the
+         absolutely-positioned settings panel + backdrop so the slide-over
+         covers only the body, not the header. */
+      .pip-body-wrap {
+        position: relative;
+        flex: 1; min-height: 0; display: flex; flex-direction: column;
+      }
+
       /* State-driven background tints. Applied to body via setEffectiveStatus.
          Each state pulls toward the corresponding semantic colour at low
-         opacity so the PIP visibly shifts (calm blue while listening, lit-up
-         while speaking, amber on reconnect, red on error) without becoming
-         hard to read. The tab-strip + header keep their darker chrome so the
-         tints don't fight with text contrast. */
+         opacity so the PIP visibly shifts (calm green while listening,
+         lit-up while speaking, amber on reconnect, red on error). */
       body.pip-state-idle         { background: ${palette.bg0}; }
       body.pip-state-connecting   { background: color-mix(in srgb, ${palette.warn}   12%, ${palette.bg0}); }
       body.pip-state-connected    { background: color-mix(in srgb, ${palette.good}   10%, ${palette.bg0}); }
@@ -3490,23 +3591,37 @@ class PipController {
       body.pip-state-error        { background: color-mix(in srgb, ${palette.bad}    18%, ${palette.bg0}); }
     `;
     doc.head.appendChild(style);
+
+    // DOM layout. Header order = priority left to right (pill = highest, then
+    // start/stop, PTT, cycle, settings cog). Brand wrap at the far right
+    // claims leftover space and is the first thing the container query hides.
     doc.body.innerHTML = `
       <header>
-        <span aria-hidden="true">🌐</span>
-        <span class="pip-brand">Translator</span>
-        <span style="flex:1"></span>
-        <span class="pip-pill"><span class="pip-dot" id="pipdot"></span><span id="pipstatus">Idle</span></span>
+        <span class="pip-pill" title="Session status">
+          <span class="pip-dot" id="pipdot"></span>
+          <span class="pip-pill-label" id="pipstatus">Idle</span>
+        </span>
+        <button class="pip-iconbtn pip-startstop" id="pipBtnStartStop"
+                type="button" data-running="false"
+                title="Start" aria-label="Start">▶</button>
+        <button class="pip-iconbtn pip-ptt" id="pipBtnPtt"
+                type="button" data-held="false"
+                title="Push to talk (placeholder)" aria-label="Push to talk">🎙</button>
+        <button class="pip-iconbtn pip-cycle is-hidden" id="pipBtnCycle"
+                type="button"
+                title="Switch session" aria-label="Switch session">⇆</button>
+        <button class="pip-iconbtn pip-settings-toggle" id="pipBtnSettingsToggle"
+                type="button" data-open="false"
+                title="Settings" aria-label="Settings"
+                aria-expanded="false" aria-controls="pipSettingsPanel">⚙</button>
+        <span class="pip-brand-wrap">
+          <span class="pip-brand-globe" aria-hidden="true">🌐</span>
+          <span class="pip-brand-text">Translator</span>
+        </span>
       </header>
-      <div class="pip-tabs" role="tablist" aria-label="Pop-out tabs">
-        <button class="pip-tab" id="pipTabTranscript" role="tab" aria-selected="true"
-                aria-controls="pipPaneTranscript" type="button">Transcript</button>
-        <button class="pip-tab" id="pipTabSettings" role="tab" aria-selected="false"
-                aria-controls="pipPaneSettings" type="button">Settings</button>
-      </div>
 
-      <section class="pip-pane is-active" id="pipPaneTranscript"
-               role="tabpanel" aria-labelledby="pipTabTranscript">
-        <div class="pip-transcript">
+      <div class="pip-body-wrap">
+        <main class="pip-transcript">
           <div class="pip-row" id="pipInputRow">
             <div class="pip-label pip-input-lab" id="pipinlab">You</div>
             <div class="pip-input pip-empty" id="pipin">—</div>
@@ -3515,43 +3630,50 @@ class PipController {
             <div class="pip-label pip-output-lab" id="pipoutlab">Translation</div>
             <div class="pip-output pip-empty" id="pipout">—</div>
           </div>
-        </div>
-      </section>
+        </main>
 
-      <section class="pip-pane" id="pipPaneSettings"
-               role="tabpanel" aria-labelledby="pipTabSettings" hidden>
-        <div class="pip-settings">
-          <div class="pip-field">
-            <div class="pip-field-label">Session</div>
-            <div class="pip-row-actions">
-              <button class="pip-btn primary flex" id="pipBtnStartStop" type="button">Start</button>
-              <button class="pip-btn flex" id="pipBtnPause" type="button" disabled>Pause mic</button>
+        <div class="pip-settings-backdrop" id="pipSettingsBackdrop" aria-hidden="true"></div>
+        <aside class="pip-settings-panel" id="pipSettingsPanel"
+               role="dialog" aria-modal="false" aria-labelledby="pipSettingsTitle" tabindex="-1">
+          <div class="pip-settings-head">
+            <span class="pip-settings-title" id="pipSettingsTitle">Settings</span>
+            <button class="pip-iconbtn" id="pipBtnSettingsClose"
+                    type="button" title="Close settings" aria-label="Close settings">×</button>
+          </div>
+          <div class="pip-settings-body">
+            <div class="pip-field">
+              <div class="pip-field-label">Mic</div>
+              <div class="pip-row-actions">
+                <button class="pip-btn flex" id="pipBtnPause" type="button" disabled>Pause</button>
+                <button class="pip-btn warn flex" id="pipBtnHush" type="button" disabled>Silence</button>
+              </div>
             </div>
-            <div class="pip-row-actions">
-              <button class="pip-btn warn flex" id="pipBtnHush" type="button" disabled>Silence</button>
+
+            <div class="pip-field">
+              <div class="pip-field-label">Show</div>
+              <div class="pip-seg" id="pipDisplaySeg" role="radiogroup" aria-label="Show">
+                <button class="pip-seg-opt" data-mode="both"   role="radio" aria-checked="true"  type="button">Both</button>
+                <button class="pip-seg-opt" data-mode="input"  role="radio" aria-checked="false" type="button">Source</button>
+                <button class="pip-seg-opt" data-mode="output" role="radio" aria-checked="false" type="button">Target</button>
+              </div>
+            </div>
+
+            <div class="pip-field">
+              <div class="pip-field-label">Text size</div>
+              <div class="pip-font-row">
+                <button class="pip-btn" id="pipFontDec" type="button" aria-label="Smaller text">A−</button>
+                <span class="pip-font-label" id="pipFontLabel">sm</span>
+                <button class="pip-btn" id="pipFontInc" type="button" aria-label="Larger text">A+</button>
+              </div>
+            </div>
+
+            <div class="pip-field">
+              <div class="pip-field-label">Transcript</div>
               <button class="pip-btn flex" id="pipBtnClear" type="button">Clear</button>
             </div>
           </div>
-
-          <div class="pip-field">
-            <div class="pip-field-label">Show</div>
-            <div class="pip-seg" id="pipDisplaySeg" role="radiogroup" aria-label="Show">
-              <button class="pip-seg-opt" data-mode="both"   role="radio" aria-checked="true"  type="button">Both</button>
-              <button class="pip-seg-opt" data-mode="input"  role="radio" aria-checked="false" type="button">Source</button>
-              <button class="pip-seg-opt" data-mode="output" role="radio" aria-checked="false" type="button">Translation</button>
-            </div>
-          </div>
-
-          <div class="pip-field">
-            <div class="pip-field-label">Text size</div>
-            <div class="pip-font-row">
-              <button class="pip-btn" id="pipFontDec" type="button" aria-label="Smaller text">A−</button>
-              <span class="pip-font-label" id="pipFontLabel">sm</span>
-              <button class="pip-btn" id="pipFontInc" type="button" aria-label="Larger text">A+</button>
-            </div>
-          </div>
-        </div>
-      </section>
+        </aside>
+      </div>
     `;
 
     this.statusEl = doc.getElementById('pipstatus');
@@ -3563,12 +3685,13 @@ class PipController {
     this.inputRowEl = doc.getElementById('pipInputRow');
     this.outputRowEl = doc.getElementById('pipOutputRow');
 
-    this.transcriptPaneEl = doc.getElementById('pipPaneTranscript');
-    this.settingsPaneEl = doc.getElementById('pipPaneSettings');
-    this.btnTabTranscriptEl = doc.getElementById('pipTabTranscript');
-    this.btnTabSettingsEl = doc.getElementById('pipTabSettings');
-
     this.btnStartStopEl = doc.getElementById('pipBtnStartStop');
+    this.btnPttEl = doc.getElementById('pipBtnPtt');
+    this.btnCycleEl = doc.getElementById('pipBtnCycle');
+    this.btnSettingsToggleEl = doc.getElementById('pipBtnSettingsToggle');
+    this.settingsPanelEl = doc.getElementById('pipSettingsPanel');
+    this.settingsBackdropEl = doc.getElementById('pipSettingsBackdrop');
+    const btnSettingsCloseEl = doc.getElementById('pipBtnSettingsClose');
     this.btnPauseEl = doc.getElementById('pipBtnPause');
     this.btnHushEl = doc.getElementById('pipBtnHush');
     this.btnClearEl = doc.getElementById('pipBtnClear');
@@ -3577,22 +3700,49 @@ class PipController {
     this.fontIncEl = doc.getElementById('pipFontInc');
     this.fontLabelEl = doc.getElementById('pipFontLabel');
 
-    // Tabs.
-    this.btnTabTranscriptEl.addEventListener('click', () => this.setActiveTab('transcript'));
-    this.btnTabSettingsEl.addEventListener('click', () => this.setActiveTab('settings'));
-
-    // Session actions — pure forwarders into the main page. The PIP doesn't
-    // know about activeSession() or the session lifecycle; the main page's
-    // existing startPipeline/stopPipeline/togglePause/hush handle that.
+    // ─── Header actions ────────────────────────────────────────────────
     this.btnStartStopEl.addEventListener('click', () => {
       if (this._currentRunning) this.onStop();
       else this.onStart();
     });
+
+    // PTT: press-and-hold. Both pointer + keyboard (Space/Enter) trigger the
+    // same down/up pair. Placeholder for now — main page can wire onPttDown/Up
+    // to the active session's activityStart/activityEnd later.
+    const pttDown = () => {
+      if (this._pttHeld) return;
+      this._pttHeld = true;
+      this.btnPttEl.dataset.held = 'true';
+      this.onPttDown();
+    };
+    const pttUp = () => {
+      if (!this._pttHeld) return;
+      this._pttHeld = false;
+      this.btnPttEl.dataset.held = 'false';
+      this.onPttUp();
+    };
+    this.btnPttEl.addEventListener('pointerdown', (ev) => { ev.preventDefault(); pttDown(); });
+    this.btnPttEl.addEventListener('pointerup', pttUp);
+    this.btnPttEl.addEventListener('pointerleave', pttUp);
+    this.btnPttEl.addEventListener('pointercancel', pttUp);
+    this.btnPttEl.addEventListener('keydown', (ev) => {
+      if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); pttDown(); }
+    });
+    this.btnPttEl.addEventListener('keyup', (ev) => {
+      if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); pttUp(); }
+    });
+    this.btnPttEl.addEventListener('blur', pttUp);  // safety: window loses focus mid-hold
+
+    this.btnCycleEl.addEventListener('click', () => this.onCycleSession());
+    this.btnSettingsToggleEl.addEventListener('click', () => this.toggleSettingsPanel());
+    btnSettingsCloseEl.addEventListener('click', () => this.closeSettingsPanel());
+    this.settingsBackdropEl.addEventListener('click', () => this.closeSettingsPanel());
+
+    // ─── Settings-panel actions ────────────────────────────────────────
     this.btnPauseEl.addEventListener('click', () => this.onPause());
     this.btnHushEl.addEventListener('click', () => this.onHush());
     this.btnClearEl.addEventListener('click', () => this.onClear());
 
-    // Display-mode segmented.
     this.displaySegEl.addEventListener('click', (ev) => {
       const btn = ev.target.closest('.pip-seg-opt');
       if (!btn) return;
@@ -3601,9 +3751,16 @@ class PipController {
       this.setDisplayMode(mode, /* persist */ true);
     });
 
-    // Font size — clamp to [0, PIP_FONT_STEPS.length - 1].
     this.fontDecEl.addEventListener('click', () => this.setFontStep(this._fontStep - 1, true));
     this.fontIncEl.addEventListener('click', () => this.setFontStep(this._fontStep + 1, true));
+
+    // ESC closes the settings panel if it's open.
+    doc.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && this._settingsOpen) {
+        ev.preventDefault();
+        this.closeSettingsPanel();
+      }
+    });
 
     // Replay current state into the freshly-built DOM.
     this.setStatus(this._currentStatus, this._currentLive);
@@ -3614,23 +3771,39 @@ class PipController {
     this.setOutput(this._currentOutput);
     this.setDisplayMode(this._displayMode, /* persist */ false);
     this.setFontStep(this._fontStep, /* persist */ false);
-    this.setActiveTab(this._activeTab);
+    this.setSessionCount(this._sessionCount);
   }
 
-  setActiveTab(tab) {
-    if (tab !== 'transcript' && tab !== 'settings') tab = 'transcript';
-    this._activeTab = tab;
-    if (!this.btnTabTranscriptEl) return;
-    const onTranscript = tab === 'transcript';
-    this.btnTabTranscriptEl.setAttribute('aria-selected', onTranscript ? 'true' : 'false');
-    this.btnTabSettingsEl.setAttribute('aria-selected', onTranscript ? 'false' : 'true');
-    if (this.transcriptPaneEl) {
-      this.transcriptPaneEl.classList.toggle('is-active', onTranscript);
-      this.transcriptPaneEl.hidden = !onTranscript;
-    }
-    if (this.settingsPaneEl) {
-      this.settingsPaneEl.classList.toggle('is-active', !onTranscript);
-      this.settingsPaneEl.hidden = onTranscript;
+  // Settings slide-over open/close.
+  openSettingsPanel() {
+    if (!this.settingsPanelEl) return;
+    this._settingsOpen = true;
+    this.settingsPanelEl.classList.add('is-open');
+    this.settingsBackdropEl.classList.add('is-open');
+    this.btnSettingsToggleEl.dataset.open = 'true';
+    this.btnSettingsToggleEl.setAttribute('aria-expanded', 'true');
+    try { this.settingsPanelEl.focus({ preventScroll: true }); } catch (_) {}
+  }
+  closeSettingsPanel() {
+    if (!this.settingsPanelEl) return;
+    this._settingsOpen = false;
+    this.settingsPanelEl.classList.remove('is-open');
+    this.settingsBackdropEl.classList.remove('is-open');
+    this.btnSettingsToggleEl.dataset.open = 'false';
+    this.btnSettingsToggleEl.setAttribute('aria-expanded', 'false');
+    try { this.btnSettingsToggleEl.focus({ preventScroll: true }); } catch (_) {}
+  }
+  toggleSettingsPanel() {
+    if (this._settingsOpen) this.closeSettingsPanel();
+    else this.openSettingsPanel();
+  }
+
+  // Shown only when more than one session exists in the main page. Called
+  // from refreshAddSessionButton / closeSession / restoreSessionsFromStorage.
+  setSessionCount(n) {
+    this._sessionCount = n | 0;
+    if (this.btnCycleEl) {
+      this.btnCycleEl.classList.toggle('is-hidden', this._sessionCount <= 1);
     }
   }
 
@@ -3681,28 +3854,31 @@ class PipController {
     body.classList.add('pip-state-' + this._currentEffStatus);
   }
 
-  // Updates the Start/Stop and Pause/Hush controls. Passed running + paused
-  // separately so the PIP doesn't need to interpret status strings.
+  // Drives the Start/Stop icon button in the header plus the Pause/Hush
+  // buttons in the slide-over settings panel. Running + paused passed in
+  // explicitly so the PIP doesn't need to interpret session status strings.
   setRunning(running, paused, isAudio) {
     this._currentRunning = !!running;
     this._currentPaused = !!paused;
     this._currentIsAudio = isAudio === undefined ? true : !!isAudio;
-    if (!this.btnStartStopEl) return;
-    if (this._currentRunning) {
-      this.btnStartStopEl.textContent = 'Stop';
-      this.btnStartStopEl.classList.remove('primary');
-      this.btnStartStopEl.classList.add('danger');
-    } else {
-      this.btnStartStopEl.textContent = 'Start';
-      this.btnStartStopEl.classList.add('primary');
-      this.btnStartStopEl.classList.remove('danger');
+    if (this.btnStartStopEl) {
+      this.btnStartStopEl.dataset.running = this._currentRunning ? 'true' : 'false';
+      this.btnStartStopEl.textContent = this._currentRunning ? '■' : '▶';
+      this.btnStartStopEl.title = this._currentRunning ? 'Stop' : 'Start';
+      this.btnStartStopEl.setAttribute('aria-label', this._currentRunning ? 'Stop' : 'Start');
     }
     if (this.btnPauseEl) {
       this.btnPauseEl.disabled = !this._currentRunning;
-      this.btnPauseEl.textContent = this._currentPaused ? 'Resume mic' : 'Pause mic';
+      this.btnPauseEl.textContent = this._currentPaused ? 'Resume' : 'Pause';
     }
     if (this.btnHushEl) {
       this.btnHushEl.disabled = !this._currentRunning || !this._currentIsAudio;
+    }
+    // If a session stops while PTT is held, release it so the visual state
+    // doesn't lie about what's happening.
+    if (!this._currentRunning && this._pttHeld && this.btnPttEl) {
+      this._pttHeld = false;
+      this.btnPttEl.dataset.held = 'false';
     }
   }
 
@@ -3750,11 +3926,16 @@ class PipController {
     this.inputEl = this.outputEl = null;
     this.inputLabelEl = this.outputLabelEl = null;
     this.inputRowEl = this.outputRowEl = null;
-    this.transcriptPaneEl = this.settingsPaneEl = null;
-    this.btnTabTranscriptEl = this.btnTabSettingsEl = null;
-    this.btnStartStopEl = this.btnPauseEl = this.btnHushEl = this.btnClearEl = null;
+    this.btnStartStopEl = null;
+    this.btnPttEl = null;
+    this.btnCycleEl = null;
+    this.btnSettingsToggleEl = null;
+    this.settingsPanelEl = this.settingsBackdropEl = null;
+    this.btnPauseEl = this.btnHushEl = this.btnClearEl = null;
     this.displaySegEl = null;
     this.fontDecEl = this.fontIncEl = this.fontLabelEl = null;
+    this._settingsOpen = false;
+    this._pttHeld = false;
     this.onClose();
   }
 
@@ -3778,6 +3959,38 @@ async function togglePip() {
       if (session) state.ttsCoordinator.hush(session);
     },
     onClear: () => clearConversation(),
+    // Cycle to the next session in iteration order. Wraps from the end back
+    // to the beginning. Hidden when there's <= 1 session (PipController
+    // class+visibility is driven by setSessionCount).
+    onCycleSession: () => {
+      const ids = [...state.sessions.keys()];
+      if (ids.length <= 1) return;
+      const here = ids.indexOf(state.activeSessionId);
+      const next = ids[(here + 1) % ids.length];
+      setActiveSession(next);
+    },
+    // PTT button is a placeholder. We forward press/release into the active
+    // session's GeminiLive client as activityStart/activityEnd so it does the
+    // right thing for sessions started with manualActivity:true (PTT mode).
+    // For auto-VAD sessions these are harmless no-ops on the server side.
+    // Real PTT lifecycle (gating the mic feed) still lives in the companion
+    // hotkey path — this button is intentionally lower-fidelity.
+    onPttDown: () => {
+      const session = activeSession();
+      if (session && session.client) {
+        session.pttHeld = true;
+        try { session.client.sendActivityStart(); } catch (_) {}
+        refreshSessionDisplay(session);
+      }
+    },
+    onPttUp: () => {
+      const session = activeSession();
+      if (session && session.client) {
+        session.pttHeld = false;
+        try { session.client.sendActivityEnd(); } catch (_) {}
+        refreshSessionDisplay(session);
+      }
+    },
     onPrefsChange: (prefs) => {
       // Mirror PIP-side prefs (display mode + font size) into global prefs so
       // they stick across pop-out sessions and page reloads. The PIP class
@@ -3812,7 +4025,16 @@ async function togglePip() {
     pip.setRunning(false, false, true);
     pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
   }
+  // Seed the cycle-button visibility now that the PIP exists. Subsequent
+  // session add/close/restore paths re-call this via refreshPipSessionCount.
+  refreshPipSessionCount();
   log('info', PipController.isDocPipSupported() ? 'Pop-out window opened.' : 'Pop-out (popup fallback) opened.');
+}
+
+// Push the current session count into the PIP so it can hide/show the cycle
+// button. Cheap no-op when the PIP isn't open.
+function refreshPipSessionCount() {
+  if (state.pip) state.pip.setSessionCount(state.sessions.size);
 }
 
 // ─── Wire UI ─────────────────────────────────────────────────────────────────
