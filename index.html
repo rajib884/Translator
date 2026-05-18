@@ -251,10 +251,16 @@
           <div class="field">
             <label id="audio-output-label">Audio output</label>
             <div id="audio-output" class="device-list" role="group" aria-labelledby="audio-output-label">
-              <label class="device-option">
-                <input type="checkbox" value="" />
-                <span>System default</span>
-              </label>
+              <!-- Placeholder row used until refreshAudioOutputDevices() rebuilds
+                   the list. Mirrors the structure buildDeviceOption() emits so
+                   the device-id query selectors and "live" indicator find a
+                   well-formed System-default row even on the very first paint. -->
+              <div class="device-option" data-device-id="">
+                <label class="device-tts-label">
+                  <input type="checkbox" class="dev-tts" value="" checked />
+                  <span class="device-name">System default</span>
+                </label>
+              </div>
             </div>
             <p class="hint" id="audio-output-hint">Tick one or more speakers; translated speech plays on every checked device. Device names may appear after microphone permission.</p>
           </div>

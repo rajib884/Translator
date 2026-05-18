@@ -775,13 +775,32 @@ class MicPassthrough {
     this.running = false;
   }
 
-  // Restarts with new settings. Cheap no-op when deviceIds is empty.
+  // Restarts with new settings. Cheap no-op when deviceIds is empty OR when
+  // the call would re-create the exact same mic+sinks already running (e.g.
+  // app.js calls applyPassthrough() after every output-list refresh — without
+  // this short-circuit each refresh briefly silences the passthrough sink).
   async update(micDeviceId, deviceIds) {
     if (!deviceIds || deviceIds.length === 0) {
       if (this.running) await this.stop();
       return;
     }
+    if (this.running && this._matchesActive(micDeviceId, deviceIds)) return;
     await this.start(micDeviceId, deviceIds);
+  }
+
+  _matchesActive(micDeviceId, deviceIds) {
+    const currentMic = this.getActiveMicId();
+    const wantMic = micDeviceId || '';
+    // Treat null/undefined currentMic (no live track) as a mismatch — the
+    // caller wants something running and we don't have anything.
+    if (currentMic == null || currentMic !== wantMic) return false;
+    const currentSinks = this.getActiveSinkIds();
+    if (currentSinks.length !== deviceIds.length) return false;
+    const have = new Set(currentSinks);
+    for (const id of deviceIds) {
+      if (!have.has(id || '')) return false;
+    }
+    return true;
   }
 
   getActiveMicId() {
@@ -817,10 +836,33 @@ class InputPreview {
     this._rafId = 0;
     this._stopTimer = 0;
     this.running = false;
+    // Serialises start/stop against rapid dropdown changes. Without this, two
+    // concurrent start() calls can interleave: stream A from call 1 is still
+    // resolving when call 2 starts; call 2 overwrites this.stream/ctx/src
+    // before call 1 finishes, leaving stream A's MediaStream and AudioContext
+    // unreleased (OS mic indicator stays on, contexts leak). Same pattern
+    // TTSPlayer uses for _applyDevicesQueue.
+    this._queue = Promise.resolve();
   }
 
-  async start(micDeviceId) {
-    await this.stop();
+  start(micDeviceId) {
+    const next = this._queue
+      .catch(() => {})                     // a previous failure must not poison the chain
+      .then(() => this._doStart(micDeviceId));
+    this._queue = next;
+    return next;
+  }
+
+  stop() {
+    const next = this._queue
+      .catch(() => {})
+      .then(() => this._doStop());
+    this._queue = next;
+    return next;
+  }
+
+  async _doStart(micDeviceId) {
+    await this._doStop();
     const baseAudio = {
       echoCancellation: true,
       noiseSuppression: true,
@@ -868,6 +910,8 @@ class InputPreview {
     };
     this._rafId = requestAnimationFrame(tick);
 
+    // Auto-stop posts back onto the same queue so it can't interleave with an
+    // in-flight start() the user kicked off in the same window.
     this._stopTimer = setTimeout(() => {
       this._stopTimer = 0;
       const wasRunning = this.running;
@@ -877,7 +921,7 @@ class InputPreview {
     }, this.autoStopMs);
   }
 
-  async stop() {
+  async _doStop() {
     const wasRunning = this.running;
     this.running = false;
     if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = 0; }

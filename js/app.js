@@ -620,6 +620,11 @@ const state = {
   // Lazily allocated InputPreview for the settings panel's mic visualizer.
   // Stays null until the user clicks the preview button.
   inputPreview: null,
+  // Saved sessions that were over MAX_SESSIONS at restore time. Not loaded
+  // into memory or rendered, but threaded through every saveSessions() write
+  // so they're preserved verbatim — if MAX_SESSIONS is bumped up in a future
+  // build (or the user deletes a visible session), the old ones can return.
+  archivedSessions: [],
 
   // 'simple' hides the tab strip and advanced settings sections; 'advanced'
   // shows everything. Sessions and configs are unaffected — flipping back to
@@ -1242,6 +1247,10 @@ async function closeSession(session) {
   if (session.tabEl) session.tabEl.remove();
   if (session.transcriptEl) session.transcriptEl.remove();
   state.sessions.delete(session.id);
+  // Closing a session opens a visible slot — surface the next archived
+  // session if there is one. They're FIFO: the first archived entry is the
+  // oldest excess from restore time.
+  maybePromoteArchivedSession();
   refreshAddSessionButton();
   refreshBulkActionButtons();
 
@@ -1268,6 +1277,25 @@ async function closeSession(session) {
   } else {
     saveSessions();
   }
+}
+
+// If there's room and at least one archived session waiting, promote the
+// oldest archived entry back into the visible set. Mirrors the restore path
+// but for a single entry, fired after closeSession frees a slot.
+function maybePromoteArchivedSession() {
+  if (!state.archivedSessions || state.archivedSessions.length === 0) return;
+  if (state.sessions.size >= MAX_SESSIONS) return;
+  const entry = state.archivedSessions.shift();
+  const fallback = readConfigFromUI();
+  const cfg = Object.assign({}, fallback, entry.config || {});
+  cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+  cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
+  delete cfg.outputDeviceId;
+  const session = new Session({ id: entry.id || newSessionId(), config: cfg });
+  session.resumeHandle = entry.resumeHandle || null;
+  state.sessions.set(session.id, session);
+  createSessionDOM(session);
+  log('info', `Restored an archived session (${state.archivedSessions.length} remaining).`);
 }
 
 // Disables the "+" affordance and explains why when we're at the per-window
@@ -1321,11 +1349,15 @@ async function stopAllSessions() {
 // ─── Persistence (sessions) ──────────────────────────────────────────────────
 function saveSessions() {
   try {
-    const arr = [...state.sessions.values()].map((s) => ({
+    const visible = [...state.sessions.values()].map((s) => ({
       id: s.id,
       config: s.config,
       resumeHandle: s.resumeHandle || null,
     }));
+    // Append archivedSessions (extras we hid at restore time) so they're
+    // preserved across writes. They never become active sessions in this
+    // process — they just round-trip through storage.
+    const arr = visible.concat(state.archivedSessions || []);
     localStorage.setItem(SESSIONS_KEY, JSON.stringify({
       sessions: arr,
       activeId: state.activeSessionId,
@@ -1352,11 +1384,16 @@ function restoreSessionsFromStorage() {
   // Use the current UI snapshot as a fallback for any missing config fields,
   // then overlay the saved per-session config.
   const fallback = readConfigFromUI();
-  // If an older build saved more than MAX_SESSIONS, keep only the first N —
-  // the rest are lost on first load but no longer count against the cap.
+  // If an older build saved more than MAX_SESSIONS, keep only the first N
+  // visible. The rest are stashed in state.archivedSessions so saveSessions()
+  // can write them back verbatim — they're not destroyed, just hidden until
+  // MAX_SESSIONS goes up or a visible slot frees up.
   const entries = data.sessions.slice(0, MAX_SESSIONS);
-  if (data.sessions.length > MAX_SESSIONS) {
-    log('warn', `Found ${data.sessions.length} saved sessions; only the first ${MAX_SESSIONS} were restored.`);
+  state.archivedSessions = data.sessions.slice(MAX_SESSIONS);
+  if (state.archivedSessions.length > 0) {
+    log('warn',
+      `Found ${data.sessions.length} saved sessions; showing the first ${MAX_SESSIONS}. ` +
+      `${state.archivedSessions.length} kept in storage and will resurface if a slot frees up.`);
   }
   for (const entry of entries) {
     const cfg = Object.assign({}, fallback, entry.config || {});
@@ -1538,6 +1575,7 @@ function updateAudioSourceAvailability() {
 }
 
 async function detectCompanionService({ silent = true } = {}) {
+  const wasAvailable = state.companionAvailable;
   try {
     const res = await fetchWithTimeout(`${COMPANION_HTTP_URL}/status`, {
       mode: 'cors',
@@ -1550,6 +1588,30 @@ async function detectCompanionService({ silent = true } = {}) {
   } catch (e) {
     state.companionAvailable = false;
     if (!silent) log('warn', 'Companion service unavailable: ' + (e && e.message ? e.message : e));
+  }
+  // Companion dropped while we were depending on it. Every running PTT session
+  // was started with manualActivity:true; the GeminiLiveClient won't pick up
+  // a pttMode change until restart, so it sits there waiting for activityStart
+  // signals that will never arrive (no hotkey = mic effectively muted, but
+  // the chip kept reading "Hold KEY" / "Listening"). Stop those sessions and
+  // surface a clear error so the user knows to restart with auto VAD.
+  if (wasAvailable && !state.companionAvailable) {
+    const stuckPtt = [...state.sessions.values()].filter(
+      (s) => s.running && s.config && s.config.pttMode === 'ptt');
+    if (stuckPtt.length > 0) {
+      log('error',
+        `Companion service disconnected — stopping ${stuckPtt.length} push-to-talk ` +
+        `session${stuckPtt.length === 1 ? '' : 's'} that can no longer receive the hotkey.`);
+      Promise.all(stuckPtt.map((s) => stopSession(s).catch(() => {})));
+    }
+    const stuckCompanionAudio = [...state.sessions.values()].filter(
+      (s) => s.running && (s.currentAudioMode === 'companion'));
+    if (stuckCompanionAudio.length > 0) {
+      log('error',
+        `Companion service disconnected — stopping ${stuckCompanionAudio.length} ` +
+        `companion-audio session${stuckCompanionAudio.length === 1 ? '' : 's'}.`);
+      Promise.all(stuckCompanionAudio.map((s) => stopSession(s).catch(() => {})));
+    }
   }
   updateAudioSourceAvailability();
   updateSpeechModeFields();
@@ -1859,15 +1921,14 @@ function normalizeOutputDeviceIds(arr, legacySingle) {
 
 function inputDeviceLabel(device, index) {
   if (device.label) return device.label;
-  if (device.deviceId === 'default') return 'System default';
-  if (device.deviceId === 'communications') return 'Communications default';
+  // We never render 'default'/'communications' rows (they're filtered out
+  // before this is called) so we only need a fallback for unlabelled real
+  // devices — typically "no permission yet, so labels are empty".
   return `Microphone ${index + 1}`;
 }
 
 function outputDeviceLabel(device, index) {
   if (device.label) return device.label;
-  if (device.deviceId === 'default') return 'System default';
-  if (device.deviceId === 'communications') return 'Communications default';
   return `Speaker ${index + 1}`;
 }
 
@@ -1888,7 +1949,11 @@ async function refreshAudioInputDevices() {
 
     inputs.forEach((device, index) => {
       const id = device.deviceId || '';
-      if (id === 'default') return;
+      // Windows browsers report two pseudo-devices ('default' and
+      // 'communications') alongside the real ones. We already render
+      // "System default" with value '', so listing both confuses users —
+      // skip them and only show concrete devices.
+      if (id === 'default' || id === 'communications') return;
       if (seen.has(id)) return;
       seen.add(id);
       const opt = document.createElement('option');
@@ -1931,13 +1996,17 @@ async function refreshAudioOutputDevices() {
     catch (_) { prefPassthrough = []; }
     if (!Array.isArray(prefPassthrough)) prefPassthrough = [];
 
+    const devices = await navigator.mediaDevices.enumerateDevices();
+
+    // Re-read selection AFTER the enumerate await — a user click that landed
+    // during the async gap must not be clobbered by a snapshot we took before
+    // the await. (Race fix: previously we snapshotted before the await and
+    // any toggle made during enumeration was reverted by the rebuild.)
     const currently = new Set(getSelectedOutputDeviceIds());
     const currentPt = new Set(getPassthroughDeviceIds());
     // Anything currently ticked wins over stale dataset values.
     const wantedTts = new Set([...currently, ...preferred.map((v) => v || '')]);
     const wantedPt  = new Set([...currentPt, ...prefPassthrough.map((v) => v || '')]);
-
-    const devices = await navigator.mediaDevices.enumerateDevices();
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
     const seen = new Set();
     const frag = document.createDocumentFragment();
@@ -1946,7 +2015,10 @@ async function refreshAudioOutputDevices() {
 
     outputs.forEach((device, index) => {
       const id = device.deviceId || '';
-      if (id === 'default') return;
+      // Same reasoning as the input list: skip the pseudo-device aliases the
+      // browser exposes alongside the real ones. The single "System default"
+      // row at value '' is the only default we surface.
+      if (id === 'default' || id === 'communications') return;
       if (seen.has(id)) return;
       seen.add(id);
       frag.appendChild(buildDeviceOption(id, outputDeviceLabel(device, index), wantedTts.has(id), wantedPt.has(id)));
@@ -2218,7 +2290,11 @@ function sendAudioGated(session, buf) {
   // model receives no input to act on.
   const isPtt = session.config && session.config.pttMode === 'ptt';
   const pttMuted = isPtt && !session.pttHeld;
-  if (session.muteInput || pttMuted) {
+  // During a mid-session mic swap, two captures briefly run in parallel (the
+  // new one starts before the old one stops, so the user doesn't hear a gap
+  // in their meter). Treat both feeds as silence for the overlap so the model
+  // doesn't receive doubled audio and Gemini's VAD doesn't get confused.
+  if (session.muteInput || pttMuted || session._swappingCapture) {
     session.client.sendAudio(new ArrayBuffer(buf.byteLength));
   } else {
     session.client.sendAudio(buf);
@@ -2278,6 +2354,11 @@ async function changeAudioInput() {
     return;
   }
 
+  // Gate sendAudioGated → silence while the new capture is starting and the
+  // old one is still feeding chunks. Without this, the model receives an
+  // overlap of both mics for the ~tens of milliseconds between start() and
+  // stop(), occasionally producing a stuck "speaking" turn.
+  session._swappingCapture = true;
   try {
     if (audioMode === 'both') {
       log('info', 'Pick the app/tab audio again to switch microphones.');
@@ -2291,6 +2372,8 @@ async function changeAudioInput() {
   } catch (e) {
     log('error', 'Microphone change failed: ' + (e && e.message ? e.message : e));
     await refreshAudioInputDevices();
+  } finally {
+    session._swappingCapture = false;
   }
   // Passthrough uses the same mic — restart it with the new device.
   applyPassthrough();
@@ -2959,22 +3042,25 @@ function closeSheet(id) {
   if (!el.classList.contains('is-open')) return;
   el.classList.remove('is-open');
 
-  const state = modalState.get(id);
-  if (!state) return;                  // wasn't opened modally (e.g., docked sidebar)
+  // Local `modal` (not `state`) so we don't shadow the module-level `state`
+  // object — a future maintainer adding `state.foo` to this function would
+  // otherwise silently read from the wrong object.
+  const modal = modalState.get(id);
+  if (!modal) return;                  // wasn't opened modally (e.g., docked sidebar)
   modalState.delete(id);
 
-  if (state.content && state.trapHandler) {
-    state.content.removeEventListener('keydown', state.trapHandler);
+  if (modal.content && modal.trapHandler) {
+    modal.content.removeEventListener('keydown', modal.trapHandler);
   }
-  if (state.content && state.restoreRole !== null) {
-    state.content.setAttribute('role', state.restoreRole);
-    state.content.removeAttribute('aria-modal');
+  if (modal.content && modal.restoreRole !== null) {
+    modal.content.setAttribute('role', modal.restoreRole);
+    modal.content.removeAttribute('aria-modal');
   }
   // Restore focus to whoever opened the sheet. If they vanished (e.g., a tab
   // was closed), fall back to body so focus isn't stuck on a detached element.
-  if (state.opener && document.contains(state.opener)) {
-    try { state.opener.focus({ preventScroll: true }); }
-    catch (_) { try { state.opener.focus(); } catch (__) {} }
+  if (modal.opener && document.contains(modal.opener)) {
+    try { modal.opener.focus({ preventScroll: true }); }
+    catch (_) { try { modal.opener.focus(); } catch (__) {} }
   }
 }
 
@@ -3065,8 +3151,19 @@ function exportConversation(format) {
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
+// Snapshot of the textarea contents at last open/save. We compare on close
+// (and at beforeunload) to detect unsaved edits and prompt before discarding.
+let promptEditorBaseline = '';
+
+function isPromptEditorDirty() {
+  if (!els.promptText) return false;
+  // Sheet not open and never opened → baseline is '', textarea is '' → clean.
+  return els.promptText.value !== promptEditorBaseline;
+}
+
 function openPromptEditor() {
   els.promptText.value = effectivePromptTemplate();
+  promptEditorBaseline = els.promptText.value;
   const lab = document.getElementById('prompt-mode-label');
   if (lab) lab.textContent = modeDescriptiveLabel();
   openSheet('prompt-sheet');
@@ -3077,6 +3174,7 @@ function savePromptEditor() {
   // No string-equality check with builtins — see the comment above
   // effectivePromptTemplateFor for why that was removed.
   state.systemPromptTemplate = v || null;
+  promptEditorBaseline = els.promptText.value;   // clean again
   savePrefs();
   closeSheet('prompt-sheet');
   log('info', state.systemPromptTemplate
@@ -3087,9 +3185,17 @@ function resetPromptEditor() {
   // Explicit "use default" — drops any custom override and closes. The user
   // can reopen to inspect the resolved default in the textarea.
   state.systemPromptTemplate = null;
+  promptEditorBaseline = els.promptText ? els.promptText.value : '';
   savePrefs();
   closeSheet('prompt-sheet');
   log('info', 'System prompt reset to default for the current mode.');
+}
+
+// Confirm-then-close wrapper used by the close × and the backdrop. Returns
+// true if the close should proceed; false to abort.
+function confirmDiscardPromptEdits() {
+  if (!isPromptEditorDirty()) return true;
+  return window.confirm('Discard unsaved system prompt edits?');
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
@@ -3173,8 +3279,8 @@ class PipController {
         background: ${palette.bg3};
       }
       .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${palette.fg2}; }
-      .pip-dot.live { background: ${palette.accent}; animation: p 0.8s infinite; }
-      @keyframes p { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
+      .pip-dot.live { background: ${palette.accent}; animation: pip-pulse 0.8s infinite; }
+      @keyframes pip-pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
       .pip-brand { font-weight: 600; font-size: 13px; }
       main {
         flex: 1; padding: 14px 16px; overflow-y: auto;
@@ -3318,11 +3424,16 @@ function wireUI() {
     onSettingsChange();
   });
   els.btnShowKey.addEventListener('click', () => {
-    const willShow = els.apiKey.type === 'password';
-    els.apiKey.type = willShow ? 'text' : 'password';
+    // Read the current visibility BEFORE flipping it, then derive the next
+    // state. Earlier code used `willShow = (type === 'password')` which is
+    // correct but read confusingly — the variable was named for what becomes
+    // true, not what *is* true.
+    const wasHidden = els.apiKey.type === 'password';
+    const isNowVisible = wasHidden;
+    els.apiKey.type = isNowVisible ? 'text' : 'password';
     // aria-pressed reflects whether the key is currently revealed — gives
     // screen-reader users a clear "this toggle is on/off" announcement.
-    els.btnShowKey.setAttribute('aria-pressed', willShow ? 'true' : 'false');
+    els.btnShowKey.setAttribute('aria-pressed', isNowVisible ? 'true' : 'false');
   });
   els.modeSelect.addEventListener('change', () => {
     updateUIVisibility();
@@ -3397,8 +3508,11 @@ function wireUI() {
       btn.disabled = false;
     }
   });
-  // API key is global, not per-session — savePrefs only.
-  els.apiKey.addEventListener('change', savePrefs);
+  // API key is global, not per-session — savePrefs only. Listen on 'input' so
+  // a paste-then-reload doesn't lose the key (the 'change' event only fires
+  // on blur, which is too late for the user who pastes and immediately
+  // reloads, switches tabs, or experiences a crash).
+  els.apiKey.addEventListener('input', savePrefs);
 
   els.btnMenu.addEventListener('click', () => openSheet('sidebar'));
   els.btnLog.addEventListener('click', () => openSheet('log-sheet'));
@@ -3501,25 +3615,34 @@ function wireUI() {
     });
   }
 
-  // Generic sheet close handlers
+  // Generic sheet close handlers. Prompt-sheet additionally guards against
+  // discarding unsaved edits — see confirmDiscardPromptEdits.
   document.addEventListener('click', (ev) => {
     const tgt = ev.target.closest('[data-close]');
-    if (tgt) closeSheet(tgt.getAttribute('data-close'));
+    if (!tgt) return;
+    const id = tgt.getAttribute('data-close');
+    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) return;
+    closeSheet(id);
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
     // Close only the topmost open modal so layered sheets (e.g. Log opened
     // from inside Settings) close one at a time, matching native dialog UX.
     const id = topmostOpenSheet();
-    if (id) {
+    if (!id) return;
+    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) {
       ev.preventDefault();
-      closeSheet(id);
+      return;
     }
+    ev.preventDefault();
+    closeSheet(id);
   });
 
   window.addEventListener('beforeunload', (ev) => {
     const hasRunning = [...state.sessions.values()].some((session) => session.running);
-    if (hasRunning) {
+    // Either a live session OR a dirty prompt is enough to warrant the
+    // browser's "leave site?" prompt — both represent unrecoverable state.
+    if (hasRunning || isPromptEditorDirty()) {
       ev.preventDefault();
       ev.returnValue = '';
     }
@@ -3531,6 +3654,11 @@ function wireUI() {
         try { session.capture && session.capture.stop(); } catch (_) {}
         try { session.player && session.player.destroy(); } catch (_) {}
       }
+      // ageTimer survives across BFCache restore (Safari especially) — a
+      // restored page would tick the age display against a destroyed session.
+      // Clear unconditionally; ageTimer is also cleared in stopSession but
+      // not every running-state path here was guaranteed to flow through it.
+      if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
     }
     try { state.micPassthrough.stop(); } catch (_) {}
     try { state.inputPreview && state.inputPreview.stop(); } catch (_) {}
@@ -3567,8 +3695,22 @@ function wireUI() {
   // and we call refreshActiveDeviceIndicators at every one of those points.
   // The 2 s tick is the safety net for cases we can't observe (e.g. the OS
   // changing the default device while the user picked "System default", or a
-  // BT speaker reconnecting under us). Cheap — just walks running sessions.
-  setInterval(refreshActiveDeviceIndicators, 2000);
+  // BT speaker reconnecting under us). Skipped when nothing is producing or
+  // consuming audio — no point polling an idle app.
+  setInterval(() => {
+    if (!hasActiveAudio()) return;
+    refreshActiveDeviceIndicators();
+  }, 2000);
+}
+
+// True when any session is running OR mic passthrough is live — i.e. there
+// is at least one device the indicators might need to reflect.
+function hasActiveAudio() {
+  if (state.micPassthrough && state.micPassthrough.running) return true;
+  for (const s of state.sessions.values()) {
+    if (s.running) return true;
+  }
+  return false;
 }
 
 function checkSupport() {
