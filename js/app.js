@@ -258,6 +258,7 @@ class Session {
     this.client = null;            // GeminiLiveClient
     this.capture = null;           // AudioCapture | CompanionAudioCapture
     this.player = null;            // TTSPlayer | null (text/transcribe modes)
+    this.resumeHandle = null;      // Latest Gemini Live resumption handle
 
     this.running = false;
     this.paused = false;
@@ -1152,7 +1153,11 @@ function onSettingsChange() {
   savePrefs();
   const session = activeSession();
   if (!session) return;
-  session.config = readConfigFromUI();
+  const nextConfig = readConfigFromUI();
+  if (JSON.stringify(session.config) !== JSON.stringify(nextConfig)) {
+    session.resumeHandle = null;
+  }
+  session.config = nextConfig;
   updateTabChip(session);
   saveSessions();
 }
@@ -1165,6 +1170,10 @@ function createNewSession({ activate = true } = {}) {
   const session = new Session({ id: newSessionId(), config: readConfigFromUI() });
   state.sessions.set(session.id, session);
   createSessionDOM(session);
+  if (state.uiMode === 'simple' && state.sessions.size > 1) {
+    setUIMode('advanced');
+    log('info', 'Switched to Full mode so all sessions are visible.');
+  }
   refreshAddSessionButton();
   refreshBulkActionButtons();
   saveSessions();
@@ -1265,6 +1274,7 @@ function saveSessions() {
     const arr = [...state.sessions.values()].map((s) => ({
       id: s.id,
       config: s.config,
+      resumeHandle: s.resumeHandle || null,
     }));
     localStorage.setItem(SESSIONS_KEY, JSON.stringify({
       sessions: arr,
@@ -1307,6 +1317,7 @@ function restoreSessionsFromStorage() {
       id: entry.id || newSessionId(),
       config: cfg,
     });
+    session.resumeHandle = entry.resumeHandle || null;
     state.sessions.set(session.id, session);
     createSessionDOM(session);
   }
@@ -1891,6 +1902,10 @@ async function changeAudioOutput() {
     await session.player.setOutputDevices(ids);
     const labels = describeSelectedOutputs(ids);
     log('info', 'Audio output changed: ' + labels);
+    for (const w of session.player.warnings || []) {
+      const label = describeSelectedOutputs([w.deviceId || '']);
+      log('warn', `Audio output ${label}: ${w.reason}.`);
+    }
   } catch (e) {
     log('error', 'Audio output change failed: ' + (e && e.message ? e.message : e));
     await refreshAudioOutputDevices();
@@ -2333,6 +2348,11 @@ async function startSession(session) {
     // manualActivity disables Gemini's auto VAD so we control turn boundaries
     // via activityStart/activityEnd (sent from the PTT key handlers below).
     manualActivity: isPtt,
+    resumeHandle: session.resumeHandle || null,
+    onResumeHandle: (handle) => {
+      session.resumeHandle = handle || null;
+      saveSessions();
+    },
     useOutputTranscription: cfg.mode !== 'transcribe',
     onAudio: isAudio ? (b64) => state.ttsCoordinator.enqueueChunk(session, b64) : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
@@ -2377,7 +2397,13 @@ async function startSession(session) {
   }
 
   try {
-    if (isAudio) await session.player.ensureCtx();
+    if (isAudio) {
+      await session.player.ensureCtx();
+      for (const w of session.player.warnings || []) {
+        const label = describeSelectedOutputs([w.deviceId || '']);
+        log('warn', `Audio output ${label}: ${w.reason}.`);
+      }
+    }
     const audioMode = cfg.audioSource || 'mic';
     if (audioMode === 'companion') {
       if (!state.companionAvailable && !(await detectCompanionService({ silent: false }))) {
@@ -2451,12 +2477,19 @@ async function stopSession(session) {
   // through startSession which resets the state we care about.
   if (!session || session._stopping) return;
   session._stopping = true;
+  if (session.player) {
+    try { session.player.hush(); } catch (_) {}
+  }
   state.ttsCoordinator.unregister(session);
   if (state.pttClient) state.pttClient.unsubscribe(session.id);
   session.pttHeld = false;
+  if (session.client && session.client.resumeHandle) {
+    session.resumeHandle = session.client.resumeHandle;
+    saveSessions();
+  }
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
-  try { session.player && session.player.destroy(); } catch (_) {}
+  try { if (session.player) await session.player.destroy(); } catch (_) {}
   session.client = null;
   session.capture = null;
   session.player = null;

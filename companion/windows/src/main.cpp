@@ -40,11 +40,13 @@ typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -471,8 +473,15 @@ void capture_system_loopback_to_websocket(SOCKET s, std::atomic<bool>& alive) {
 class ActivationHandler : public IActivateAudioInterfaceCompletionHandler {
  public:
   HANDLE event = nullptr;
-  STDMETHODIMP_(ULONG) AddRef() override { return 1; }
-  STDMETHODIMP_(ULONG) Release() override { return 1; }
+  explicit ActivationHandler(HANDLE event_handle) : event(event_handle) {}
+  STDMETHODIMP_(ULONG) AddRef() override {
+    return static_cast<ULONG>(refCount.fetch_add(1, std::memory_order_relaxed) + 1);
+  }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG refs = static_cast<ULONG>(refCount.fetch_sub(1, std::memory_order_acq_rel) - 1);
+    if (refs == 0) delete this;
+    return refs;
+  }
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
     if (!ppv) return E_POINTER;
     // IAgileObject is REQUIRED here. ActivateAudioInterfaceAsync QIs for it
@@ -483,6 +492,7 @@ class ActivationHandler : public IActivateAudioInterfaceCompletionHandler {
         riid == __uuidof(IAgileObject) ||
         riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
       *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+      AddRef();
       return S_OK;
     }
     *ppv = nullptr;
@@ -490,8 +500,11 @@ class ActivationHandler : public IActivateAudioInterfaceCompletionHandler {
   }
   STDMETHODIMP ActivateCompleted(IActivateAudioInterfaceAsyncOperation*) override {
     SetEvent(event);
+    Release();
     return S_OK;
   }
+ private:
+  std::atomic<ULONG> refCount{1};
 };
 
 struct ProcLoopFormat {
@@ -525,19 +538,19 @@ void capture_process_loopback_to_websocket(SOCKET s, DWORD pid, std::atomic<bool
   propvar.blob.cbSize = sizeof(activation);
   propvar.blob.pBlobData = reinterpret_cast<BYTE*>(&activation);
 
-  ActivationHandler handler;
-  handler.event = event;
+  ActivationHandler* handler = new ActivationHandler(event);
 
   IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
   HRESULT hr = ActivateAudioInterfaceAsync(
       VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
       __uuidof(IAudioClient),
       &propvar,
-      &handler,
+      handler,
       &asyncOp);
   dlog("process loopback pid=%lu: ActivateAudioInterfaceAsync hr=0x%08x", pid, hr);
 
   if (FAILED(hr) || !asyncOp) {
+    handler->Release();
     alive = false;
     CloseHandle(event);
     CoUninitialize();
@@ -859,6 +872,9 @@ struct HotkeyConnection {
   HotkeyBinding binding;
   std::atomic<bool> alive{true};
   std::mutex sendMutex;          // serialise writes (hook thread + pong sender)
+  std::mutex outboxMutex;
+  std::condition_variable outboxCv;
+  std::deque<std::string> outbox;
 };
 
 std::mutex g_hotkey_mutex;
@@ -888,6 +904,40 @@ bool ws_send_text(HotkeyConnection& conn, const std::string& text) {
   if (!conn.alive) return false;
   return send_all(conn.sock, hdr, hdr_len) &&
          send_all(conn.sock, reinterpret_cast<const uint8_t*>(text.data()), len);
+}
+
+void queue_hotkey_event(const std::shared_ptr<HotkeyConnection>& conn, const char* text) {
+  if (!conn || !conn->alive.load()) return;
+  {
+    std::lock_guard<std::mutex> lock(conn->outboxMutex);
+    if (!conn->alive.load()) return;
+    if (conn->outbox.size() >= 16) conn->outbox.pop_front();
+    conn->outbox.emplace_back(text);
+  }
+  conn->outboxCv.notify_one();
+}
+
+void hotkey_sender_loop(std::shared_ptr<HotkeyConnection> conn) {
+  for (;;) {
+    std::string msg;
+    {
+      std::unique_lock<std::mutex> lock(conn->outboxMutex);
+      conn->outboxCv.wait(lock, [&] {
+        return !conn->alive.load() || !conn->outbox.empty();
+      });
+      if (conn->outbox.empty()) {
+        if (!conn->alive.load()) break;
+        continue;
+      }
+      msg = std::move(conn->outbox.front());
+      conn->outbox.pop_front();
+    }
+    if (!ws_send_text(*conn, msg)) {
+      conn->alive = false;
+      conn->outboxCv.notify_all();
+      break;
+    }
+  }
 }
 
 LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -935,11 +985,11 @@ LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
           if (wantCtrl != ctrl || wantShift != shift ||
               wantAlt != alt   || wantWin != win) continue;
           if (!conn->binding.held.exchange(true)) {
-            ws_send_text(*conn, R"({"event":"down"})");
+            queue_hotkey_event(conn, R"({"event":"down"})");
           }
         } else {
           if (conn->binding.held.exchange(false)) {
-            ws_send_text(*conn, R"({"event":"up"})");
+            queue_hotkey_event(conn, R"({"event":"up"})");
           }
         }
       }
@@ -1013,6 +1063,7 @@ void hotkey_session_loop(SOCKET sock) {
 
   auto conn = std::make_shared<HotkeyConnection>();
   conn->sock = sock;
+  std::thread(hotkey_sender_loop, conn).detach();
   {
     std::lock_guard<std::mutex> lock(g_hotkey_mutex);
     g_hotkey_connections.push_back(conn);
@@ -1092,6 +1143,7 @@ void hotkey_session_loop(SOCKET sock) {
   }
 
   conn->alive = false;
+  conn->outboxCv.notify_all();
   std::lock_guard<std::mutex> lock(g_hotkey_mutex);
   g_hotkey_connections.erase(
       std::remove_if(g_hotkey_connections.begin(), g_hotkey_connections.end(),

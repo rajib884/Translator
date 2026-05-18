@@ -382,6 +382,8 @@ class TTSPlayer {
     // schedule a BufferSource into a disconnected graph and play silently.
     // playChunk awaits this queue so chunks always see a fully-connected sink.
     this._applyDevicesQueue = Promise.resolve();
+    this._destroyed = false;
+    this.warnings = [];
   }
 
   _sampleAnalyserPeak() {
@@ -405,6 +407,7 @@ class TTSPlayer {
   }
 
   async ensureCtx() {
+    if (this._destroyed) return;
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
       // Sources feed an analyser so the meter reflects what is actually
@@ -446,6 +449,7 @@ class TTSPlayer {
   async _doApplyDevices(ids) {
     if (!this.ctx || !this.analyser) return;
 
+    this.warnings = [];
     this._tearDownSinks();
 
     const list = (ids && ids.length) ? ids.slice() : [''];
@@ -470,19 +474,26 @@ class TTSPlayer {
       el.playsInline = true;
       el.srcObject = dest.stream;
       let resolvedId = id;
+      let setSinkErr = null;
       try {
         await el.setSinkId(id || '');
       } catch (e) {
+        setSinkErr = e;
         // Requested device disappeared or was rejected. Fall back to the
         // system default for this sink so the session still produces audio.
         try { await el.setSinkId(''); resolvedId = ''; }
         catch (_) {
           try { this.analyser.disconnect(dest); } catch (_) {}
           el.srcObject = null;
+          this.warnings.push({ deviceId: id, reason: (setSinkErr && setSinkErr.message) || 'setSinkId failed' });
           continue;
         }
+        this.warnings.push({ deviceId: id, reason: `requested device unavailable (${(setSinkErr && setSinkErr.message) || 'setSinkId failed'}); fell back to system default` });
       }
-      try { await el.play(); } catch (_) {}
+      try { await el.play(); }
+      catch (e) {
+        this.warnings.push({ deviceId: resolvedId, reason: `autoplay blocked (${(e && e.message) || 'play() rejected'})` });
+      }
       this.sinks.push({ deviceId: resolvedId, streamDest: dest, audioEl: el });
       accepted.push(resolvedId);
     }
@@ -500,6 +511,7 @@ class TTSPlayer {
   }
 
   async setOutputDevices(ids) {
+    if (this._destroyed) return;
     const normalized = TTSPlayer._normalizeIds(ids);
     this.outputDeviceIds = normalized;
     if (!this.ctx) return;
@@ -511,11 +523,14 @@ class TTSPlayer {
   }
 
   async playChunk(base64Pcm) {
+    if (this._destroyed) return;
     await this.ensureCtx();
+    if (this._destroyed || !this.ctx) return;
     // Wait for any in-flight sink reconfiguration before scheduling. The queue
     // is also awaited inside _applyDevices itself, so this is a no-op when the
     // graph is already settled.
     await this._applyDevicesQueue.catch(() => {});
+    if (this._destroyed || !this.ctx) return;
     const bin = atob(base64Pcm);
     const n = bin.length;
     const bytes = new Uint8Array(n);
@@ -566,10 +581,12 @@ class TTSPlayer {
            (this.ctx && this.nextStart > this.ctx.currentTime);
   }
 
-  destroy() {
+  async destroy() {
+    this._destroyed = true;
     this.hush();
+    await this._applyDevicesQueue.catch(() => {});
     this._tearDownSinks();
-    try { this.ctx && this.ctx.close(); } catch (_) {}
+    try { if (this.ctx) await this.ctx.close(); } catch (_) {}
     this.outputNode = null;
     this.analyser = null;
     this._analyserBuf = null;

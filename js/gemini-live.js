@@ -109,7 +109,8 @@ class GeminiLiveClient {
     this.ws = null;
     this.state = 'idle'; // idle | connecting | connected | reconnecting | error
     this.shouldRun = false;
-    this.resumeHandle = null;
+    this.resumeHandle = opts.resumeHandle || null;
+    this.onResumeHandle = opts.onResumeHandle || (() => {});
     this._reconnectTimer = null;
     this._goAwayTimer = null;
     this._setupComplete = false;
@@ -145,7 +146,6 @@ class GeminiLiveClient {
       try { this.ws.close(1000, 'client stop'); } catch (_) {}
       this.ws = null;
     }
-    this.resumeHandle = null;
     this._setupComplete = false;
     this._reconnectAttempts = 0;
     this._setState('idle');
@@ -252,7 +252,7 @@ class GeminiLiveClient {
       return;
     }
 
-    const sc = msg.serverContent;
+    const sc = msg && msg.serverContent;
     if (sc) {
       if (sc.inputTranscription && sc.inputTranscription.text) {
         this.onInputChunk(sc.inputTranscription.text);
@@ -262,10 +262,10 @@ class GeminiLiveClient {
       }
       if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
         for (const part of sc.modelTurn.parts) {
-          if (part.inlineData && part.inlineData.data) {
+          if (part && part.inlineData && part.inlineData.data) {
             this.onAudio(part.inlineData.data);
           }
-          if (part.text) {
+          if (part && part.text) {
             this.onOutputChunk(part.text);
           }
         }
@@ -277,6 +277,7 @@ class GeminiLiveClient {
       const u = msg.sessionResumptionUpdate;
       if (u.resumable && u.newHandle) {
         this.resumeHandle = u.newHandle;
+        try { this.onResumeHandle(u.newHandle); } catch (_) {}
       }
     }
 
@@ -341,7 +342,8 @@ class GeminiLiveClient {
       const exp = Math.min(
         RECONNECT_MAX_MS,
         RECONNECT_BACKOFF_MS * Math.pow(2, this._reconnectAttempts - 1));
-      delay = exp + Math.random() * 500;
+      const jitter = exp * 0.2;
+      delay = Math.max(250, exp - jitter + Math.random() * jitter * 2);
     }
     this._reconnectTimer = setTimeout(() => this._connect(), delay);
   }
