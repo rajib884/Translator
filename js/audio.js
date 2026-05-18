@@ -396,17 +396,12 @@ class TTSPlayer {
     return peak;
   }
 
-  // Strip empties to a single '' (default), de-dupe, and keep order.
+  // Strip empties to a single '' (default), de-dupe, and keep order. Thin
+  // shim that routes to the shared LiveAudio.normalizeOutputIds helper —
+  // kept as a static method for source compatibility with existing callers
+  // inside this class.
   static _normalizeIds(ids) {
-    const seen = new Set();
-    const out = [];
-    for (const raw of (ids || [])) {
-      const id = raw || '';
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push(id);
-    }
-    return out;
+    return normalizeOutputIds(ids);
   }
 
   async ensureCtx() {
@@ -598,6 +593,22 @@ function abToBase64(buf) {
   return btoa(bin);
 }
 
+// Canonical de-dupe + empty-coercion for an output-device id list. Shared
+// between TTSPlayer._normalizeIds (in this file) and app.js's
+// normalizeOutputDeviceIds wrapper (which also handles legacy single-string
+// and bare-id save formats from older builds).
+function normalizeOutputIds(ids) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of (ids || [])) {
+    const id = raw == null ? '' : String(raw);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 function canCaptureDisplayAudio() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 }
@@ -700,4 +711,4 @@ class MicPassthrough {
   }
 }
 
-window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, abToBase64, canCaptureDisplayAudio, canSelectOutputDevice };
+window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, abToBase64, normalizeOutputIds, canCaptureDisplayAudio, canSelectOutputDevice };

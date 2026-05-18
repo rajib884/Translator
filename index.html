@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <!-- WCAG 1.4.4: do not block user-initiated zoom. maximum-scale=1 was removed
+       because it stops users with low vision from pinching to enlarge text. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0d12" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
@@ -12,6 +14,20 @@
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
+
+  <!-- Icon sprite. Hidden but reachable via <use href="#icon-mic">. Currently
+       only the mic shape is centralised here — it's the only icon that
+       appears more than twice across the codebase (pause button, empty
+       state, passthrough toggle). Pause uses inline because it animates
+       between two shapes. -->
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+    <symbol id="icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+      <line x1="12" y1="19" x2="12" y2="23"/>
+      <line x1="8" y1="23" x2="16" y2="23"/>
+    </symbol>
+  </svg>
 
   <header class="topbar">
     <button id="btn-menu" class="icon-btn menu-btn" title="Settings" aria-label="Settings">

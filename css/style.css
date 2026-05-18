@@ -856,8 +856,13 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   outline-offset: 2px;
 }
 .tab-chip { outline-offset: -2px; }
+/* Keyboard focus on form fields: explicit 2px outline at 1px offset on top of
+   the existing border-color emphasis. The previous `outline: none` relied
+   entirely on the border colour change, which is too subtle to satisfy WCAG
+   2.4.7 once the focus indicator overlaps the field's own border. */
 input:focus-visible, select:focus-visible, textarea:focus-visible {
-  outline: none;     /* the .focus border-color rule already handles these */
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* Custom scrollbars — match the dark palette, stay slim. */

@@ -759,12 +759,7 @@ function renderSessionEmptyState(session) {
   empty.className = 'empty-state';
   empty.innerHTML =
     '<div class="empty-icon" aria-hidden="true">' +
-      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
-        '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>' +
-        '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>' +
-        '<line x1="12" y1="19" x2="12" y2="23"/>' +
-        '<line x1="8" y1="23" x2="16" y2="23"/>' +
-      '</svg>' +
+      '<svg class="icon" viewBox="0 0 24 24"><use href="#icon-mic"/></svg>' +
     '</div>' +
     '<p>Press <strong>Start</strong> and speak.<br/>Your words appear on one side, the translation on the other.</p>' +
     '<p class="hint">First, open <button class="link-btn" data-empty-action="open-settings" type="button">Settings</button> and paste your Gemini API key.</p>';
@@ -1715,22 +1710,17 @@ async function applyPassthrough() {
   }
 }
 
-// Coerce legacy single-string saves and stray inputs into a clean array.
+// Coerce legacy single-string saves and stray inputs into a clean array, then
+// hand off to the shared LiveAudio.normalizeOutputIds for de-dup + empty
+// coercion. The legacy migration (string → [string], legacySingle fallback)
+// lives here because only app.js sees those old pref shapes.
 function normalizeOutputDeviceIds(arr, legacySingle) {
   let raw;
   if (Array.isArray(arr)) raw = arr;
   else if (typeof arr === 'string') raw = [arr];
   else if (legacySingle != null) raw = [legacySingle];
   else raw = [];
-  const seen = new Set();
-  const out = [];
-  for (const v of raw) {
-    const s = v == null ? '' : String(v);
-    if (seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
-  }
-  return out;
+  return LiveAudio.normalizeOutputIds(raw);
 }
 
 function inputDeviceLabel(device, index) {
@@ -1882,7 +1872,7 @@ function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
   ptCb.checked = !!passthroughChecked;
   const ptIcon = document.createElement('span');
   ptIcon.className = 'pt-icon';
-  ptIcon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+  ptIcon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-mic"/></svg>';
   ptLabel.appendChild(ptCb);
   ptLabel.appendChild(ptIcon);
 
@@ -2092,6 +2082,14 @@ function flushPending(session) {
   if (!session.pendingInput && !session.pendingOutput) return;
   const t = ensureLiveTurn(session);
   if (!t) return;
+
+  // Decide BEFORE mutating: if the user has scrolled up to read earlier turns,
+  // don't yank them back to the bottom on every new chunk. 64 px tolerance
+  // covers "I'm at the bottom" including sub-pixel positions from native
+  // smooth scrolling or a partial last line.
+  const el = session.transcriptEl;
+  const autoScroll = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 64);
+
   if (session.pendingInput) {
     if (t.inputText === '') {
       t.inputEl.classList.remove('empty');
@@ -2116,8 +2114,8 @@ function flushPending(session) {
     }
     session.pendingOutput = '';
   }
-  if (session.transcriptEl) {
-    session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+  if (el && autoScroll) {
+    el.scrollTop = el.scrollHeight;
   }
 }
 
@@ -2734,27 +2732,44 @@ class PipController {
   _setup() {
     const doc = this.win.document;
     doc.documentElement.lang = 'en';
+    // Pull the palette from the main document's CSS variables so the PiP
+    // window can never drift from the app theme. Falls back to literal
+    // hex values when a custom property is missing (host page didn't ship
+    // them, or the PiP was opened from a barebones context).
+    const cs = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => (cs.getPropertyValue(name).trim() || fallback);
+    const palette = {
+      bg0:    v('--bg-0',      '#0b0d12'),
+      bg1:    v('--bg-1',      '#11141b'),
+      bg3:    v('--bg-3',      '#1d2230'),
+      fg0:    v('--fg-0',      '#e8ecf3'),
+      fg1:    v('--fg-1',      '#aab2c4'),
+      fg2:    v('--fg-2',      '#8a93a8'),
+      accent: v('--accent',    '#7c9cff'),
+      accent2:v('--accent-2',  '#a78bfa'),
+      line:   v('--line-soft', '#1c2230'),
+    };
     const style = doc.createElement('style');
     style.textContent = `
       html, body {
         margin: 0; height: 100%;
-        background: #0b0d12; color: #e8ecf3;
+        background: ${palette.bg0}; color: ${palette.fg0};
         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
         display: flex; flex-direction: column; overflow: hidden;
       }
       header {
         display: flex; align-items: center; gap: 8px;
-        padding: 8px 14px; border-bottom: 1px solid #1c2230;
-        background: #11141b; flex: 0 0 auto;
+        padding: 8px 14px; border-bottom: 1px solid ${palette.line};
+        background: ${palette.bg1}; flex: 0 0 auto;
       }
       .pip-pill {
         display: inline-flex; align-items: center; gap: 6px;
         padding: 4px 10px; border-radius: 999px;
         font-size: 11px; font-weight: 600;
-        background: #1d2230;
+        background: ${palette.bg3};
       }
-      .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: #6b7488; }
-      .pip-dot.live { background: #7c9cff; animation: p 0.8s infinite; }
+      .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${palette.fg2}; }
+      .pip-dot.live { background: ${palette.accent}; animation: p 0.8s infinite; }
       @keyframes p { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
       .pip-brand { font-weight: 600; font-size: 13px; }
       main {
@@ -2763,13 +2778,13 @@ class PipController {
       }
       .pip-label {
         font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
-        text-transform: uppercase; color: #6b7488; margin-bottom: 4px;
+        text-transform: uppercase; color: ${palette.fg2}; margin-bottom: 4px;
       }
-      .pip-input-lab { color: #7c9cff; }
-      .pip-output-lab { color: #a78bfa; }
-      .pip-input { font-size: 15px; color: #aab2c4; line-height: 1.45; word-wrap: break-word; }
+      .pip-input-lab { color: ${palette.accent}; }
+      .pip-output-lab { color: ${palette.accent2}; }
+      .pip-input { font-size: 15px; color: ${palette.fg1}; line-height: 1.45; word-wrap: break-word; }
       .pip-output { font-size: 20px; font-weight: 500; line-height: 1.4; word-wrap: break-word; }
-      .pip-empty { color: #6b7488; font-style: italic; }
+      .pip-empty { color: ${palette.fg2}; font-style: italic; }
     `;
     doc.head.appendChild(style);
     doc.body.innerHTML = `

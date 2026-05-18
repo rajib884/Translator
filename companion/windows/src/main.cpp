@@ -63,8 +63,8 @@ constexpr int kMaxFrameSamples = 1600;
 // some polling traffic. Past this we 503 new connections; the local-only
 // audience makes this purely a fork-bomb guardrail, not a throughput knob.
 constexpr int kMaxConnections = 32;
-constexpr GUID kAudioSubtypeIeeeFloat =
-    {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT from <ksmedia.h> is the canonical name;
+// the GUID storage comes from <initguid.h> being included first.
 
 struct SocketGuard {
   SOCKET s = INVALID_SOCKET;
@@ -84,21 +84,24 @@ std::string getenv_string(const char* name) {
 }
 
 // Diagnostic logging. The binary calls FreeConsole() at startup, so stdout is
-// useless — write to a file in %TEMP% (or beside the exe if that fails) and
-// also mirror to OutputDebugString so DebugView picks it up. Cheap enough that
-// we sprinkle it freely on the process-loopback path.
+// useless — write to a file in %TEMP% and mirror to OutputDebugString so
+// DebugView picks it up. Cheap enough that we sprinkle it freely on the
+// process-loopback path; the log file handle is opened once via call_once
+// and reused (the previous implementation opened/closed per call, which
+// became measurable during the every-500ms silent-tick heartbeat).
 void dlog(const char* fmt, ...) {
-  static char path[MAX_PATH] = {};
-  static std::atomic<bool> path_set{false};
-  if (!path_set.load(std::memory_order_acquire)) {
+  static FILE* log_file = nullptr;
+  static std::once_flag init_flag;
+  static std::mutex log_mutex;
+  std::call_once(init_flag, [] {
+    char path[MAX_PATH];
     DWORD n = GetTempPathA(MAX_PATH, path);
-    if (n > 0 && n < MAX_PATH - 40) {
-      strcat_s(path + n, MAX_PATH - n, "live-translator-companion.log");
-    } else {
-      path[0] = '\0';
-    }
-    path_set.store(true, std::memory_order_release);
-  }
+    if (n == 0 || n >= MAX_PATH - 40) return;
+    if (strcat_s(path + n, MAX_PATH - n, "live-translator-companion.log") != 0) return;
+    // Opened "ab" so writes from a previous run are preserved and so we can
+    // fflush each line for crash visibility without sweeping over prior text.
+    fopen_s(&log_file, path, "ab");
+  });
 
   va_list args;
   va_start(args, fmt);
@@ -114,14 +117,10 @@ void dlog(const char* fmt, ...) {
 
   OutputDebugStringA(line);
 
-  if (path[0]) {
-    static std::mutex log_mutex;
+  if (log_file) {
     std::lock_guard<std::mutex> lock(log_mutex);
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") == 0 && f) {
-      fputs(line, f);
-      fclose(f);
-    }
+    fputs(line, log_file);
+    fflush(log_file);
   }
 }
 
@@ -365,7 +364,7 @@ bool is_float_format(const WAVEFORMATEX* fmt) {
   if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
   if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
     auto ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(fmt);
-    return IsEqualGUID(ext->SubFormat, kAudioSubtypeIeeeFloat);
+    return IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
   }
   return false;
 }
