@@ -221,6 +221,8 @@ const els = {
   btnHush:       $('btn-hush'),
   btnPause:      $('btn-pause'),
   btnClear:      $('btn-clear'),
+  btnExportJson: $('btn-export-json'),
+  btnExportText: $('btn-export-text'),
   btnMenu:       $('btn-menu'),
   btnLog:        $('btn-log'),
   btnPip:        $('btn-pip'),
@@ -642,6 +644,47 @@ function setUIMode(mode) {
     }
   }
   savePrefs();
+}
+
+function resetAdvancedSettingsForBasic() {
+  els.modeSelect.value = 'audio';
+  els.dirSelect.value = 'bidir';
+  els.audioSource.value = 'mic';
+  els.audioInput.value = '';
+  els.audioInput.dataset.preferred = '';
+  els.audioOutput.dataset.preferred = JSON.stringify(['']);
+  els.audioOutput.dataset.preferredPassthrough = JSON.stringify([]);
+  setSelectedOutputDeviceIds(['']);
+  els.speechMode.value = 'auto';
+  els.vadPreset.value = DEFAULT_VAD_PRESET;
+  applyVadPreset(DEFAULT_VAD_PRESET);
+  if (els.companionApp) {
+    els.companionApp.value = '';
+    els.companionApp.dataset.preferred = '';
+  }
+  state.systemPromptTemplate = null;
+  updateUIVisibility();
+  updateAudioSourceAvailability();
+  updateSpeechModeFields();
+  applyPassthrough();
+  onSettingsChange();
+}
+
+function requestUIModeChange(mode) {
+  if (mode === state.uiMode) return;
+  if (mode === 'simple') {
+    const session = activeSession();
+    if (session && session.running) {
+      log('warn', 'Stop the active session before switching to Basic mode and resetting advanced settings.');
+      return;
+    }
+    const ok = window.confirm(
+      'Switch to Basic mode and reset advanced settings for the active session? ' +
+      'This restores voice translation, microphone input, Auto Detect, default devices, and the default prompt.');
+    if (!ok) return;
+    resetAdvancedSettingsForBasic();
+  }
+  setUIMode(mode);
 }
 
 function activeSession() {
@@ -1887,9 +1930,59 @@ function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
   ptLabel.appendChild(ptCb);
   ptLabel.appendChild(ptIcon);
 
+  const testBtn = document.createElement('button');
+  testBtn.className = 'device-test';
+  testBtn.type = 'button';
+  testBtn.dataset.deviceId = value;
+  testBtn.title = 'Test speaker';
+  testBtn.setAttribute('aria-label', `Test ${label}`);
+  testBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5z" fill="currentColor"/><path d="M16 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M19 7a8 8 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
   row.appendChild(ttsLabel);
+  row.appendChild(testBtn);
   row.appendChild(ptLabel);
   return row;
+}
+
+async function testOutputDevice(deviceId) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) throw new Error('AudioContext unavailable.');
+  const ctx = new Ctx();
+  let el = null;
+  try {
+    if (ctx.state === 'suspended') await ctx.resume();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 660;
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.45);
+    osc.connect(gain);
+
+    if (typeof HTMLMediaElement !== 'undefined' &&
+        HTMLMediaElement.prototype &&
+        typeof HTMLMediaElement.prototype.setSinkId === 'function') {
+      const dest = ctx.createMediaStreamDestination();
+      gain.connect(dest);
+      el = new Audio();
+      el.autoplay = true;
+      el.playsInline = true;
+      el.srcObject = dest.stream;
+      await el.setSinkId(deviceId || '');
+      await el.play();
+    } else {
+      gain.connect(ctx.destination);
+    }
+
+    osc.start();
+    osc.stop(ctx.currentTime + 0.48);
+    await new Promise((resolve) => setTimeout(resolve, 560));
+  } finally {
+    try { el && el.pause(); } catch (_) {}
+    if (el) el.srcObject = null;
+    await ctx.close().catch(() => {});
+  }
 }
 
 async function changeAudioOutput() {
@@ -1962,6 +2055,18 @@ function createCompanionCapture(session) {
       if (!session.running) return;
       log('warn', 'Companion audio service disconnected.');
       stopSession(session);
+    },
+    onReconnectState: ({ state: reconnectState, attempt, delay }) => {
+      if (!session.running) return;
+      if (reconnectState === 'reconnecting') {
+        setSessionStatus(session, 'reconnecting');
+        if (attempt === 1 || attempt % 5 === 0) {
+          log('warn', `Companion audio disconnected; retrying in ${(delay / 1000).toFixed(1)}s.`);
+        }
+      } else if (reconnectState === 'reconnected') {
+        log('info', 'Companion audio reconnected.');
+        setSessionStatus(session, 'connected');
+      }
     },
   });
 }
@@ -2115,8 +2220,10 @@ function flushPending(session) {
     t.inputTextNode.nodeValue = t.inputText;
     session.pendingInput = '';
     if (state.pip && isActive(session)) state.pip.setInput(t.inputText);
+    if (!t.outputText) t.root.classList.add('is-thinking');
   }
   if (session.pendingOutput) {
+    t.root.classList.remove('is-thinking');
     if (t.outputEl) {
       if (t.outputText === '') {
         t.outputEl.classList.remove('empty');
@@ -2177,6 +2284,11 @@ function ensureLiveTurn(session) {
     outText.appendChild(outCaret);
     outRow.appendChild(outLab); outRow.appendChild(outText);
     root.appendChild(inRow); root.appendChild(outRow);
+    const thinking = document.createElement('span');
+    thinking.className = 'turn-thinking';
+    thinking.setAttribute('aria-hidden', 'true');
+    thinking.innerHTML = '<span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>';
+    root.appendChild(thinking);
   } else {
     root.appendChild(inRow);
   }
@@ -2208,12 +2320,14 @@ function ensureLiveTurn(session) {
 }
 
 function appendInputFor(session, chunk)  { session.pendingInput  += chunk; scheduleFlush(session); }
-function appendOutputFor(session, chunk) { session.pendingOutput += chunk; scheduleFlush(session); }
+function appendOutputFor(session, chunk) { session.pendingOutput += chunk; if (session.liveTurn) session.liveTurn.root.classList.remove('is-thinking'); scheduleFlush(session); }
+function clearThinkingFor(session) { if (session && session.liveTurn) session.liveTurn.root.classList.remove('is-thinking'); }
 
 function finalizeTurn(session) {
   flushPending(session);
   if (!session.liveTurn) return;
   const t = session.liveTurn;
+  t.root.classList.remove('is-thinking');
   t.inputCaret.remove();
   if (t.outputCaret) t.outputCaret.remove();
   if (!t.inputText.trim())  { t.inputEl.classList.add('empty');  t.inputTextNode.nodeValue = '(silence)'; }
@@ -2240,7 +2354,6 @@ function setMicLevelFor(session, level) {
   // is NOT reaching the model, even though the capture is technically still
   // open. PTT-waiting sessions still show real level — that confirms the mic
   // is hearing them, while the status text says "Hold [KEY]".
-  if (session.paused) level = 0;
   session.lastMicLevel = level;
   paintMeterFill(session.tabMicFill, level);
 }
@@ -2354,7 +2467,7 @@ async function startSession(session) {
       saveSessions();
     },
     useOutputTranscription: cfg.mode !== 'transcribe',
-    onAudio: isAudio ? (b64) => state.ttsCoordinator.enqueueChunk(session, b64) : () => {},
+    onAudio: isAudio ? (b64) => { clearThinkingFor(session); state.ttsCoordinator.enqueueChunk(session, b64); } : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
     onOutputChunk: cfg.mode !== 'transcribe' ? (chunk) => appendOutputFor(session, chunk) : () => {},
     onTurnComplete: () => {
@@ -2541,10 +2654,6 @@ function togglePause() {
   // suppresses leftover chunks of the in-flight turn.
   if (session.paused) {
     state.ttsCoordinator.hush(session);
-    // Freeze the mic meter visually so the user can see the model is no
-    // longer hearing them.
-    paintMeterFill(session.tabMicFill, 0);
-    session.lastMicLevel = 0;
   }
   applyControlButtonsForActiveSession();
   refreshSessionDisplay(session);  // chip + pill now read "Paused" / "Listening"
@@ -2691,6 +2800,66 @@ function clearConversation() {
     renderSessionEmptyState(session);
   }
   if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
+}
+
+function conversationTurns(session) {
+  if (!session || !session.transcriptEl) return [];
+  return Array.from(session.transcriptEl.querySelectorAll(':scope > .turn')).map((turn, index) => {
+    const input = turn.querySelector('.turn-row.input .turn-text');
+    const output = turn.querySelector('.turn-row.output .turn-text');
+    return {
+      index: index + 1,
+      input: input ? input.textContent.trim() : '',
+      output: output ? output.textContent.trim() : '',
+    };
+  });
+}
+
+function downloadText(filename, text, type) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportConversation(format) {
+  const session = activeSession();
+  if (!session) return;
+  const turns = conversationTurns(session);
+  if (turns.length === 0) {
+    log('warn', 'Nothing to export for this session.');
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const base = `live-translator-${session.config.source}-${session.config.target}-${stamp}`;
+  if (format === 'json') {
+    downloadText(base + '.json', JSON.stringify({
+      exportedAt: new Date().toISOString(),
+      sessionId: session.id,
+      config: session.config,
+      turns,
+    }, null, 2), 'application/json');
+  } else {
+    const lines = [
+      'Live Translator export',
+      `${langName(session.config.source)} -> ${langName(session.config.target)}`,
+      `Exported: ${new Date().toLocaleString()}`,
+      '',
+      ...turns.flatMap((t) => [
+        `#${t.index}`,
+        `${langName(session.config.source)}: ${t.input || '(empty)'}`,
+        session.config.mode === 'transcribe' ? '' : `${langName(session.config.target)}: ${t.output || '(empty)'}`,
+        '',
+      ]),
+    ];
+    downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
+  }
+  log('info', `Conversation exported as ${format.toUpperCase()}.`);
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
@@ -2938,6 +3107,8 @@ function wireUI() {
     log('info', 'Playback silenced');
   });
   els.btnClear.addEventListener('click', clearConversation);
+  els.btnExportJson.addEventListener('click', () => exportConversation('json'));
+  els.btnExportText.addEventListener('click', () => exportConversation('text'));
   els.btnSwap.addEventListener('click', () => {
     const a = els.langSource.value;
     els.langSource.value = els.langTarget.value;
@@ -3006,6 +3177,21 @@ function wireUI() {
       changeAudioOutput();
     }
   });
+  els.audioOutput.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.device-test');
+    if (!btn || !els.audioOutput.contains(btn)) return;
+    e.preventDefault();
+    btn.disabled = true;
+    try {
+      await testOutputDevice(btn.dataset.deviceId || '');
+      const label = btn.getAttribute('aria-label').replace(/^Test\s+/, '');
+      log('info', 'Speaker test: ' + label);
+    } catch (err) {
+      log('warn', 'Speaker test failed: ' + (err && err.message ? err.message : err));
+    } finally {
+      btn.disabled = false;
+    }
+  });
   // API key is global, not per-session — savePrefs only.
   els.apiKey.addEventListener('change', savePrefs);
 
@@ -3022,7 +3208,7 @@ function wireUI() {
     els.modeSwitch.addEventListener('click', (ev) => {
       const btn = ev.target.closest('.mode-opt');
       if (!btn) return;
-      setUIMode(btn.dataset.uiMode);
+      requestUIModeChange(btn.dataset.uiMode);
     });
   }
 
@@ -3126,7 +3312,14 @@ function wireUI() {
     }
   });
 
-  window.addEventListener('beforeunload', () => {
+  window.addEventListener('beforeunload', (ev) => {
+    const hasRunning = [...state.sessions.values()].some((session) => session.running);
+    if (hasRunning) {
+      ev.preventDefault();
+      ev.returnValue = '';
+    }
+  });
+  window.addEventListener('pagehide', () => {
     for (const session of state.sessions.values()) {
       if (session.running) {
         try { session.client && session.client.stop(); } catch (_) {}

@@ -292,11 +292,15 @@ class AudioCapture {
 }
 
 class CompanionAudioCapture {
-  constructor({ onChunk, onLevel, onDisplayEnded } = {}) {
+  constructor({ onChunk, onLevel, onDisplayEnded, onReconnectState } = {}) {
     this.onChunk = onChunk || (() => {});
     this.onDisplayEnded = onDisplayEnded || (() => {});
+    this.onReconnectState = onReconnectState || (() => {});
     this.ws = null;
     this._stopping = false;
+    this._wsUrl = '';
+    this._reconnectTimer = 0;
+    this._reconnectAttempts = 0;
     // Tick while the WebSocket is alive; on close, snap level to 0 (same
     // semantics as AudioCapture — meter dies with the input).
     this._meter = new LevelMeter({
@@ -306,23 +310,36 @@ class CompanionAudioCapture {
   }
 
   async start({ wsUrl = 'ws://127.0.0.1:52341/audio' } = {}) {
+    this._wsUrl = wsUrl;
+    this._stopping = false;
+    this._reconnectAttempts = 0;
+    await this._connect({ initial: true });
+  }
+
+  async _connect({ initial = false } = {}) {
     await new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(this._wsUrl);
       let settled = false;
       ws.binaryType = 'arraybuffer';
       ws.onopen = () => {
         settled = true;
         this._stopping = false;
         this.ws = ws;
+        this._reconnectAttempts = 0;
         this._meter.start();
+        this.onReconnectState({ state: initial ? 'connected' : 'reconnected', attempt: 0 });
         resolve();
       };
       ws.onerror = () => {
         if (!settled) reject(new Error('Companion audio service is unavailable.'));
       };
       ws.onclose = () => {
-        this.ws = null;
-        if (!this._stopping) this.onDisplayEnded();
+        if (this.ws === ws) this.ws = null;
+        if (!settled) {
+          reject(new Error('Companion audio service is unavailable.'));
+          return;
+        }
+        if (!this._stopping) this._scheduleReconnect();
       };
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return;
@@ -330,6 +347,21 @@ class CompanionAudioCapture {
         this.onChunk(ev.data);
       };
     });
+  }
+
+  _scheduleReconnect() {
+    if (this._stopping || this._reconnectTimer) return;
+    this._meter.stop();
+    this._reconnectAttempts++;
+    const base = Math.min(10000, 500 * Math.pow(2, this._reconnectAttempts - 1));
+    const jitter = base * 0.2;
+    const delay = Math.max(250, base - jitter + Math.random() * jitter * 2);
+    this.onReconnectState({ state: 'reconnecting', attempt: this._reconnectAttempts, delay });
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = 0;
+      if (this._stopping) return;
+      this._connect({ initial: false }).catch(() => this._scheduleReconnect());
+    }, delay);
   }
 
   _trackLevel(buffer) {
@@ -345,6 +377,10 @@ class CompanionAudioCapture {
   stop() {
     const ws = this.ws;
     this._stopping = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = 0;
+    }
     this.ws = null;
     this._meter.stop();
     try { ws && ws.close(); } catch (_) {}
