@@ -711,44 +711,97 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   display: flex; align-items: stretch;
   font-size: 14px; color: var(--fg-0);
   user-select: none;
+  min-height: 48px;                  /* WCAG 2.5.5 target size on touch */
 }
 .device-option:not(:last-child) { border-bottom: 1px solid var(--line); }
+.device-option.is-live-tts { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
-/* Left: TTS output checkbox + device name */
+/* Left: TTS output checkbox + device name + live badge */
 .device-tts-label {
-  flex: 1; display: flex; align-items: center; gap: 10px;
-  padding: 9px 12px;
+  flex: 1; display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
   cursor: pointer; min-width: 0;
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.device-tts-label:hover { background: var(--bg-2); }
+.device-tts-label:hover,
+.device-tts-label:active { background: var(--bg-2); }
 .device-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.live-badge {
+  display: none; align-items: center; gap: 4px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--accent);
+  flex-shrink: 0;
+}
+.device-option.is-live-tts .live-badge { display: inline-flex; }
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: live-pulse 1.6s ease-out infinite;
+}
+@keyframes live-pulse {
+  0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--accent) 60%, transparent); }
+  70%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%,  transparent); }
+  100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--accent) 0%,  transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot { animation: none; }
+}
+
+/* Inline "Live: <device>" line shown under the input <select>. */
+.live-line {
+  margin: 4px 0 0; font-size: 11.5px; color: var(--accent);
+  display: none; align-items: center; gap: 6px;
+}
+.live-line.is-visible { display: inline-flex; }
+.live-line::before {
+  content: ''; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex-shrink: 0;
+  animation: live-pulse 1.6s ease-out infinite;
+}
 
 /* Right: mic passthrough toggle (decoupled from sessions) */
 .passthrough-toggle {
   display: flex; align-items: center; justify-content: center;
-  padding: 9px 12px;
+  padding: 10px 14px;
   border-left: 1px solid var(--line);
   cursor: pointer; flex-shrink: 0;
   color: var(--fg-2);
   transition: color 0.15s, background 0.15s;
+  min-width: 44px;                   /* touch target */
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.passthrough-toggle:hover { background: var(--bg-2); }
+.passthrough-toggle:hover,
+.passthrough-toggle:active { background: var(--bg-2); }
 .passthrough-toggle input[type=checkbox] { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
 .passthrough-toggle:has(input:checked) { color: var(--accent); }
-.pt-icon svg { width: 16px; height: 16px; display: block; }
+.device-option.is-live-passthrough .passthrough-toggle { color: var(--accent); }
+.device-option.is-live-passthrough .passthrough-toggle::after {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-left: 4px;
+  animation: live-pulse 1.6s ease-out infinite;
+}
+.pt-icon svg { width: 18px; height: 18px; display: block; }
 .device-test {
   display: flex; align-items: center; justify-content: center;
-  padding: 9px 12px;
+  padding: 10px 14px;
   border-left: 1px solid var(--line);
   color: var(--fg-2);
   flex-shrink: 0;
+  min-width: 44px;                   /* touch target */
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.device-test:hover:not(:disabled) { background: var(--bg-2); color: var(--accent); }
-.device-test svg { width: 16px; height: 16px; display: block; }
+.device-test:hover:not(:disabled),
+.device-test:active:not(:disabled) { background: var(--bg-2); color: var(--accent); }
+.device-test svg { width: 18px; height: 18px; display: block; }
 
 /* Shared checkbox overrides (undo the blanket input[type=text/password/number] rule) */
 .device-tts-label input[type=checkbox] {
-  width: 15px; height: 15px; flex-shrink: 0;
+  width: 18px; height: 18px; flex-shrink: 0;
   accent-color: var(--accent);
   cursor: pointer; padding: 0;
 }

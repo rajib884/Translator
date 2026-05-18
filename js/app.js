@@ -190,6 +190,7 @@ const els = {
   voice:         $('voice'),
   audioInput:    $('audio-input'),
   audioInputHint:$('audio-input-hint'),
+  audioInputLive:$('audio-input-live'),
   audioSource:   segProxy($('audio-source-segmented')),
   audioHint:     $('audio-source-hint'),
   companionApp:      $('companion-app'),
@@ -1736,6 +1737,18 @@ function setSelectedOutputDeviceIds(ids) {
   });
 }
 
+// Guarantees at least one TTS sink is ticked so the UI never shows "nothing
+// selected" while audio still plays via the System-default fallback. Returns
+// true if the System-default checkbox was force-re-checked, false otherwise.
+function ensureAtLeastOneOutputTicked() {
+  if (!els.audioOutput) return false;
+  const ticked = els.audioOutput.querySelectorAll('input.dev-tts:checked');
+  if (ticked.length > 0) return false;
+  const defaultCb = els.audioOutput.querySelector('input.dev-tts[value=""]');
+  if (defaultCb) defaultCb.checked = true;
+  return true;
+}
+
 function getPassthroughDeviceIds() {
   if (!els.audioOutput) return [];
   return Array.from(els.audioOutput.querySelectorAll('input.dev-passthrough:checked'))
@@ -1762,6 +1775,7 @@ async function applyPassthrough() {
   } catch (e) {
     log('warn', 'Mic passthrough error: ' + (e && e.message ? e.message : e));
   }
+  refreshActiveDeviceIndicators();
 }
 
 // Coerce legacy single-string saves and stray inputs into a clean array, then
@@ -1874,7 +1888,10 @@ async function refreshAudioOutputDevices() {
 
     els.audioOutput.innerHTML = '';
     els.audioOutput.appendChild(frag);
-    // Drop ids that no longer map to a present device.
+    // Drop ids that no longer map to a present device. Enforce the invariant
+    // that at least one TTS sink is always ticked — if everything got pruned,
+    // or the user previously saved an empty selection, System default wins.
+    ensureAtLeastOneOutputTicked();
     els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
     els.audioOutput.dataset.preferredPassthrough = JSON.stringify(getPassthroughDeviceIds());
 
@@ -1887,6 +1904,7 @@ async function refreshAudioOutputDevices() {
       els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
     }
     savePrefs();
+    refreshActiveDeviceIndicators();
     // Await so the device-refresh path doesn't race a still-applying passthrough
     // start (the audio element may not yet have finished setSinkId/play).
     await applyPassthrough();
@@ -1900,8 +1918,9 @@ async function refreshAudioOutputDevices() {
 function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
   const row = document.createElement('div');
   row.className = 'device-option';
+  row.dataset.deviceId = value;
 
-  // Left side: TTS checkbox + device name
+  // Left side: TTS checkbox + device name + live indicator
   const ttsLabel = document.createElement('label');
   ttsLabel.className = 'device-tts-label';
   const ttsCb = document.createElement('input');
@@ -1912,8 +1931,13 @@ function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
   const nameSpan = document.createElement('span');
   nameSpan.className = 'device-name';
   nameSpan.textContent = label;
+  const liveBadge = document.createElement('span');
+  liveBadge.className = 'live-badge';
+  liveBadge.setAttribute('aria-hidden', 'true');
+  liveBadge.innerHTML = '<span class="live-dot"></span><span class="live-text">live</span>';
   ttsLabel.appendChild(ttsCb);
   ttsLabel.appendChild(nameSpan);
+  ttsLabel.appendChild(liveBadge);
 
   // Right side: passthrough mic toggle (decoupled from session lifecycle)
   const ptLabel = document.createElement('label');
@@ -1951,14 +1975,30 @@ async function testOutputDevice(deviceId) {
   let el = null;
   try {
     if (ctx.state === 'suspended') await ctx.resume();
-    const osc = ctx.createOscillator();
+    // Three-note arpeggio (C5–E5–G5) over ~1.6 s. Easier to identify which
+    // speaker is playing than the previous quarter-second blip, especially on
+    // small Bluetooth devices where the first 200 ms can be lost to wake-up.
     const gain = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = 660;
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.45);
-    osc.connect(gain);
+    const notes = [523.25, 659.25, 783.99];
+    const noteDur = 0.45;
+    const totalDur = noteDur * notes.length + 0.1;
+    const oscillators = notes.map((freq, i) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const t0 = ctx.currentTime + i * noteDur;
+      osc.connect(gain);
+      osc.start(t0);
+      osc.stop(t0 + noteDur);
+      return osc;
+    });
+    // One envelope per note: 20 ms attack, 380 ms decay, 50 ms gap.
+    notes.forEach((_, i) => {
+      const t0 = ctx.currentTime + i * noteDur;
+      gain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + noteDur - 0.05);
+    });
 
     if (typeof HTMLMediaElement !== 'undefined' &&
         HTMLMediaElement.prototype &&
@@ -1975,9 +2015,8 @@ async function testOutputDevice(deviceId) {
       gain.connect(ctx.destination);
     }
 
-    osc.start();
-    osc.stop(ctx.currentTime + 0.48);
-    await new Promise((resolve) => setTimeout(resolve, 560));
+    await new Promise((resolve) => setTimeout(resolve, totalDur * 1000 + 100));
+    oscillators.forEach((o) => { try { o.disconnect(); } catch (_) {} });
   } finally {
     try { el && el.pause(); } catch (_) {}
     if (el) el.srcObject = null;
@@ -1986,6 +2025,11 @@ async function testOutputDevice(deviceId) {
 }
 
 async function changeAudioOutput() {
+  // Enforce: never zero ticks. The System-default checkbox is auto-re-ticked
+  // so the UI always reflects where TTS is actually going.
+  if (ensureAtLeastOneOutputTicked()) {
+    log('info', 'At least one output device must stay selected — System default re-enabled.');
+  }
   const ids = getSelectedOutputDeviceIds();
   els.audioOutput.dataset.preferred = JSON.stringify(ids);
   onSettingsChange();
@@ -2014,6 +2058,85 @@ function describeSelectedOutputs(ids) {
     return span ? span.textContent : (id || 'System default');
   });
   return names.join(', ');
+}
+
+// Walks every running session + the global passthrough and reports which
+// concrete deviceIds are actually attached to a live mic track or a wired-up
+// sink right now. Used to paint the "live" badges in the device list.
+function collectLiveDeviceState() {
+  const micIds = new Set();
+  const ttsIds = new Set();
+  const passthroughIds = new Set();
+  for (const session of state.sessions.values()) {
+    if (!session.running) continue;
+    if (session.capture && typeof session.capture.getActiveMicId === 'function') {
+      const mid = session.capture.getActiveMicId();
+      if (mid !== null) micIds.add(mid);
+    }
+    if (session.player && typeof session.player.getActiveSinkIds === 'function') {
+      for (const sid of session.player.getActiveSinkIds()) ttsIds.add(sid);
+    }
+  }
+  if (state.micPassthrough && state.micPassthrough.running) {
+    const mid = state.micPassthrough.getActiveMicId
+      ? state.micPassthrough.getActiveMicId() : null;
+    if (mid !== null) micIds.add(mid);
+    if (state.micPassthrough.getActiveSinkIds) {
+      for (const sid of state.micPassthrough.getActiveSinkIds()) passthroughIds.add(sid);
+    }
+  }
+  return { micIds, ttsIds, passthroughIds };
+}
+
+// Paints the live indicators on the output-device list and the input dropdown.
+// Idempotent and cheap; safe to call on a timer or any event.
+function refreshActiveDeviceIndicators() {
+  const { micIds, ttsIds, passthroughIds } = collectLiveDeviceState();
+
+  if (els.audioOutput) {
+    els.audioOutput.querySelectorAll('.device-option').forEach((row) => {
+      const id = row.dataset.deviceId || '';
+      row.classList.toggle('is-live-tts', ttsIds.has(id));
+      row.classList.toggle('is-live-passthrough', passthroughIds.has(id));
+    });
+  }
+
+  // Input: a single dropdown can only show one row, so we surface the live
+  // device(s) in a status pill under it. When the user picked "System default"
+  // we also reveal what device that actually resolved to.
+  if (els.audioInputLive) {
+    const liveIds = Array.from(micIds);
+    if (liveIds.length === 0) {
+      els.audioInputLive.textContent = '';
+      els.audioInputLive.classList.remove('is-visible');
+    } else {
+      const names = liveIds.map((id) => deviceLabelForId(id, 'input'));
+      els.audioInputLive.textContent = 'Live: ' + names.join(', ');
+      els.audioInputLive.classList.add('is-visible');
+    }
+  }
+}
+
+// Resolve a deviceId to its human label by reading the cached enumeration
+// (input select or output checkbox list). Falls back to the raw id.
+function deviceLabelForId(id, kind) {
+  if (kind === 'input') {
+    if (!els.audioInput) return id || 'System default';
+    const opt = Array.from(els.audioInput.options).find((o) => o.value === id);
+    if (opt) return opt.textContent;
+    // 'System default' has value=''; if a real id is live but the option list
+    // hasn't enumerated it (no permission yet), say so.
+    if (!id) return 'System default';
+    return id.slice(0, 8) + '…';
+  }
+  // output
+  const cb = els.audioOutput
+    ? els.audioOutput.querySelector(`input.dev-tts[value="${cssEscape(id)}"]`) : null;
+  if (cb) {
+    const span = cb.closest('.device-option').querySelector('.device-name');
+    if (span) return span.textContent;
+  }
+  return id || 'System default';
 }
 
 function cssEscape(s) {
@@ -2540,6 +2663,7 @@ async function startSession(session) {
     session.currentAudioMode = audioMode;
     await refreshAudioInputDevices();
     await refreshAudioOutputDevices();
+    refreshActiveDeviceIndicators();
     const sourceLabels = {mic:'microphone', display:'browser app audio', companion:'companion app audio', both:'mic + app audio'};
     let sourceLog = sourceLabels[audioMode] || audioMode;
     if (audioMode === 'companion' && cfg.companionApp) {
@@ -2623,6 +2747,7 @@ async function stopSession(session) {
     els.sessionAge.textContent = '00:00';
   }
   refreshBulkActionButtons();
+  refreshActiveDeviceIndicators();
   session._stopping = false;
 }
 
@@ -3356,6 +3481,13 @@ function wireUI() {
       refreshAudioOutputDevices();
     });
   }
+
+  // Live-state poller. Active mic/sink ids only change on start/stop/swap,
+  // and we call refreshActiveDeviceIndicators at every one of those points.
+  // The 2 s tick is the safety net for cases we can't observe (e.g. the OS
+  // changing the default device while the user picked "System default", or a
+  // BT speaker reconnecting under us). Cheap — just walks running sessions.
+  setInterval(refreshActiveDeviceIndicators, 2000);
 }
 
 function checkSupport() {

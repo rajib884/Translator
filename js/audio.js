@@ -289,6 +289,20 @@ class AudioCapture {
     this.ctx = null;
     this._meter.stop();
   }
+
+  // The deviceId actually attached to the live mic track. Differs from the
+  // user's pick when they chose "System default" — getSettings() resolves it
+  // to the concrete OS device the browser handed us.
+  getActiveMicId() {
+    const entry = this.streams.find((x) => x.kind === 'mic');
+    if (!entry) return null;
+    const tracks = entry.stream.getAudioTracks();
+    if (!tracks.length || tracks[0].readyState !== 'live') return null;
+    try {
+      const s = tracks[0].getSettings();
+      return s && s.deviceId ? s.deviceId : '';
+    } catch (_) { return null; }
+  }
 }
 
 class CompanionAudioCapture {
@@ -629,6 +643,13 @@ class TTSPlayer {
     this.ctx = null;
   }
 
+  // Sink ids currently wired up and playing. Mirrors what setSinkId actually
+  // accepted, including '' fallbacks. UI uses this for live "active" badges.
+  getActiveSinkIds() {
+    if (!this.sinks.length) return [];
+    return this.sinks.map((s) => s.useDestination ? '' : (s.deviceId || ''));
+  }
+
   static canSelectOutputDevice() {
     return typeof HTMLMediaElement !== 'undefined' &&
            !!HTMLMediaElement.prototype &&
@@ -761,6 +782,20 @@ class MicPassthrough {
       return;
     }
     await this.start(micDeviceId, deviceIds);
+  }
+
+  getActiveMicId() {
+    if (!this.stream) return null;
+    const tracks = this.stream.getAudioTracks();
+    if (!tracks.length || tracks[0].readyState !== 'live') return null;
+    try {
+      const s = tracks[0].getSettings();
+      return s && s.deviceId ? s.deviceId : '';
+    } catch (_) { return null; }
+  }
+
+  getActiveSinkIds() {
+    return this.sinks.map((s) => s.deviceId || '');
   }
 }
 
