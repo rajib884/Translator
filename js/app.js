@@ -130,7 +130,12 @@ function wireSegmented(seg, onChange) {
   if (!seg) return;
   seg.addEventListener('click', (ev) => {
     const btn = ev.target.closest('.seg-opt');
+    // Three ways an option can be off-limits:
+    //  - btn.disabled  → individually marked unavailable (setOptionDisabled)
+    //  - seg.is-locked → whole control locked (segProxy.disabled, e.g. session running)
+    //  - already active → no-op, don't refire onChange
     if (!btn || btn.disabled) return;
+    if (seg.classList.contains('is-locked')) return;
     if (btn.classList.contains('is-active')) return;
     setSegValue(seg, btn.dataset.value);
     if (onChange) onChange(btn.dataset.value);
@@ -144,7 +149,26 @@ function segProxy(seg) {
     el: seg,
     get value() { return segValueOf(seg); },
     set value(v) { setSegValue(seg, v); },
-    set disabled(d) { if (seg) seg.classList.toggle('is-locked', !!d); },
+    // Locking the whole control (during a running session) must remove the
+    // options from the focus order and announce them as disabled to AT —
+    // .is-locked alone only stops pointer events, leaving the buttons tab-
+    // reachable and silently unresponsive. We deliberately use tabindex +
+    // aria-disabled rather than the DOM `disabled` attribute so the per-option
+    // disabled state (set by setOptionDisabled for e.g. unavailable PTT) is
+    // preserved across lock/unlock cycles.
+    set disabled(d) {
+      if (!seg) return;
+      seg.classList.toggle('is-locked', !!d);
+      for (const btn of seg.querySelectorAll('.seg-opt')) {
+        if (d) {
+          btn.setAttribute('aria-disabled', 'true');
+          btn.setAttribute('tabindex', '-1');
+        } else {
+          btn.removeAttribute('aria-disabled');
+          btn.removeAttribute('tabindex');
+        }
+      }
+    },
     get selectedOptions() {
       const btn = seg && seg.querySelector('.seg-opt.is-active');
       return btn ? [{ textContent: btn.textContent, value: btn.dataset.value }] : [];
@@ -1170,11 +1194,22 @@ async function closeSession(session) {
   if (state.activeSessionId === session.id) {
     state.activeSessionId = null;
     const next = state.sessions.values().next().value;
+    let focusTarget = null;
     if (next) {
       setActiveSession(next.id);
+      focusTarget = next.tabEl;
     } else {
       // No sessions left — create a fresh default from current UI state.
-      createNewSession({ activate: true });
+      const created = createNewSession({ activate: true });
+      focusTarget = created && created.tabEl;
+    }
+    // The element that previously held focus (the closed chip, or its ×
+    // button that just got detached) is gone. Without an explicit focus
+    // move, focus falls to <body> and keyboard navigation stalls. Use
+    // preventScroll so a closed tab on the right edge doesn't yank the
+    // tab strip around when the new active chip is much further left.
+    if (focusTarget) {
+      try { focusTarget.focus({ preventScroll: true }); } catch (_) {}
     }
   } else {
     saveSessions();
