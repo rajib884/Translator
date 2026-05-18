@@ -3576,19 +3576,45 @@ class PipController {
         flex: 1; min-height: 0; display: flex; flex-direction: column;
       }
 
-      /* State-driven background tints. Applied to body via setEffectiveStatus.
-         Each state pulls toward the corresponding semantic colour at low
-         opacity so the PIP visibly shifts (calm green while listening,
-         lit-up while speaking, amber on reconnect, red on error). */
-      body.pip-state-idle         { background: ${palette.bg0}; }
-      body.pip-state-connecting   { background: color-mix(in srgb, ${palette.warn}   12%, ${palette.bg0}); }
-      body.pip-state-connected    { background: color-mix(in srgb, ${palette.good}   10%, ${palette.bg0}); }
-      body.pip-state-translating  { background: color-mix(in srgb, ${palette.accent} 18%, ${palette.bg0}); }
-      body.pip-state-queued       { background: color-mix(in srgb, ${palette.accent2} 12%, ${palette.bg0}); }
-      body.pip-state-waiting      { background: color-mix(in srgb, ${palette.warn}   10%, ${palette.bg0}); }
-      body.pip-state-paused       { background: color-mix(in srgb, ${palette.warn}   12%, ${palette.bg0}); }
-      body.pip-state-reconnecting { background: color-mix(in srgb, ${palette.warn}   18%, ${palette.bg0}); }
-      body.pip-state-error        { background: color-mix(in srgb, ${palette.bad}    18%, ${palette.bg0}); }
+      /* State-driven background tints + a 4 px stripe along the top of the
+         body. The stripe is a *secondary* signal that doesn't depend on
+         hue discrimination — width and presence are enough to identify the
+         state even with significant colour-vision deficiency. Mix
+         percentages are deliberately high (25 – 50 %) so neighbouring
+         states are clearly distinct on the background alone.
+         The states are also placed on a lightness ladder (idle is darkest,
+         translating + error are brightest) so even a desaturated view shows
+         meaningful contrast. */
+      body {
+        --pip-state-accent: transparent;
+        --pip-state-mix: 0%;
+        background: ${palette.bg0};
+      }
+      body::before {
+        content: '';
+        position: fixed; top: 0; left: 0; right: 0;
+        height: 4px;
+        background: var(--pip-state-accent);
+        z-index: 100;
+        transition: background 0.25s ease;
+        pointer-events: none;
+      }
+      body:not(.pip-state-idle) {
+        background: color-mix(in srgb, var(--pip-state-accent) var(--pip-state-mix), ${palette.bg0});
+      }
+
+      body.pip-state-idle         { --pip-state-accent: ${palette.line};   --pip-state-mix: 0%; }
+      /* Cool / cold side: ready, queued, waiting — all blue-ish + dim. */
+      body.pip-state-waiting      { --pip-state-accent: #38bdf8;           --pip-state-mix: 22%; } /* cyan, dim */
+      body.pip-state-queued       { --pip-state-accent: ${palette.accent2}; --pip-state-mix: 32%; } /* violet */
+      body.pip-state-connected    { --pip-state-accent: ${palette.good};   --pip-state-mix: 28%; } /* green */
+      /* Transitional warm: connecting, paused. */
+      body.pip-state-paused       { --pip-state-accent: #94a3b8;           --pip-state-mix: 28%; } /* slate */
+      body.pip-state-connecting   { --pip-state-accent: ${palette.warn};   --pip-state-mix: 30%; } /* amber */
+      /* High-attention: speaking + reconnecting + error are the brightest. */
+      body.pip-state-reconnecting { --pip-state-accent: #fb923c;           --pip-state-mix: 45%; } /* orange */
+      body.pip-state-translating  { --pip-state-accent: ${palette.accent}; --pip-state-mix: 50%; } /* bright blue */
+      body.pip-state-error        { --pip-state-accent: ${palette.bad};    --pip-state-mix: 55%; } /* red */
     `;
     doc.head.appendChild(style);
 
