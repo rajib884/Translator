@@ -43,6 +43,33 @@ const COMPANION_HTTP_URL = 'http://127.0.0.1:52341';
 const COMPANION_WS_URL = 'ws://127.0.0.1:52341/audio';
 const COMPANION_PTT_URL = 'ws://127.0.0.1:52341/hotkey';
 
+// All user-facing hint strings live here so a content review can read the
+// whole vocabulary in one place. Some hints depend on multiple state inputs
+// (e.g. audio source availability) and are expressed as small selectors that
+// take those inputs and return a string.
+const HINTS = {
+  mode: {
+    audio:      'Translates speech into both text and spoken audio.',
+    text:       'Translates speech into text only (spoken audio discarded).',
+    transcribe: 'Transcribes speech into text in the same language (no translation).',
+  },
+  dir: {
+    bidir:  'Translates both your speech and the other person\'s speech.',
+    oneway: 'Translates only your speech (useful for broadcasts).',
+  },
+  speechMode(mode, companionOk) {
+    if (!companionOk) return 'Push to talk needs the companion app running.';
+    if (mode === 'ptt') return 'Hold the bound key while speaking. Release to let the model translate.';
+    return 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
+  },
+  audioSource(canDisplay, companionOk) {
+    if (!canDisplay && !companionOk) return 'App audio capture is unavailable. Start the companion service or use Chrome/Edge tab audio.';
+    if (companionOk)                  return 'Companion app detected. Use it for background app audio without screen sharing.';
+    if (!canDisplay)                  return 'Browser app audio capture is unsupported here. Start the companion service to use app audio.';
+    return 'Default microphone. Use app/tab audio in Chrome/Edge, or Companion app audio when the local service is running.';
+  },
+};
+
 const $ = (id) => document.getElementById(id);
 
 // ─── Segmented control helpers ───────────────────────────────────────────────
@@ -55,6 +82,17 @@ function segValueOf(seg) {
   return btn ? btn.dataset.value : '';
 }
 
+// Centralises option lookup so the rest of the helpers don't have to template
+// `value` into a CSS selector (which would need CSS.escape for arbitrary
+// inputs). Linear scan is fine — segmented groups are 2–4 options.
+function segOptByValue(seg, value) {
+  if (!seg) return null;
+  for (const btn of seg.querySelectorAll('.seg-opt')) {
+    if (btn.dataset.value === value) return btn;
+  }
+  return null;
+}
+
 function setSegValue(seg, value) {
   if (!seg) return;
   let foundActive = false;
@@ -65,7 +103,12 @@ function setSegValue(seg, value) {
     btn.setAttribute('aria-checked', isThis ? 'true' : 'false');
   }
   if (!foundActive) {
-    // Value not in the group — pick the first enabled option as a safe fallback.
+    // Surface the mismatch loudly during development — silently snapping to
+    // a fallback hides config bugs (typos in dataset.value, mismatched preset
+    // keys). Empty-string requests are intentional ("clear selection") and skip.
+    if (value !== undefined && value !== null && value !== '') {
+      console.warn(`[Translator] segmented control: no .seg-opt with data-value="${value}" — fell back to first enabled option.`);
+    }
     const first = seg.querySelector('.seg-opt:not([disabled])');
     if (first) {
       first.classList.add('is-active');
@@ -75,13 +118,12 @@ function setSegValue(seg, value) {
 }
 
 function setSegOptionDisabled(seg, value, disabled) {
-  if (!seg) return;
-  const btn = seg.querySelector(`.seg-opt[data-value="${value}"]`);
+  const btn = segOptByValue(seg, value);
   if (btn) btn.disabled = !!disabled;
 }
 
 function segOption(seg, value) {
-  return seg ? seg.querySelector(`.seg-opt[data-value="${value}"]`) : null;
+  return segOptByValue(seg, value);
 }
 
 function wireSegmented(seg, onChange) {
@@ -775,8 +817,62 @@ function keyLabelFromCode(code) {
   return map[code] || code;
 }
 
+// KeyboardEvent.code → Windows VK_* lookup. The companion's low-level keyboard
+// hook stores generic VK codes (VK_SHIFT, not VK_LSHIFT) so left/right
+// modifiers both map to the same value here. Anything missing (layout-specific
+// keys, OEM keys, language-specific composes) falls through to the legacy
+// keyCode path below — keyCode is deprecated and not portable across layouts,
+// but on Windows + US-ish layouts it lines up with VK_* by coincidence and is
+// good enough as a last-resort fallback for unmapped keys.
+const CODE_TO_VK = {
+  // Letters A-Z
+  KeyA: 0x41, KeyB: 0x42, KeyC: 0x43, KeyD: 0x44, KeyE: 0x45, KeyF: 0x46,
+  KeyG: 0x47, KeyH: 0x48, KeyI: 0x49, KeyJ: 0x4A, KeyK: 0x4B, KeyL: 0x4C,
+  KeyM: 0x4D, KeyN: 0x4E, KeyO: 0x4F, KeyP: 0x50, KeyQ: 0x51, KeyR: 0x52,
+  KeyS: 0x53, KeyT: 0x54, KeyU: 0x55, KeyV: 0x56, KeyW: 0x57, KeyX: 0x58,
+  KeyY: 0x59, KeyZ: 0x5A,
+  // Top-row digits
+  Digit0: 0x30, Digit1: 0x31, Digit2: 0x32, Digit3: 0x33, Digit4: 0x34,
+  Digit5: 0x35, Digit6: 0x36, Digit7: 0x37, Digit8: 0x38, Digit9: 0x39,
+  // Function keys
+  F1: 0x70, F2: 0x71, F3: 0x72, F4: 0x73, F5: 0x74, F6: 0x75,
+  F7: 0x76, F8: 0x77, F9: 0x78, F10: 0x79, F11: 0x7A, F12: 0x7B,
+  F13: 0x7C, F14: 0x7D, F15: 0x7E, F16: 0x7F, F17: 0x80, F18: 0x81,
+  F19: 0x82, F20: 0x83, F21: 0x84, F22: 0x85, F23: 0x86, F24: 0x87,
+  // Numpad
+  Numpad0: 0x60, Numpad1: 0x61, Numpad2: 0x62, Numpad3: 0x63, Numpad4: 0x64,
+  Numpad5: 0x65, Numpad6: 0x66, Numpad7: 0x67, Numpad8: 0x68, Numpad9: 0x69,
+  NumpadMultiply: 0x6A, NumpadAdd: 0x6B, NumpadSubtract: 0x6D,
+  NumpadDecimal: 0x6E, NumpadDivide: 0x6F, NumpadEnter: 0x0D,
+  // Modifiers — both sides collapse to the generic VK to match what the
+  // companion's GetAsyncKeyState comparison normalises to.
+  ShiftLeft: 0x10, ShiftRight: 0x10,
+  ControlLeft: 0x11, ControlRight: 0x11,
+  AltLeft: 0x12, AltRight: 0x12,
+  MetaLeft: 0x5B, MetaRight: 0x5C,
+  // Whitespace / navigation
+  Space: 0x20, Tab: 0x09, Enter: 0x0D, Escape: 0x1B, Backspace: 0x08,
+  CapsLock: 0x14, ScrollLock: 0x91, NumLock: 0x90, Pause: 0x13,
+  PrintScreen: 0x2C, ContextMenu: 0x5D,
+  Insert: 0x2D, Delete: 0x2E,
+  Home: 0x24, End: 0x23, PageUp: 0x21, PageDown: 0x22,
+  ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28,
+  // Punctuation (US layout — VK_OEM_* values; non-US layouts hit the
+  // keyCode fallback, which usually matches anyway).
+  Semicolon: 0xBA, Equal: 0xBB, Comma: 0xBC, Minus: 0xBD, Period: 0xBE,
+  Slash: 0xBF, Backquote: 0xC0, BracketLeft: 0xDB, Backslash: 0xDC,
+  BracketRight: 0xDD, Quote: 0xDE,
+};
+
 function bindingFromKeyboardEvent(ev) {
-  const vkCode = ev.keyCode || ev.which || 0;
+  const code = ev.code || '';
+  let vkCode = CODE_TO_VK[code];
+  if (vkCode === undefined) {
+    // Last-resort fallback. ev.keyCode is deprecated and layout-dependent,
+    // but tends to line up with Windows VK on Windows; better to bind
+    // something for unmapped keys than to refuse the bind entirely.
+    vkCode = ev.keyCode || ev.which || 0;
+  }
   if (!vkCode) return null;
   const isModifier = (vkCode === 0x10 || vkCode === 0x11 || vkCode === 0x12 ||
                       vkCode === 0x5B || vkCode === 0x5C);
@@ -787,7 +883,7 @@ function bindingFromKeyboardEvent(ev) {
     shift: !!ev.shiftKey,
     alt:   !!ev.altKey,
     win:   !!ev.metaKey,
-    label: keyLabelFromCode(ev.code || ''),
+    label: keyLabelFromCode(code),
   };
 }
 
@@ -834,13 +930,7 @@ function updateSpeechModeFields() {
   if (els.vadPttFields)  els.vadPttFields.style.display  = mode === 'ptt' ? '' : 'none';
 
   if (els.speechModeHint) {
-    if (!companionOk) {
-      els.speechModeHint.textContent = 'Push to talk needs the companion app running.';
-    } else if (mode === 'ptt') {
-      els.speechModeHint.textContent = 'Hold the bound key while speaking. Release to let the model translate.';
-    } else {
-      els.speechModeHint.textContent = 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
-    }
+    els.speechModeHint.textContent = HINTS.speechMode(mode, companionOk);
   }
   updatePttButton();
 }
@@ -1237,11 +1327,13 @@ function langName(code) {
 }
 
 // ─── System prompt resolution ────────────────────────────────────────────────
-function isBuiltinPromptTemplate(t) {
-  return t === GeminiLive.DEFAULT_SYSTEM_PROMPT_TEMPLATE ||
-         t === GeminiLive.ONE_WAY_SYSTEM_PROMPT_TEMPLATE ||
-         t === GeminiLive.TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE;
-}
+// Two-state model: state.systemPromptTemplate is either a user-saved string
+// (used verbatim, regardless of content) or null (use the mode default).
+// The old code value-compared saved prompts against builtins, which meant a
+// snapshot of yesterday's default could be silently treated as null today if
+// the constant changed — and the user would unknowingly switch to a different
+// system prompt at the next start. Explicit "Reset" sets null; "Save" saves
+// whatever is typed.
 
 function modeDefaultTemplate(mode, dir) {
   if (mode === 'transcribe') return GeminiLive.TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE;
@@ -1250,9 +1342,7 @@ function modeDefaultTemplate(mode, dir) {
 }
 
 function effectivePromptTemplateFor(mode, dir) {
-  const custom = state.systemPromptTemplate;
-  if (custom && !isBuiltinPromptTemplate(custom)) return custom;
-  return modeDefaultTemplate(mode, dir);
+  return state.systemPromptTemplate || modeDefaultTemplate(mode, dir);
 }
 function effectivePromptTemplate() {
   return effectivePromptTemplateFor(els.modeSelect.value, els.dirSelect.value);
@@ -1281,23 +1371,12 @@ function updateUIVisibility() {
   // Microphone: only for Mic or Mic+Tab sources
   els.micSection.style.display = (source === 'mic' || source === 'both') ? '' : 'none';
 
-  // Hints
-  if (els.modeHint) {
-    if (mode === 'audio') {
-      els.modeHint.textContent = 'Translates speech into both text and spoken audio.';
-    } else if (mode === 'text') {
-      els.modeHint.textContent = 'Translates speech into text only (spoken audio discarded).';
-    } else if (mode === 'transcribe') {
-      els.modeHint.textContent = 'Transcribes speech into text in the same language (no translation).';
-    }
+  // Hints (table in HINTS constant at the top of this file)
+  if (els.modeHint && HINTS.mode[mode]) {
+    els.modeHint.textContent = HINTS.mode[mode];
   }
-
   if (els.dirHint) {
-    if (els.dirSelect.value === 'bidir') {
-      els.dirHint.textContent = 'Translates both your speech and the other person\'s speech.';
-    } else {
-      els.dirHint.textContent = 'Translates only your speech (useful for broadcasts).';
-    }
+    els.dirHint.textContent = HINTS.dir[els.dirSelect.value] || HINTS.dir.bidir;
   }
 }
 
@@ -1362,15 +1441,8 @@ function updateAudioSourceAvailability() {
     els.audioSource.value = 'mic';
   }
 
-  if (!LiveAudio.canCaptureDisplayAudio() && !state.companionAvailable) {
-    els.audioHint.textContent = 'App audio capture is unavailable. Start the companion service or use Chrome/Edge tab audio.';
-  } else if (state.companionAvailable) {
-    els.audioHint.textContent = 'Companion app detected. Use it for background app audio without screen sharing.';
-  } else if (!LiveAudio.canCaptureDisplayAudio()) {
-    els.audioHint.textContent = 'Browser app audio capture is unsupported here. Start the companion service to use app audio.';
-  } else {
-    els.audioHint.textContent = 'Default microphone. Use app/tab audio in Chrome/Edge, or Companion app audio when the local service is running.';
-  }
+  els.audioHint.textContent = HINTS.audioSource(
+    LiveAudio.canCaptureDisplayAudio(), state.companionAvailable);
   updateCompanionAppVisibility();
 }
 
@@ -1988,11 +2060,11 @@ function flushPending(session) {
   if (session.pendingInput) {
     if (t.inputText === '') {
       t.inputEl.classList.remove('empty');
-      t.inputEl.firstChild.nodeValue = '';
+      t.inputTextNode.nodeValue = '';
       t.inputCaret.style.display = '';
     }
     t.inputText += session.pendingInput;
-    t.inputEl.firstChild.nodeValue = t.inputText;
+    t.inputTextNode.nodeValue = t.inputText;
     session.pendingInput = '';
     if (state.pip && isActive(session)) state.pip.setInput(t.inputText);
   }
@@ -2000,11 +2072,11 @@ function flushPending(session) {
     if (t.outputEl) {
       if (t.outputText === '') {
         t.outputEl.classList.remove('empty');
-        t.outputEl.firstChild.nodeValue = '';
+        t.outputTextNode.nodeValue = '';
         if (t.outputCaret) t.outputCaret.style.display = '';
       }
       t.outputText += session.pendingOutput;
-      t.outputEl.firstChild.nodeValue = t.outputText;
+      t.outputTextNode.nodeValue = t.outputText;
       if (state.pip && isActive(session)) state.pip.setOutput(t.outputText);
     }
     session.pendingOutput = '';
@@ -2032,12 +2104,17 @@ function ensureLiveTurn(session) {
   inLab.textContent = '🎙 ' + langName(session.config.source);
   const inText = document.createElement('span');
   inText.className = 'turn-text empty';
-  inText.appendChild(document.createTextNode('listening…'));
+  // Hold an explicit text-node reference so flushPending / finalizeTurn can
+  // mutate it without assuming a particular child order. The previous code
+  // relied on inText.firstChild — fragile if the empty-state placeholder were
+  // ever rendered differently.
+  const inTextNode = document.createTextNode('listening…');
+  inText.appendChild(inTextNode);
   const inCaret = document.createElement('span'); inCaret.className = 'caret'; inCaret.style.display = 'none';
   inText.appendChild(inCaret);
   inRow.appendChild(inLab); inRow.appendChild(inText);
 
-  let outText = null, outCaret = null;
+  let outText = null, outCaret = null, outTextNode = null;
   if (!isTranscribe) {
     const outRow = document.createElement('div');
     outRow.className = 'turn-row output';
@@ -2046,7 +2123,8 @@ function ensureLiveTurn(session) {
     outLab.textContent = '→ ' + langName(session.config.target);
     outText = document.createElement('span');
     outText.className = 'turn-text empty';
-    outText.appendChild(document.createTextNode('…'));
+    outTextNode = document.createTextNode('…');
+    outText.appendChild(outTextNode);
     outCaret = document.createElement('span'); outCaret.className = 'caret'; outCaret.style.display = 'none';
     outText.appendChild(outCaret);
     outRow.appendChild(outLab); outRow.appendChild(outText);
@@ -2065,6 +2143,8 @@ function ensureLiveTurn(session) {
     root,
     inputEl: inText,
     outputEl: outText,
+    inputTextNode: inTextNode,
+    outputTextNode: outTextNode,
     inputCaret: inCaret,
     outputCaret: outCaret,
     inputText: '',
@@ -2088,8 +2168,8 @@ function finalizeTurn(session) {
   const t = session.liveTurn;
   t.inputCaret.remove();
   if (t.outputCaret) t.outputCaret.remove();
-  if (!t.inputText.trim())  { t.inputEl.classList.add('empty');  t.inputEl.firstChild.nodeValue = '(silence)'; }
-  if (t.outputEl && !t.outputText.trim()) { t.outputEl.classList.add('empty'); t.outputEl.firstChild.nodeValue = '(no translation)'; }
+  if (!t.inputText.trim())  { t.inputEl.classList.add('empty');  t.inputTextNode.nodeValue = '(silence)'; }
+  if (t.outputEl && !t.outputText.trim()) { t.outputEl.classList.add('empty'); t.outputTextNode.nodeValue = '(no translation)'; }
   t.root.classList.remove('live');
   session.liveTurn = null;
 }
@@ -2556,15 +2636,23 @@ function openPromptEditor() {
 }
 function savePromptEditor() {
   const v = els.promptText.value.trim();
-  state.systemPromptTemplate = (v && !isBuiltinPromptTemplate(v)) ? v : null;
+  // Save verbatim. Empty trimmed value clears the override (same as Reset).
+  // No string-equality check with builtins — see the comment above
+  // effectivePromptTemplateFor for why that was removed.
+  state.systemPromptTemplate = v || null;
   savePrefs();
   closeSheet('prompt-sheet');
   log('info', state.systemPromptTemplate
-        ? 'System prompt updated (takes effect on next Start).'
-        : 'System prompt reset — using default for the current mode.');
+        ? 'Custom system prompt saved (takes effect on next Start).'
+        : 'System prompt cleared — using default for the current mode.');
 }
 function resetPromptEditor() {
-  els.promptText.value = modeDefaultTemplate(els.modeSelect.value, els.dirSelect.value);
+  // Explicit "use default" — drops any custom override and closes. The user
+  // can reopen to inspect the resolved default in the textarea.
+  state.systemPromptTemplate = null;
+  savePrefs();
+  closeSheet('prompt-sheet');
+  log('info', 'System prompt reset to default for the current mode.');
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
@@ -2967,6 +3055,24 @@ function wireUI() {
     if (state.pip) state.pip.close();
   });
   window.addEventListener('focus', () => detectCompanionService());
+
+  // Browsers auto-suspend AudioContexts when the tab is hidden long enough.
+  // Without an explicit resume, TTS output would stay silent and capture
+  // worklets would stop posting messages even after the user came back.
+  // Iterate every per-session context plus the global passthrough on each
+  // unhide; resume() is a no-op on already-running contexts.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    const ctxs = [];
+    for (const session of state.sessions.values()) {
+      if (session.player && session.player.ctx) ctxs.push(session.player.ctx);
+      if (session.capture && session.capture.ctx) ctxs.push(session.capture.ctx);
+    }
+    if (state.micPassthrough && state.micPassthrough.ctx) ctxs.push(state.micPassthrough.ctx);
+    for (const ctx of ctxs) {
+      if (ctx.state === 'suspended') { ctx.resume().catch(() => {}); }
+    }
+  });
 
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
     navigator.mediaDevices.addEventListener('devicechange', () => {

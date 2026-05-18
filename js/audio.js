@@ -1,6 +1,72 @@
 // Audio capture (mic and/or display) → 16 kHz Int16 PCM, and TTS playback (24 kHz Int16 PCM).
 // Pure browser. AudioWorklet loaded from a Blob URL so this works from file:// or any host.
 
+// ─── Shared level meter ──────────────────────────────────────────────────────
+// Three independent rAF loops (capture / companion / TTS) all wanted the same
+// pattern: per-frame exponential decay (~100 ms time constant), an external
+// peak pushed in from message callbacks or sampled from an analyser, and a
+// stop condition that either ends immediately (capture lost) or tails through
+// the decay so the meter fades smoothly when audio finishes (TTS).
+//
+// `isActive` returns true while the meter should keep ticking unconditionally.
+// `sampler` is an optional per-tick peak source (used by TTSPlayer to read the
+// analyser). `decayTail` keeps the loop running for the smooth fade-out — set
+// to Infinity for "stop the moment isActive flips false" (capture semantics).
+class LevelMeter {
+  constructor({ onLevel, isActive, sampler = null, decayTau = 0.1, decayTail = Infinity }) {
+    this.onLevel = onLevel || (() => {});
+    this.isActive = isActive || (() => false);
+    this.sampler = sampler;
+    this.decayTau = decayTau;
+    this.decayTail = decayTail;
+    this._level = 0;
+    this._rafId = 0;
+  }
+
+  // Push an externally observed peak; the next tick exponentially decays from
+  // this value (the highest wins over the decay).
+  push(peak) {
+    if (peak > this._level) this._level = peak;
+  }
+
+  get level() { return this._level; }
+
+  start() {
+    if (this._rafId) return;
+    let last = performance.now();
+    const tick = () => {
+      const now = performance.now();
+      const dt = Math.max(0, (now - last) / 1000);
+      last = now;
+
+      if (this.sampler) {
+        const peak = this.sampler();
+        if (peak > this._level) this._level = peak;
+        else this._level *= Math.exp(-dt / this.decayTau);
+      } else {
+        this._level *= Math.exp(-dt / this.decayTau);
+      }
+
+      this.onLevel(this._level);
+
+      if (this.isActive() || this._level > this.decayTail) {
+        this._rafId = requestAnimationFrame(tick);
+      } else {
+        this._rafId = 0;
+        this.onLevel(0);
+      }
+    };
+    this._rafId = requestAnimationFrame(tick);
+  }
+
+  stop() {
+    if (this._rafId) cancelAnimationFrame(this._rafId);
+    this._rafId = 0;
+    this._level = 0;
+    this.onLevel(0);
+  }
+}
+
 const PCM16_WORKLET_SRC = `
 class PCM16Processor extends AudioWorkletProcessor {
   constructor() {
@@ -82,15 +148,19 @@ registerProcessor('pcm16-processor', PCM16Processor);
 class AudioCapture {
   constructor({ onChunk, onLevel, onDisplayEnded } = {}) {
     this.onChunk = onChunk || (() => {});
-    this.onLevel = onLevel || (() => {});
     this.onDisplayEnded = onDisplayEnded || (() => {});
     this.ctx = null;
     this.streams = [];
     this.sources = [];
     this.node = null;
     this._workletUrl = null;
-    this._level = 0;
-    this._rafId = 0;
+    // Meter ticks while a worklet node exists; the moment capture is torn
+    // down, isActive flips false and the tail (Infinity) lets the loop end on
+    // the next frame with a final level=0 emission.
+    this._meter = new LevelMeter({
+      onLevel: onLevel || (() => {}),
+      isActive: () => !!this.node,
+    });
   }
 
   // mode: 'mic' | 'display' | 'both'
@@ -161,9 +231,7 @@ class AudioCapture {
       this.node.port.onmessage = (ev) => {
         const m = ev.data;
         if (m.type === 'audio') this.onChunk(m.buffer);
-        else if (m.type === 'level') {
-          if (m.level > this._level) this._level = m.level;
-        }
+        else if (m.type === 'level') this._meter.push(m.level);
       };
 
       // Connect every input stream to the same worklet — Web Audio sums them.
@@ -174,7 +242,7 @@ class AudioCapture {
       }
       // Worklet output isn't connected to destination — no monitor playback.
 
-      this._startMeter();
+      this._meter.start();
     } catch (e) {
       this._abortStart();
       throw e;
@@ -197,26 +265,7 @@ class AudioCapture {
       try { this.ctx.close(); } catch (_) {}
       this.ctx = null;
     }
-  }
-
-  _startMeter() {
-    if (this._rafId) return;
-    let last = performance.now();
-    const decayTau = 0.1;
-    const tick = () => {
-      const now = performance.now();
-      const dt = Math.max(0, (now - last) / 1000);
-      last = now;
-      this._level *= Math.exp(-dt / decayTau);
-      this.onLevel(this._level);
-      if (this.node) {
-        this._rafId = requestAnimationFrame(tick);
-      } else {
-        this._rafId = 0;
-        this.onLevel(0);
-      }
-    };
-    this._rafId = requestAnimationFrame(tick);
+    this._meter.stop();
   }
 
   _releaseStreams() {
@@ -235,25 +284,25 @@ class AudioCapture {
       URL.revokeObjectURL(this._workletUrl);
       this._workletUrl = null;
     }
-    if (this._rafId) cancelAnimationFrame(this._rafId);
-    this._rafId = 0;
-    this._level = 0;
-    this.onLevel(0);
     this.sources = [];
     this.node = null;
     this.ctx = null;
+    this._meter.stop();
   }
 }
 
 class CompanionAudioCapture {
   constructor({ onChunk, onLevel, onDisplayEnded } = {}) {
     this.onChunk = onChunk || (() => {});
-    this.onLevel = onLevel || (() => {});
     this.onDisplayEnded = onDisplayEnded || (() => {});
     this.ws = null;
-    this._level = 0;
-    this._rafId = 0;
     this._stopping = false;
+    // Tick while the WebSocket is alive; on close, snap level to 0 (same
+    // semantics as AudioCapture — meter dies with the input).
+    this._meter = new LevelMeter({
+      onLevel: onLevel || (() => {}),
+      isActive: () => !!this.ws,
+    });
   }
 
   async start({ wsUrl = 'ws://127.0.0.1:52341/audio' } = {}) {
@@ -265,7 +314,7 @@ class CompanionAudioCapture {
         settled = true;
         this._stopping = false;
         this.ws = ws;
-        this._startMeter();
+        this._meter.start();
         resolve();
       };
       ws.onerror = () => {
@@ -290,46 +339,20 @@ class CompanionAudioCapture {
       const a = Math.abs(pcm[i] / 32768);
       if (a > peak) peak = a;
     }
-    if (peak > this._level) this._level = peak;
-  }
-
-  _startMeter() {
-    if (this._rafId) return;
-    let last = performance.now();
-    // 100 ms time constant — reproduces the old *0.85/frame feel at 60 Hz
-    // but is independent of the display refresh rate.
-    const decayTau = 0.1;
-    const tick = () => {
-      const now = performance.now();
-      const dt = Math.max(0, (now - last) / 1000);
-      last = now;
-      this._level *= Math.exp(-dt / decayTau);
-      this.onLevel(this._level);
-      if (this.ws) {
-        this._rafId = requestAnimationFrame(tick);
-      } else {
-        this._rafId = 0;
-        this.onLevel(0);
-      }
-    };
-    this._rafId = requestAnimationFrame(tick);
+    this._meter.push(peak);
   }
 
   stop() {
     const ws = this.ws;
     this._stopping = true;
     this.ws = null;
-    if (this._rafId) cancelAnimationFrame(this._rafId);
-    this._rafId = 0;
-    this._level = 0;
-    this.onLevel(0);
+    this._meter.stop();
     try { ws && ws.close(); } catch (_) {}
   }
 }
 
 class TTSPlayer {
   constructor({ onLevel, onActiveChange, outputDeviceIds, outputDeviceId } = {}) {
-    this.onLevel = onLevel || (() => {});
     this.onActiveChange = onActiveChange || (() => {});
     this.outputDeviceIds = TTSPlayer._normalizeIds(
       Array.isArray(outputDeviceIds) ? outputDeviceIds : (outputDeviceId != null ? [outputDeviceId] : []));
@@ -343,14 +366,34 @@ class TTSPlayer {
     this.sinks = [];
     this.nextStart = 0;
     this.sources = new Set();
-    this._level = 0;
-    this._rafId = 0;
+    // Meter samples the analyser each tick (so the level reflects what's
+    // actually playing, not what's been scheduled). Keeps ticking while a
+    // BufferSource is queued OR until the level decays under decayTail — that
+    // way the fade-out is smooth after the model stops streaming.
+    this._meter = new LevelMeter({
+      onLevel: onLevel || (() => {}),
+      isActive: () => this.sources.size > 0,
+      sampler: () => this._sampleAnalyserPeak(),
+      decayTail: 0.005,
+    });
     // Serialises sink reconfiguration against chunk playback. _applyDevices
     // tears down and rebuilds the analyser→destination connections across
     // multiple awaits (setSinkId, play); a playChunk landing mid-window would
     // schedule a BufferSource into a disconnected graph and play silently.
     // playChunk awaits this queue so chunks always see a fully-connected sink.
     this._applyDevicesQueue = Promise.resolve();
+  }
+
+  _sampleAnalyserPeak() {
+    if (!this.analyser || !this._analyserBuf) return 0;
+    this.analyser.getFloatTimeDomainData(this._analyserBuf);
+    const buf = this._analyserBuf;
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const a = buf[i] < 0 ? -buf[i] : buf[i];
+      if (a > peak) peak = a;
+    }
+    return peak;
   }
 
   // Strip empties to a single '' (default), de-dupe, and keep order.
@@ -504,7 +547,7 @@ class TTSPlayer {
     this.sources.add(src);
     if (wasIdle) {
       this.onActiveChange(true);
-      this._startMeter();
+      this._meter.start();
     }
     src.onended = () => {
       this.sources.delete(src);
@@ -515,48 +558,12 @@ class TTSPlayer {
     };
   }
 
-  _startMeter() {
-    if (this._rafId) return;
-    let last = performance.now();
-    const decayTau = 0.1;
-    const tick = () => {
-      const now = performance.now();
-      const dt = Math.max(0, (now - last) / 1000);
-      last = now;
-
-      // Sample the actual output, not the queued chunks.
-      let peak = 0;
-      if (this.analyser && this._analyserBuf) {
-        this.analyser.getFloatTimeDomainData(this._analyserBuf);
-        const buf = this._analyserBuf;
-        for (let i = 0; i < buf.length; i++) {
-          const a = buf[i] < 0 ? -buf[i] : buf[i];
-          if (a > peak) peak = a;
-        }
-      }
-
-      if (peak > this._level) this._level = peak;
-      else this._level *= Math.exp(-dt / decayTau);
-
-      this.onLevel(this._level);
-      // Keep ticking while audio is scheduled OR still ringing out in the meter.
-      if (this.sources.size > 0 || this._level > 0.005) {
-        this._rafId = requestAnimationFrame(tick);
-      } else {
-        this._rafId = 0;
-        this.onLevel(0);
-      }
-    };
-    this._rafId = requestAnimationFrame(tick);
-  }
-
   hush() {
     for (const s of this.sources) { try { s.stop(); } catch (_) {} }
     this.sources.clear();
     this.nextStart = 0;
-    this._level = 0;
     this.onActiveChange(false);
-    this.onLevel(0);
+    this._meter.stop();
   }
 
   isActive() {
@@ -566,8 +573,6 @@ class TTSPlayer {
 
   destroy() {
     this.hush();
-    if (this._rafId) cancelAnimationFrame(this._rafId);
-    this._rafId = 0;
     this._tearDownSinks();
     try { this.ctx && this.ctx.close(); } catch (_) {}
     this.outputNode = null;

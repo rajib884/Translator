@@ -2,9 +2,17 @@
 // Setup, audio in/out, transcripts, sliding-window context, and proactive
 // GoAway reconnect with session resumption.
 
-const LIVE_URL = (apiKey) =>
-  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=' +
-  encodeURIComponent(apiKey);
+const DEFAULT_ENDPOINT =
+  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+
+// Build the connection URL. Callers can pass a custom endpoint via the
+// constructor (proxy in front of Google's edge, regional override, mock for
+// tests, etc.) — falls back to DEFAULT_ENDPOINT otherwise.
+function buildLiveUrl(endpoint, apiKey) {
+  const base = endpoint || DEFAULT_ENDPOINT;
+  const sep = base.indexOf('?') === -1 ? '?' : '&';
+  return base + sep + 'key=' + encodeURIComponent(apiKey);
+}
 
 const DEFAULT_MODEL = 'models/gemini-3.1-flash-live-preview';
 const GOAWAY_SAFETY_MS = 2000;
@@ -80,6 +88,9 @@ class GeminiLiveClient {
   constructor(opts) {
     this.apiKey = opts.apiKey;
     this.model = opts.model || DEFAULT_MODEL;
+    // Optional endpoint override — useful for proxies, regional endpoints, or
+    // a local mock. The api key is appended as a query param by buildLiveUrl.
+    this.endpoint = opts.endpoint || DEFAULT_ENDPOINT;
     this.voice = opts.voice || 'Zephyr';
     this.systemInstruction = opts.systemInstruction || '';
     this.useOutputTranscription = opts.useOutputTranscription !== false;
@@ -152,7 +163,7 @@ class GeminiLiveClient {
     }
     this._setupComplete = false;
     try {
-      this.ws = new WebSocket(LIVE_URL(this.apiKey));
+      this.ws = new WebSocket(buildLiveUrl(this.endpoint, this.apiKey));
     } catch (e) {
       this.onLog('error', 'WebSocket construct failed: ' + e.message);
       this._setState('error');
@@ -376,6 +387,7 @@ class GeminiLiveClient {
 
 window.GeminiLive = {
   GeminiLiveClient,
+  DEFAULT_ENDPOINT,
   DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   ONE_WAY_SYSTEM_PROMPT_TEMPLATE,
   TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE,
