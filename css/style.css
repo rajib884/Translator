@@ -210,6 +210,8 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
 .pill-listening .dot { background: var(--good); animation: pulse 1.6s infinite; }
 .pill-translating .dot { background: var(--accent); animation: pulse 0.8s infinite; }
 .pill-reconnecting .dot { background: var(--warn); animation: pulse 0.6s infinite; }
+.pill-switching { color: var(--warn); }
+.pill-switching .dot { background: var(--warn); animation: pulse 1.0s infinite; }
 .pill-paused { color: var(--warn); }
 .pill-paused .dot { background: var(--warn); }
 .pill-waiting { color: var(--warn); }

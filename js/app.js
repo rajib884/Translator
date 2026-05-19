@@ -274,6 +274,7 @@ class Session {
     this.capture = null;           // AudioCapture | CompanionAudioCapture
     this.player = null;            // TTSPlayer | null (text/transcribe modes)
     this.resumeHandle = null;      // Latest Gemini Live resumption handle
+    this.switching = false;        // True from GoAway received → setupComplete
 
     this.running = false;
     this.paused = false;
@@ -2671,6 +2672,7 @@ const STATUS_DEF = {
   connected:    { cls: 'pill-listening',    label: () => 'Listening' },
   translating:  { cls: 'pill-translating',  label: () => 'Speaking' },
   reconnecting: { cls: 'pill-reconnecting', label: () => 'Reconnect' },
+  switching:    { cls: 'pill-switching',    label: () => 'Switching' },
   error:        { cls: 'pill-error',        label: () => 'Error' },
   paused:       { cls: 'pill-paused',       label: () => 'Paused' },
   queued:       { cls: 'pill-queued',       label: () => 'Queued' },
@@ -2695,6 +2697,12 @@ function effectiveStatus(session) {
       session.config && session.config.pttMode === 'ptt' && !session.pttHeld) {
     return 'waiting';
   }
+  // Switching: the server announced an imminent disconnect via GoAway and we
+  // are about to swap to a new WebSocket on the next resumable handle. Up to
+  // ~2s of mic audio may be lost during the swap — surface this so the user
+  // doesn't speak through the gap unaware. Sits below user-driven overlays
+  // (paused, waiting) but above the regular connection state.
+  if (session.switching) return 'switching';
   return session.status;
 }
 
@@ -3089,6 +3097,10 @@ async function startSession(session) {
         setSessionStatus(session, s);
       }
     },
+    onSwitching: (on) => {
+      session.switching = !!on;
+      refreshSessionDisplay(session);
+    },
     onLog: log,
   });
 
@@ -3209,10 +3221,13 @@ async function stopSession(session) {
   state.ttsCoordinator.unregister(session);
   if (state.pttClient) state.pttClient.unsubscribe(session.id);
   session.pttHeld = false;
-  if (session.client && session.client.resumeHandle) {
-    session.resumeHandle = session.client.resumeHandle;
-    saveSessions();
-  }
+  // Stop is a clean ending — drop the resume handle so the next Start opens
+  // a fresh session instead of silently resuming the prior conversation.
+  // (Real reconnects within a running session still resume via the client's
+  // in-memory handle; this only affects the *next* startSession.)
+  session.resumeHandle = null;
+  if (session.client) session.client.resumeHandle = null;
+  saveSessions();
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
   try { if (session.player) await session.player.destroy(); } catch (_) {}
@@ -3222,6 +3237,7 @@ async function stopSession(session) {
   session.currentAudioMode = '';
   session.running = false;
   session.paused = false;
+  session.switching = false;
   if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
   finalizeTurn(session);
   setSessionStatus(session, 'idle');
@@ -3272,6 +3288,8 @@ function forceResetActiveSession() {
   log('warn', 'Force reconnect: clearing resume handle and dropping WebSocket.');
   session.resumeHandle = null;
   session.client.resumeHandle = null;
+  session.switching = false;
+  refreshSessionDisplay(session);
   saveSessions();
   session.client.forceCloseWebSocket(4001, 'user-reset');
 }
@@ -3979,6 +3997,7 @@ class PipController {
       body.pip-state-paused       { --pip-state-accent: #94a3b8;           --pip-state-mix: 28%; } /* slate */
       body.pip-state-connecting   { --pip-state-accent: ${palette.warn};   --pip-state-mix: 30%; } /* amber */
       /* High-attention: speaking + reconnecting + error are the brightest. */
+      body.pip-state-switching    { --pip-state-accent: ${palette.warn};   --pip-state-mix: 38%; } /* amber — server signaled imminent renewal */
       body.pip-state-reconnecting { --pip-state-accent: #fb923c;           --pip-state-mix: 45%; } /* orange */
       body.pip-state-translating  { --pip-state-accent: ${palette.accent}; --pip-state-mix: 50%; } /* bright blue */
       body.pip-state-error        { --pip-state-accent: ${palette.bad};    --pip-state-mix: 55%; } /* red */
