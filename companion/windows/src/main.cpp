@@ -860,9 +860,22 @@ std::string serialize_apps(const std::vector<AppInfo>& apps) {
 // connection that has a matching binding, sending {"event":"down"} on press
 // and {"event":"up"} on release. The hook fires regardless of which window
 // has focus — that's the whole point of using the companion process.
+//
+// Exclusive capture (opt-in via `"exclusive":true` in the bind message): when
+// set and the bound vkCode matches (with modifiers on DOWN), the hook returns
+// non-zero so the event is dropped before any other app sees it. Only the
+// bound *main* key is swallowed; modifier keys themselves (bare Ctrl/Shift/
+// Alt/Win events) always pass through, so shortcuts like Ctrl+C keep working.
+// Default is non-exclusive: clients observe the key without consuming it,
+// matching pre-toggle behaviour. When all pages with bindings close, the
+// connections are removed and the hook falls through normally, restoring
+// default keyboard behaviour.
 struct HotkeyBinding {
   DWORD vkCode = 0;
   bool ctrl = false, shift = false, alt = false, win = false;
+  // When true, the hook swallows the bound key so other apps don't see it.
+  // Off by default — opt-in from the web client per bind message.
+  bool exclusive = false;
   std::atomic<bool> held{false};
 };
 
@@ -941,6 +954,7 @@ void hotkey_sender_loop(std::shared_ptr<HotkeyConnection> conn) {
 }
 
 LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+  bool suppress = false;
   if (nCode == HC_ACTION) {
     const KBDLLHOOKSTRUCT* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
@@ -961,14 +975,15 @@ LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
       for (auto& conn : snapshot) {
         if (!conn->alive.load()) continue;
         DWORD vk;
-        bool wantCtrl, wantShift, wantAlt, wantWin;
+        bool wantCtrl, wantShift, wantAlt, wantWin, wantExclusive;
         {
           std::lock_guard<std::mutex> bl(conn->bindMutex);
-          vk        = conn->binding.vkCode;
-          wantCtrl  = conn->binding.ctrl;
-          wantShift = conn->binding.shift;
-          wantAlt   = conn->binding.alt;
-          wantWin   = conn->binding.win;
+          vk            = conn->binding.vkCode;
+          wantCtrl      = conn->binding.ctrl;
+          wantShift     = conn->binding.shift;
+          wantAlt       = conn->binding.alt;
+          wantWin       = conn->binding.win;
+          wantExclusive = conn->binding.exclusive;
         }
         if (vk == 0) continue;
 
@@ -987,14 +1002,30 @@ LRESULT CALLBACK hotkey_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
           if (!conn->binding.held.exchange(true)) {
             queue_hotkey_event(conn, R"({"event":"down"})");
           }
+          // Swallow the key event so other apps never see it — but only when
+          // the client opted into exclusive capture. Only the bound main key
+          // is suppressed (Ctrl/Shift/Alt/Win pass through normally, because
+          // the hook never matches them as the vk for a chord), so common
+          // modifier-based shortcuts in other apps stay usable.
+          if (wantExclusive) suppress = true;
         } else {
           if (conn->binding.held.exchange(false)) {
             queue_hotkey_event(conn, R"({"event":"up"})");
+            // Pair the suppressed down with a suppressed up so the OS never
+            // sees a dangling release. If we weren't tracking this press as
+            // held (held was already false), the down wasn't ours either,
+            // so leave the up alone. Same exclusive-only gating as down.
+            if (wantExclusive) suppress = true;
           }
         }
       }
     }
   }
+  // Returning non-zero from a low-level hook tells the OS to drop the event
+  // before any other hook/app receives it. When no connection is bound (or
+  // the page is closed and all connections were removed), we always fall
+  // through to CallNextHookEx so the keyboard behaves normally.
+  if (suppress) return 1;
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
@@ -1129,16 +1160,18 @@ void hotkey_session_loop(SOCKET sock) {
 
     if (json_action_is(payload, "bind")) {
       std::lock_guard<std::mutex> bl(conn->bindMutex);
-      conn->binding.vkCode = json_int(payload, "vkCode", 0);
-      conn->binding.ctrl   = json_bool(payload, "ctrl");
-      conn->binding.shift  = json_bool(payload, "shift");
-      conn->binding.alt    = json_bool(payload, "alt");
-      conn->binding.win    = json_bool(payload, "win");
-      conn->binding.held   = false;
+      conn->binding.vkCode    = json_int(payload, "vkCode", 0);
+      conn->binding.ctrl      = json_bool(payload, "ctrl");
+      conn->binding.shift     = json_bool(payload, "shift");
+      conn->binding.alt       = json_bool(payload, "alt");
+      conn->binding.win       = json_bool(payload, "win");
+      conn->binding.exclusive = json_bool(payload, "exclusive");
+      conn->binding.held      = false;
     } else if (json_action_is(payload, "unbind")) {
       std::lock_guard<std::mutex> bl(conn->bindMutex);
-      conn->binding.vkCode = 0;
-      conn->binding.held = false;
+      conn->binding.vkCode    = 0;
+      conn->binding.exclusive = false;
+      conn->binding.held      = false;
     }
   }
 

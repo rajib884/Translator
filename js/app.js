@@ -241,6 +241,7 @@ const els = {
   btnResetPrompt:$('btn-reset-prompt'),
   btnPttKey:     $('btn-ptt-key'),
   btnPttClear:   $('btn-ptt-clear'),
+  pttExclusive:  $('ptt-exclusive'),
   pttKeyLabel:   $('ptt-key-label'),
   pttHint:       $('ptt-hint'),
   promptText:    $('prompt-text'),
@@ -620,11 +621,12 @@ class PttHotkeyClient {
     try {
       this.ws.send(JSON.stringify({
         action: 'bind',
-        vkCode: b.vkCode,
-        ctrl:   !!b.ctrl,
-        shift:  !!b.shift,
-        alt:    !!b.alt,
-        win:    !!b.win,
+        vkCode:    b.vkCode,
+        ctrl:      !!b.ctrl,
+        shift:     !!b.shift,
+        alt:       !!b.alt,
+        win:       !!b.win,
+        exclusive: !!b.exclusive,
       }));
     } catch (_) {}
   }
@@ -1068,6 +1070,12 @@ function updatePttButton() {
   if (els.btnPttClear) {
     els.btnPttClear.disabled = !state.pttBinding;
   }
+  if (els.pttExclusive) {
+    // Checkbox is only meaningful when there's a binding to capture. Reflect
+    // the saved flag (default false) and disable when no key is bound.
+    els.pttExclusive.disabled = !state.pttBinding;
+    els.pttExclusive.checked = !!(state.pttBinding && state.pttBinding.exclusive);
+  }
   if (els.pttHint) {
     const companionMissing = !state.companionAvailable;
     if (companionMissing) {
@@ -1121,8 +1129,11 @@ function beginPttCapture() {
 
   const finishCapture = (binding) => {
     finish();
-    state.pttBinding = binding;
-    if (state.pttClient) state.pttClient.setBinding(binding);
+    // Carry the previous exclusive preference forward across rebinds — the
+    // checkbox is about behavior, not about the specific key.
+    const exclusive = !!(state.pttBinding && state.pttBinding.exclusive);
+    state.pttBinding = Object.assign({}, binding, { exclusive });
+    if (state.pttClient) state.pttClient.setBinding(state.pttBinding);
     savePrefs();
     updatePttButton();
     log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
@@ -1166,8 +1177,9 @@ function beginPttCapture() {
 // for any direct callers (e.g. unit tests or future programmatic binds).
 function finishPttCapture(binding) {
   state.pttCapturing = false;
-  state.pttBinding = binding;
-  if (state.pttClient) state.pttClient.setBinding(binding);
+  const exclusive = !!(state.pttBinding && state.pttBinding.exclusive);
+  state.pttBinding = Object.assign({}, binding, { exclusive });
+  if (state.pttClient) state.pttClient.setBinding(state.pttBinding);
   savePrefs();
   updatePttButton();
   log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
@@ -4545,6 +4557,23 @@ function wireUI() {
   }
   if (els.btnPttClear) {
     els.btnPttClear.addEventListener('click', clearPttBinding);
+  }
+  if (els.pttExclusive) {
+    els.pttExclusive.addEventListener('change', () => {
+      if (!state.pttBinding) return;
+      state.pttBinding = Object.assign({}, state.pttBinding, {
+        exclusive: !!els.pttExclusive.checked,
+      });
+      savePrefs();
+      if (state.pttClient && state.pttClient.hasBinding()) {
+        // Push the updated binding through; the companion replaces the
+        // previous binding atomically when it sees a new bind frame.
+        state.pttClient.setBinding(state.pttBinding);
+      }
+      log('info', els.pttExclusive.checked
+        ? 'PTT key capture: exclusive (other apps will not see the key).'
+        : 'PTT key capture: shared (key still reaches other apps).');
+    });
   }
   if (els.companionApp) {
     els.companionApp.addEventListener('change', () => {

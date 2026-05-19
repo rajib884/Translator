@@ -742,6 +742,14 @@ textarea {
 }
 code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--bg-3); padding: 1px 5px; border-radius: 4px; }
 .hint { margin: 0; font-size: 11px; color: var(--fg-2); }
+.checkbox-row {
+  display: inline-flex; align-items: center; gap: 8px;
+  cursor: pointer; font-size: 12px; font-weight: 500;
+  text-transform: none; letter-spacing: normal; color: var(--fg-0);
+}
+.checkbox-row input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; }
+.checkbox-row:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.checkbox-row:has(input:disabled) input { cursor: not-allowed; }
 
 /* ─── Multi-device checkbox list ─── */
 .device-list {
