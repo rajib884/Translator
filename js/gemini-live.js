@@ -551,14 +551,15 @@ class GeminiLiveClient {
   }
 
   // Force-close the underlying WebSocket with a non-1000 code. shouldRun is
-  // unchanged, so the close triggers the normal reconnect ladder — useful to
-  // verify backoff + resume-handle behaviour without unplugging anything.
-  forceCloseWebSocket(code = 4000, reason = 'test force-close') {
+  // unchanged, so the close triggers the normal reconnect ladder. Used both
+  // by the test toolbar and by the PiP "force reconnect" action — the reason
+  // string distinguishes them in the log.
+  forceCloseWebSocket(code = 4000, reason = 'force-close') {
     if (!this.ws) {
       this.onLog('warn', 'forceCloseWebSocket ignored: no active WebSocket.');
       return;
     }
-    this.onLog('info', `[test] Force-closing WebSocket (${code} ${reason}).`);
+    this.onLog('info', `Force-closing WebSocket (${code} ${reason}).`);
     try { this.ws.close(code, reason); } catch (e) {
       this.onLog('warn', 'forceCloseWebSocket failed: ' + (e && e.message ? e.message : e));
     }

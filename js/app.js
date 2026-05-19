@@ -233,6 +233,7 @@ const els = {
   btnExportText: $('btn-export-text'),
   btnMenu:       $('btn-menu'),
   btnLog:        $('btn-log'),
+  btnForceReset: $('btn-force-reset'),
   btnPip:        $('btn-pip'),
   btnPipQuick:   $('btn-pip-quick'),
   btnEditPrompt: $('btn-edit-prompt'),
@@ -3258,6 +3259,23 @@ function setControlsLocked(locked) {
   // a session is running so the user can change the hotkey mid-session.
 }
 
+// Force-disconnect the active session's WebSocket and wipe its resume handle.
+// The reconnect ladder fires automatically and reopens as a fresh session
+// (no handle = new context). Destructive — loses all in-flight context.
+// Shared by the main page's "Force reconnect" button and the PiP header ↻.
+function forceResetActiveSession() {
+  const session = activeSession();
+  if (!session || !session.client) {
+    log('warn', 'No active session to force-reset.');
+    return;
+  }
+  log('warn', 'Force reconnect: clearing resume handle and dropping WebSocket.');
+  session.resumeHandle = null;
+  session.client.resumeHandle = null;
+  saveSessions();
+  session.client.forceCloseWebSocket(4001, 'user-reset');
+}
+
 function togglePause() {
   const session = activeSession();
   if (!session || !session.running) return;
@@ -3579,7 +3597,8 @@ const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
 
 class PipController {
   constructor({ onStart, onStop, onPause, onHush, onClear,
-                onCycleSession, onPttDown, onPttUp, onPrefsChange } = {}) {
+                onCycleSession, onPttDown, onPttUp, onPrefsChange,
+                onForceReset } = {}) {
     this.win = null;
     this.doc = null;
 
@@ -3602,6 +3621,7 @@ class PipController {
     this.onPttDown = onPttDown || (() => {});
     this.onPttUp   = onPttUp   || (() => {});
     this.onPrefsChange = onPrefsChange || (() => {});
+    this.onForceReset = onForceReset || (() => {});
     this.onClose = () => {};
 
     // Element references — set by _setup, nulled by _cleanup.
@@ -3778,6 +3798,11 @@ class PipController {
       .pip-iconbtn.pip-settings-toggle[data-open="true"] {
         background: ${palette.bg3}; color: ${palette.accent};
       }
+      /* Force-reconnect: warn tint hints at destructive action (loses model context). */
+      .pip-iconbtn.pip-reset { color: ${palette.warn}; }
+      .pip-iconbtn.pip-reset:hover:not(:disabled) {
+        background: ${palette.bg3}; color: ${palette.warn};
+      }
       .pip-iconbtn.is-hidden { display: none; }
 
       /* ─── Container-query responsive hiding ─────────────────────────
@@ -3787,6 +3812,7 @@ class PipController {
            ≤ 310px   brand wrap fully drops
            ≤ 270px   pill label drops (pill becomes just the dot)
            ≤ 240px   PTT button drops
+           ≤ 225px   force-reconnect button drops
            ≤ 210px   cycle button drops
          Settings cog + Start/Stop always remain — they're the essentials. */
       @container pip (max-width: 360px) {
@@ -3801,6 +3827,9 @@ class PipController {
       }
       @container pip (max-width: 240px) {
         .pip-iconbtn.pip-ptt { display: none; }
+      }
+      @container pip (max-width: 225px) {
+        .pip-iconbtn.pip-reset { display: none; }
       }
       @container pip (max-width: 210px) {
         .pip-iconbtn.pip-cycle { display: none; }
@@ -3974,6 +4003,10 @@ class PipController {
         <button class="pip-iconbtn pip-cycle is-hidden" id="pipBtnCycle"
                 type="button"
                 title="Switch session" aria-label="Switch session">⇆</button>
+        <button class="pip-iconbtn pip-reset" id="pipBtnForceReset"
+                type="button"
+                title="Force reconnect: drop the WebSocket and clear the resume handle. Starts a fresh model context."
+                aria-label="Force reconnect">↻</button>
         <button class="pip-iconbtn pip-settings-toggle" id="pipBtnSettingsToggle"
                 type="button" data-open="false"
                 title="Settings" aria-label="Settings"
@@ -4059,6 +4092,7 @@ class PipController {
     this.btnPauseEl = doc.getElementById('pipBtnPause');
     this.btnHushEl = doc.getElementById('pipBtnHush');
     this.btnClearEl = doc.getElementById('pipBtnClear');
+    this.btnForceResetEl = doc.getElementById('pipBtnForceReset');
     this.displaySegEl = doc.getElementById('pipDisplaySeg');
     this.fontDecEl = doc.getElementById('pipFontDec');
     this.fontIncEl = doc.getElementById('pipFontInc');
@@ -4098,6 +4132,7 @@ class PipController {
     this.btnPttEl.addEventListener('blur', pttUp);  // safety: window loses focus mid-hold
 
     this.btnCycleEl.addEventListener('click', () => this.onCycleSession());
+    this.btnForceResetEl.addEventListener('click', () => this.onForceReset());
     this.btnSettingsToggleEl.addEventListener('click', () => this.toggleSettingsPanel());
     btnSettingsCloseEl.addEventListener('click', () => this.closeSettingsPanel());
     this.settingsBackdropEl.addEventListener('click', () => this.closeSettingsPanel());
@@ -4362,6 +4397,7 @@ async function togglePip() {
       state.pipPrefs = Object.assign({}, state.pipPrefs || {}, prefs);
       savePrefs();
     },
+    onForceReset: forceResetActiveSession,
   });
   // Seed PIP-side state BEFORE open() so _setup paints with the user's saved
   // preferences instead of flashing the defaults for one frame.
@@ -4551,6 +4587,9 @@ function wireUI() {
 
   els.btnMenu.addEventListener('click', () => openSheet('sidebar'));
   els.btnLog.addEventListener('click', () => openSheet('log-sheet'));
+  if (els.btnForceReset) {
+    els.btnForceReset.addEventListener('click', forceResetActiveSession);
+  }
 
   // Dev test hooks in the Log sheet. Both operate on the active session's
   // live GeminiLive client; warn cleanly if there isn't one yet.
