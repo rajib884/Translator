@@ -258,6 +258,8 @@ const els = {
   log:           $('log'),
   btnTestGoaway: $('btn-test-goaway'),
   btnTestWsclose:$('btn-test-wsclose'),
+  btnLogExport:  $('btn-log-export'),
+  btnLogClear:   $('btn-log-clear'),
 };
 
 // ─── Session ─────────────────────────────────────────────────────────────────
@@ -2749,6 +2751,32 @@ function log(level, message) {
   els.log.scrollTop = els.log.scrollHeight;
 }
 
+// Dump the visible log lines (up to MAX_LOG) as a plain .txt file. Reads from
+// the DOM rather than a parallel buffer so what you download matches what you
+// see — and so the export honours the same ring-buffer trimming.
+function exportLog() {
+  const lines = Array.from(els.log.children).map((line) => {
+    const ts = line.querySelector('.ts')?.textContent || '';
+    const lv = line.querySelector('.level')?.textContent || '';
+    const msg = line.querySelector('.msg')?.textContent || '';
+    return `${ts} ${lv.padEnd(5)} ${msg}`;
+  });
+  if (lines.length === 0) {
+    log('warn', 'Log is empty — nothing to export.');
+    return;
+  }
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  a.href = url;
+  a.download = `translator-log_${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ─── Streaming transcripts: batch chunks per rAF ──────────────────────────────
 function scheduleFlush(session) {
   if (session.pendingScheduled) return;
@@ -4545,6 +4573,14 @@ function wireUI() {
       }
       session.client.forceCloseWebSocket(4000, 'test force-close');
     });
+  }
+  if (els.btnLogClear) {
+    els.btnLogClear.addEventListener('click', () => {
+      els.log.textContent = '';
+    });
+  }
+  if (els.btnLogExport) {
+    els.btnLogExport.addEventListener('click', exportLog);
   }
   els.btnEditPrompt.addEventListener('click', openPromptEditor);
   els.btnSavePrompt.addEventListener('click', savePromptEditor);

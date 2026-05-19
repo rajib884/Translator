@@ -128,17 +128,21 @@ class GeminiLiveClient {
 
   _setState(s) {
     if (this.state === s) return;
+    const prev = this.state;
     this.state = s;
+    this.onLog('info', `state: ${prev} → ${s}`);
     this.onState(s);
   }
 
   start() {
     if (this.shouldRun) return;
     this.shouldRun = true;
+    this.onLog('info', `start() model=${this.model} voice=${this.voice} manualVAD=${this.manualActivity} hasResumeHandle=${!!this.resumeHandle}`);
     this._connect();
   }
 
   stop() {
+    this.onLog('info', `stop() requested (state=${this.state}, hadWS=${!!this.ws}, setupComplete=${this._setupComplete})`);
     this.shouldRun = false;
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
@@ -162,6 +166,10 @@ class GeminiLiveClient {
       return;
     }
     this._setupComplete = false;
+    const endpointHost = (() => {
+      try { return new URL(this.endpoint).host; } catch (_) { return this.endpoint; }
+    })();
+    this.onLog('info', `WS connecting to ${endpointHost} (attempt ${this._reconnectAttempts + 1})`);
     try {
       this.ws = new WebSocket(buildLiveUrl(this.endpoint, this.apiKey));
     } catch (e) {
@@ -177,11 +185,12 @@ class GeminiLiveClient {
     this._setState('connecting');
     this.ws.onopen = () => this._onOpen();
     this.ws.onmessage = (ev) => this._onMessage(ev);
-    this.ws.onerror = () => this.onLog('error', 'WebSocket error');
+    this.ws.onerror = () => this.onLog('error', `WebSocket error (readyState=${this.ws ? this.ws.readyState : 'n/a'})`);
     this.ws.onclose = (ev) => this._onClose(ev);
   }
 
   _onOpen() {
+    this.onLog('info', 'WS open — sending setup');
     // gemini-3.1-flash-live-preview (and all native audio models) only support
     // AUDIO response modality. TEXT modality is not supported. To get a text
     // representation of the model's response, use outputAudioTranscription.
@@ -248,12 +257,26 @@ class GeminiLiveClient {
       // budget resets and the next disconnect starts at the base backoff.
       this._reconnectAttempts = 0;
       this._setState('connected');
-      this.onLog('info', 'Connected to Gemini Live');
+      this.onLog('info', `Connected to Gemini Live (resumed=${!!this.resumeHandle})`);
       return;
     }
 
     const sc = msg && msg.serverContent;
     if (sc) {
+      if (sc.interrupted) {
+        this.onLog('info', 'serverContent.interrupted');
+      }
+      if (sc.generationComplete) {
+        this.onLog('info', 'serverContent.generationComplete');
+      }
+      if (sc.groundingMetadata) {
+        const chunks = sc.groundingMetadata.groundingChunks?.length ?? 0;
+        this.onLog('info', `serverContent.groundingMetadata (${chunks} chunk${chunks === 1 ? '' : 's'})`);
+      }
+      if (sc.urlContextMetadata) {
+        const urls = sc.urlContextMetadata.urlMetadata?.length ?? 0;
+        this.onLog('info', `serverContent.urlContextMetadata (${urls} url${urls === 1 ? '' : 's'})`);
+      }
       if (sc.inputTranscription && sc.inputTranscription.text) {
         this.onInputChunk(sc.inputTranscription.text);
       }
@@ -270,14 +293,23 @@ class GeminiLiveClient {
           }
         }
       }
-      if (sc.turnComplete) this.onTurnComplete();
+      if (sc.turnComplete) {
+        this.onLog('info', 'serverContent.turnComplete');
+        this.onTurnComplete();
+      }
     }
 
     if (msg.sessionResumptionUpdate) {
       const u = msg.sessionResumptionUpdate;
       if (u.resumable && u.newHandle) {
         this.resumeHandle = u.newHandle;
+        this.onLog('info', `Resume handle received: ${u.newHandle}`);
         try { this.onResumeHandle(u.newHandle); } catch (_) {}
+      } else {
+        // Resumption is not possible at certain points (mid-generation, tool
+        // execution). The server still sends an update — log it so a missing
+        // handle near a disconnect isn't a mystery.
+        this.onLog('info', `sessionResumptionUpdate: not resumable at this point`);
       }
     }
 
@@ -290,6 +322,47 @@ class GeminiLiveClient {
       this._goAwayTimer = setTimeout(() => {
         if (this.ws) { try { this.ws.close(1000, 'goaway'); } catch (_) {} }
       }, delay);
+    }
+
+    // Tool-calling isn't enabled in our setup, but if Google ever ships it on
+    // by default — or someone adds tools to the setup payload — surface it
+    // loudly. Silently ignoring would leave the model waiting for a response
+    // that never comes.
+    if (msg.toolCall) {
+      const n = msg.toolCall.functionCalls?.length ?? 0;
+      const names = (msg.toolCall.functionCalls || [])
+        .map((c) => c.name || '?').join(', ');
+      this.onLog('warn', `toolCall received (${n} call${n === 1 ? '' : 's'}: ${names}) — not handled by this client.`);
+    }
+    if (msg.toolCallCancellation) {
+      const ids = (msg.toolCallCancellation.ids || []).join(', ');
+      this.onLog('warn', `toolCallCancellation received (ids: ${ids})`);
+    }
+
+    if (msg.usageMetadata) {
+      const u = msg.usageMetadata;
+      const parts = [
+        `total=${u.totalTokenCount ?? '?'}`,
+        `prompt=${u.promptTokenCount ?? '?'}`,
+        `response=${u.responseTokenCount ?? '?'}`,
+      ];
+      if (u.cachedContentTokenCount) parts.push(`cached=${u.cachedContentTokenCount}`);
+      if (u.thoughtsTokenCount)      parts.push(`thoughts=${u.thoughtsTokenCount}`);
+      if (u.toolUsePromptTokenCount) parts.push(`toolUse=${u.toolUsePromptTokenCount}`);
+      this.onLog('info', `usage: ${parts.join(' ')}`);
+    }
+
+    // Spot unrecognized top-level message types. The Live API is in preview
+    // and may add new ones — silently dropping them is how you end up debugging
+    // "the model went quiet" for an hour. Excludes the fields we handle above
+    // plus the always-allowed usageMetadata sidecar.
+    const KNOWN_FIELDS = new Set([
+      'setupComplete', 'serverContent', 'toolCall', 'toolCallCancellation',
+      'goAway', 'sessionResumptionUpdate', 'usageMetadata',
+    ]);
+    const unknown = Object.keys(msg).filter((k) => !KNOWN_FIELDS.has(k));
+    if (unknown.length) {
+      this.onLog('warn', `Unhandled server message field(s): ${unknown.join(', ')}`);
     }
   }
 
@@ -359,6 +432,8 @@ class GeminiLiveClient {
       const jitter = exp * 0.2;
       delay = Math.max(250, exp - jitter + Math.random() * jitter * 2);
     }
+    this.onLog('info',
+      `Reconnect scheduled in ${(delay / 1000).toFixed(1)}s (attempt ${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}${isClean ? ', clean' : ''})`);
     this._reconnectTimer = setTimeout(() => this._connect(), delay);
   }
 
@@ -391,12 +466,14 @@ class GeminiLiveClient {
   sendActivityStart() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this._setupComplete) return;
+    this.onLog('info', 'activityStart →');
     this.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
   }
 
   sendActivityEnd() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this._setupComplete) return;
+    this.onLog('info', 'activityEnd →');
     this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
   }
 
