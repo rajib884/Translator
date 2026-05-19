@@ -241,6 +241,8 @@ const els = {
   btnResetPrompt:$('btn-reset-prompt'),
   btnPttKey:     $('btn-ptt-key'),
   btnPttClear:   $('btn-ptt-clear'),
+  pttMode:       segProxy($('ptt-mode-segmented')),
+  pttModeHint:   $('ptt-mode-hint'),
   pttExclusive:  $('ptt-exclusive'),
   pttKeyLabel:   $('ptt-key-label'),
   pttHint:       $('ptt-hint'),
@@ -514,18 +516,39 @@ class PttHotkeyClient {
   constructor({ wsUrl }) {
     this.wsUrl = wsUrl;
     this.ws = null;
-    this.binding = null;          // {vkCode, ctrl, shift, alt, win, label}
+    this.binding = null;          // {vkCode, ctrl, shift, alt, win, label, exclusive, mode}
     this.subscribers = new Map(); // sessionId -> {onDown, onUp}
     this.connected = false;
     this._reconnectTimer = 0;
     this._wantConnect = false;
     this.onAvailabilityChange = () => {};
+    // Subscriber-facing "is mic engaged" state. In 'hold' mode this tracks the
+    // physical key (down = engaged, up = released). In 'toggle' mode it's a
+    // virtual state flipped on each physical key-down; physical key-ups are
+    // ignored.
     this._held = false;
+    this.mode = 'hold';           // 'hold' | 'toggle'
   }
 
   setBinding(binding) {
     this.binding = binding;
     this._sendBinding();
+  }
+
+  // 'hold'   — engage while the key is physically held (current default).
+  // 'toggle' — tap to engage, tap again to release; physical releases ignored.
+  setMode(mode) {
+    if (mode !== 'hold' && mode !== 'toggle') return;
+    if (mode === this.mode) return;
+    this.mode = mode;
+    // Releasing on mode change avoids a "stuck on" state if the user switches
+    // mid-press: e.g. toggle-mode-on then switch to hold while engaged would
+    // otherwise leave subscribers thinking the mic is still live with no
+    // physical release to bring it back down.
+    if (this._held) {
+      this._held = false;
+      this._broadcast('up');
+    }
   }
 
   clearBinding() {
@@ -576,12 +599,24 @@ class PttHotkeyClient {
       if (typeof ev.data !== 'string') return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
-      if (msg.event === 'down' && !this._held) {
-        this._held = true;
-        this._broadcast('down');
-      } else if (msg.event === 'up' && this._held) {
-        this._held = false;
-        this._broadcast('up');
+      if (msg.event === 'down') {
+        if (this.mode === 'toggle') {
+          // Each physical key-down flips the virtual state. Treat the flip
+          // as the corresponding subscriber event so the rest of the app
+          // doesn't need to know about toggle mode.
+          this._held = !this._held;
+          this._broadcast(this._held ? 'down' : 'up');
+        } else if (!this._held) {
+          this._held = true;
+          this._broadcast('down');
+        }
+      } else if (msg.event === 'up') {
+        // Toggle mode ignores physical releases; the next key-down is what
+        // ends the engaged state.
+        if (this.mode === 'hold' && this._held) {
+          this._held = false;
+          this._broadcast('up');
+        }
       }
     };
     this.ws.onerror = () => {};
@@ -1070,6 +1105,13 @@ function updatePttButton() {
   if (els.btnPttClear) {
     els.btnPttClear.disabled = !state.pttBinding;
   }
+  if (els.pttMode && els.pttMode.el) {
+    // Segmented control is only meaningful when there's a binding; lock it
+    // when no key is bound (matches the exclusive-checkbox treatment).
+    els.pttMode.disabled = !state.pttBinding;
+    const mode = (state.pttBinding && state.pttBinding.mode === 'toggle') ? 'toggle' : 'hold';
+    els.pttMode.value = mode;
+  }
   if (els.pttExclusive) {
     // Checkbox is only meaningful when there's a binding to capture. Reflect
     // the saved flag (default false) and disable when no key is bound.
@@ -1129,11 +1171,16 @@ function beginPttCapture() {
 
   const finishCapture = (binding) => {
     finish();
-    // Carry the previous exclusive preference forward across rebinds — the
-    // checkbox is about behavior, not about the specific key.
-    const exclusive = !!(state.pttBinding && state.pttBinding.exclusive);
-    state.pttBinding = Object.assign({}, binding, { exclusive });
-    if (state.pttClient) state.pttClient.setBinding(state.pttBinding);
+    // Carry the previous exclusive + mode preferences forward across rebinds
+    // — they're about behavior, not about the specific key.
+    const prev = state.pttBinding || {};
+    const exclusive = !!prev.exclusive;
+    const mode = prev.mode === 'toggle' ? 'toggle' : 'hold';
+    state.pttBinding = Object.assign({}, binding, { exclusive, mode });
+    if (state.pttClient) {
+      state.pttClient.setBinding(state.pttBinding);
+      state.pttClient.setMode(mode);
+    }
     savePrefs();
     updatePttButton();
     log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
@@ -1177,9 +1224,14 @@ function beginPttCapture() {
 // for any direct callers (e.g. unit tests or future programmatic binds).
 function finishPttCapture(binding) {
   state.pttCapturing = false;
-  const exclusive = !!(state.pttBinding && state.pttBinding.exclusive);
-  state.pttBinding = Object.assign({}, binding, { exclusive });
-  if (state.pttClient) state.pttClient.setBinding(state.pttBinding);
+  const prev = state.pttBinding || {};
+  const exclusive = !!prev.exclusive;
+  const mode = prev.mode === 'toggle' ? 'toggle' : 'hold';
+  state.pttBinding = Object.assign({}, binding, { exclusive, mode });
+  if (state.pttClient) {
+    state.pttClient.setBinding(state.pttBinding);
+    state.pttClient.setMode(mode);
+  }
   savePrefs();
   updatePttButton();
   log('info', 'Push-to-talk hotkey set to ' + vkLabel(binding));
@@ -4558,6 +4610,18 @@ function wireUI() {
   if (els.btnPttClear) {
     els.btnPttClear.addEventListener('click', clearPttBinding);
   }
+  if (els.pttMode && els.pttMode.el) {
+    els.pttMode.addEventListener('change', () => {
+      if (!state.pttBinding) return;
+      const mode = els.pttMode.value === 'toggle' ? 'toggle' : 'hold';
+      state.pttBinding = Object.assign({}, state.pttBinding, { mode });
+      savePrefs();
+      if (state.pttClient) state.pttClient.setMode(mode);
+      log('info', mode === 'toggle'
+        ? 'PTT mode: tap to toggle (key press starts/stops the mic).'
+        : 'PTT mode: hold to talk (mic engaged while key is held).');
+    });
+  }
   if (els.pttExclusive) {
     els.pttExclusive.addEventListener('change', () => {
       if (!state.pttBinding) return;
@@ -4928,7 +4992,10 @@ document.addEventListener('DOMContentLoaded', () => {
   // session starts. Apply any saved binding immediately; if no session is
   // active yet, the client stays disconnected until subscribe() arrives.
   state.pttClient = new PttHotkeyClient({ wsUrl: COMPANION_PTT_URL });
-  if (state.pttBinding) state.pttClient.setBinding(state.pttBinding);
+  if (state.pttBinding) {
+    state.pttClient.setBinding(state.pttBinding);
+    if (state.pttBinding.mode === 'toggle') state.pttClient.setMode('toggle');
+  }
   state.pttClient.onAvailabilityChange = () => updatePttButton();
   restoreSessionsFromStorage();
   detectCompanionService();

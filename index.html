@@ -183,6 +183,14 @@
               <p class="hint" id="ptt-hint">Companion app must be running. Hotkey is shared across all PTT sessions and works system-wide.</p>
             </div>
             <div class="field">
+              <label>Mode</label>
+              <div class="segmented" id="ptt-mode-segmented" role="radiogroup" aria-label="Push-to-talk mode">
+                <button class="seg-opt is-active" data-value="hold"   type="button" role="radio" aria-checked="true">Hold to talk</button>
+                <button class="seg-opt"           data-value="toggle" type="button" role="radio" aria-checked="false">Tap to toggle</button>
+              </div>
+              <p class="hint" id="ptt-mode-hint">Hold: speak while the key is pressed. Toggle: tap once to start, tap again to stop.</p>
+            </div>
+            <div class="field">
               <label class="checkbox-row">
                 <input type="checkbox" id="ptt-exclusive" />
                 <span>Capture key exclusively (block other apps)</span>
