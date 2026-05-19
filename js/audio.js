@@ -698,17 +698,41 @@ function canSelectOutputDevice() {
 // a virtual cable). Completely decoupled from translation sessions so the user
 // can stop/restart sessions without breaking their audio routing.
 class MicPassthrough {
-  constructor() {
+  constructor({ onLevel } = {}) {
+    this.onLevel = onLevel || (() => {});
     this.running = false;
     this.ctx = null;
     this.stream = null;
     this.source = null;
+    this.analyser = null;
+    this._analyserBuf = null;
     this.sinks = []; // { deviceId, streamDest, audioEl }
     // Diagnostic surface: warnings accumulate per start() and the caller
     // (applyPassthrough in app.js) drains and logs them. Previously these
     // errors were swallowed inside inner try/catches, so users had no idea
     // why one of their selected speakers wasn't receiving the mic.
     this.warnings = [];
+    // Live level meter. Drives the per-row pulse on .is-live-passthrough rows
+    // so the user can see real audio flowing (the previous version had no way
+    // to distinguish "routed" from "audio actually playing").
+    this._meter = new LevelMeter({
+      onLevel: (l) => this.onLevel(l),
+      isActive: () => this.running && this.sinks.length > 0,
+      sampler: () => this._samplePeak(),
+      decayTail: 0.005,
+    });
+  }
+
+  _samplePeak() {
+    if (!this.analyser || !this._analyserBuf) return 0;
+    this.analyser.getFloatTimeDomainData(this._analyserBuf);
+    const buf = this._analyserBuf;
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const a = buf[i] < 0 ? -buf[i] : buf[i];
+      if (a > peak) peak = a;
+    }
+    return peak;
   }
 
   async start(micDeviceId, deviceIds) {
@@ -720,7 +744,16 @@ class MicPassthrough {
       audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
     });
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
     this.source = this.ctx.createMediaStreamSource(this.stream);
+    // Side branch for level metering. The analyser doesn't sit in series with
+    // the destinations — both are independent fan-outs from `source` — so the
+    // analyser overhead can never affect what's actually routed to the sinks.
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.analyser.smoothingTimeConstant = 0;
+    this._analyserBuf = new Float32Array(this.analyser.fftSize);
+    this.source.connect(this.analyser);
 
     for (const id of deviceIds) {
       const dest = this.ctx.createMediaStreamDestination();
@@ -748,16 +781,29 @@ class MicPassthrough {
         }
         this.warnings.push({ deviceId: id, reason: `requested device unavailable (${(setSinkErr && setSinkErr.message) || 'setSinkId failed'}); fell back to system default` });
       }
-      try { await el.play(); }
-      catch (e) {
+      // CRITICAL: if play() is rejected (autoplay policy, sink busy, etc.) we
+      // must NOT push this sink as "live". The previous code recorded a
+      // warning but kept the dead sink — getActiveSinkIds then reported the
+      // device as routing audio when it wasn't, lighting up the "live" dot
+      // for a silent route. Now we tear the disconnected element down and
+      // skip it entirely; the warning still propagates to the caller.
+      try {
+        await el.play();
+      } catch (e) {
         this.warnings.push({ deviceId: resolvedId, reason: `autoplay blocked (${(e && e.message) || 'play() rejected'})` });
+        try { this.source.disconnect(dest); } catch (_) {}
+        el.srcObject = null;
+        continue;
       }
       this.sinks.push({ deviceId: resolvedId, streamDest: dest, audioEl: el });
     }
     this.running = this.sinks.length > 0;
+    if (this.running) this._meter.start();
+    else this.onLevel(0);
   }
 
   async stop() {
+    this._meter.stop();
     for (const s of this.sinks) {
       try { s.audioEl.pause(); } catch (_) {}
       s.audioEl.srcObject = null;
@@ -766,6 +812,9 @@ class MicPassthrough {
     this.sinks = [];
     try { this.source && this.source.disconnect(); } catch (_) {}
     this.source = null;
+    try { this.analyser && this.analyser.disconnect(); } catch (_) {}
+    this.analyser = null;
+    this._analyserBuf = null;
     if (this.stream) {
       this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
       this.stream = null;
@@ -773,6 +822,7 @@ class MicPassthrough {
     try { this.ctx && this.ctx.close(); } catch (_) {}
     this.ctx = null;
     this.running = false;
+    this.onLevel(0);
   }
 
   // Restarts with new settings. Cheap no-op when deviceIds is empty OR when

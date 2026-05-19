@@ -815,6 +815,24 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   background: var(--accent); margin-left: 4px;
   animation: live-pulse 1.6s ease-out infinite;
 }
+/* Live mic-level bar at the bottom of every row currently routing the mic.
+   Width is driven by the --pt-level CSS variable set from JS at rAF rate so
+   the user sees real audio flowing — solves "is it actually routing?". The
+   bar is rendered via a thin overlay on .device-option so it doesn't shift
+   layout when it appears/disappears. */
+.device-option { position: relative; }
+.device-option.is-live-passthrough::after {
+  content: '';
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 3px;
+  background: linear-gradient(to right,
+    var(--accent) 0%,
+    var(--accent) calc(var(--pt-level, 0%) - 1px),
+    transparent calc(var(--pt-level, 0%)),
+    transparent 100%);
+  transition: background 0.04s linear;
+  pointer-events: none;
+}
 .pt-icon svg { width: 18px; height: 18px; display: block; }
 .device-test {
   display: flex; align-items: center; justify-content: center;
@@ -829,6 +847,45 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .device-test:hover:not(:disabled),
 .device-test:active:not(:disabled) { background: var(--bg-2); color: var(--accent); }
 .device-test svg { width: 18px; height: 18px; display: block; }
+
+/* Speaker test "playing" state. Three signals so the user can't miss that the
+   test is actually firing:
+     1. The button background is tinted accent so the busy state is visible
+        even with the speaker icon's tiny silhouette.
+     2. The icon scales up and down on a soft pulse (matches the cadence of
+        the three-note arpeggio testOutputDevice plays).
+     3. An expanding ring radiates outward, the same "tap ripple" idiom users
+        already associate with audio actively emitting. */
+.device-test.is-playing {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+  position: relative; overflow: visible;
+  opacity: 1 !important;          /* override the :disabled dim */
+}
+.device-test.is-playing svg {
+  animation: speaker-pulse 0.5s ease-in-out infinite alternate;
+}
+.device-test.is-playing::after {
+  content: '';
+  position: absolute; inset: -2px;
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+  opacity: 0;
+  animation: speaker-ring 1.0s ease-out infinite;
+  pointer-events: none;
+}
+@keyframes speaker-pulse {
+  from { transform: scale(1);    }
+  to   { transform: scale(1.18); }
+}
+@keyframes speaker-ring {
+  0%   { transform: scale(0.85); opacity: 0.85; }
+  100% { transform: scale(1.45); opacity: 0;    }
+}
+@media (prefers-reduced-motion: reduce) {
+  .device-test.is-playing svg { animation: none; }
+  .device-test.is-playing::after { animation: none; opacity: 0.6; }
+}
 
 /* Shared checkbox overrides (undo the blanket input[type=text/password/number] rule) */
 .device-tts-label input[type=checkbox] {

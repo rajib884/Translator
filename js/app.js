@@ -618,7 +618,13 @@ const state = {
   sessions: new Map(),
   activeSessionId: null,
   ttsCoordinator: new TTSCoordinator(),
-  micPassthrough: new LiveAudio.MicPassthrough(),
+  micPassthrough: new LiveAudio.MicPassthrough({
+    // paintPassthroughLevel is hoisted (function declaration). Pushes the
+    // live mic peak into a CSS variable on each .is-live-passthrough row so
+    // the user can see audio actually flowing, not just a static "routed"
+    // indicator.
+    onLevel: (l) => paintPassthroughLevel(l),
+  }),
   // Lazily allocated InputPreview for the settings panel's mic visualizer.
   // Stays null until the user clicks the preview button.
   inputPreview: null,
@@ -2248,6 +2254,19 @@ function collectLiveDeviceState() {
   return { micIds, ttsIds, passthroughIds };
 }
 
+// Paints the current mic level (0..1) into the --pt-level CSS variable on
+// every .is-live-passthrough row, so the meter bar at the bottom of those
+// rows widens/narrows with the user's voice. Wired to MicPassthrough's
+// onLevel callback — fires at rAF rate via LevelMeter. Cheap when nothing
+// is live (querySelectorAll matches zero rows).
+function paintPassthroughLevel(level) {
+  if (!els.audioOutput) return;
+  const pct = levelToPct(level);
+  els.audioOutput
+    .querySelectorAll('.device-option.is-live-passthrough')
+    .forEach((row) => { row.style.setProperty('--pt-level', pct + '%'); });
+}
+
 // Paints the live indicators on the output-device list and the input dropdown.
 // Idempotent and cheap; safe to call on a timer or any event.
 function refreshActiveDeviceIndicators() {
@@ -2256,8 +2275,13 @@ function refreshActiveDeviceIndicators() {
   if (els.audioOutput) {
     els.audioOutput.querySelectorAll('.device-option').forEach((row) => {
       const id = row.dataset.deviceId || '';
+      const wasPt = row.classList.contains('is-live-passthrough');
+      const isPt = passthroughIds.has(id);
       row.classList.toggle('is-live-tts', ttsIds.has(id));
-      row.classList.toggle('is-live-passthrough', passthroughIds.has(id));
+      row.classList.toggle('is-live-passthrough', isPt);
+      // Zero out the level when a row drops out of live state so the meter
+      // bar doesn't freeze at its last value after passthrough is disabled.
+      if (wasPt && !isPt) row.style.setProperty('--pt-level', '0%');
     });
   }
 
@@ -4157,6 +4181,11 @@ function wireUI() {
     if (!btn || !els.audioOutput.contains(btn)) return;
     e.preventDefault();
     btn.disabled = true;
+    // Visual busy state: CSS animates the speaker icon while .is-playing is
+    // on, so the user has unambiguous feedback that the test is running.
+    // Previously the button just went disabled — easy to miss on a Bluetooth
+    // sink that takes 200 ms to wake up before producing sound.
+    btn.classList.add('is-playing');
     try {
       await testOutputDevice(btn.dataset.deviceId || '');
       const label = btn.getAttribute('aria-label').replace(/^Test\s+/, '');
@@ -4165,6 +4194,7 @@ function wireUI() {
       log('warn', 'Speaker test failed: ' + (err && err.message ? err.message : err));
     } finally {
       btn.disabled = false;
+      btn.classList.remove('is-playing');
     }
   });
   // API key is global, not per-session — savePrefs only. Listen on 'input' so
