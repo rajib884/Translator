@@ -184,8 +184,19 @@ body[data-ui-mode="simple"] .tab-chip {
 }
 /* Hide any non-active chip in simple mode — the user can only ever act on
    one session, and visually there should be just one "card" up there.
-   Switching to Advanced reveals the rest. */
+   Switching to Advanced or Full reveals the rest. */
 body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
+
+/* "Advanced" mode (data-ui-mode="mid") sits between Basic and Full. It
+   reveals the advanced-only chrome (audio source/output, speech detection,
+   bulk session actions) but still hides the .full-only sections — namely
+   the translation-mode/direction segmented controls and the system-prompt
+   editor — which would mostly only be useful to power users. */
+body[data-ui-mode="mid"] .full-only { display: none !important; }
+/* Simple also hides .full-only (.full-only is strictly more restrictive
+   than .advanced-only, so any element that's full-only should be hidden in
+   simple too, even when only one class is on it). */
+body[data-ui-mode="simple"] .full-only { display: none !important; }
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
@@ -633,6 +644,38 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 .section { display: flex; flex-direction: column; gap: 10px; }
 .section.actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .section.actions .btn { flex: 1 1 0; min-width: 90px; padding: 0 10px; }
+.section.actions .export-wrap { flex: 1 1 0; min-width: 90px; position: relative; display: flex; }
+.section.actions .export-wrap .btn { flex: 1 1 auto; min-width: 0; }
+
+/* Export popup menu — anchored to the Export button, opens upward so the
+   menu doesn't collide with the footer. Closed by clicking outside or
+   pressing Escape (see wireUI). */
+.export-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0; right: 0;
+  z-index: 60;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: fade-in 0.12s ease-out;
+}
+.export-menu[hidden] { display: none; }
+.export-item {
+  background: none; border: 0; cursor: pointer;
+  color: var(--fg-0);
+  font-size: 13px;
+  padding: 10px 12px;
+  text-align: left;
+  display: flex; align-items: center;
+  width: 100%;
+}
+.export-item:hover, .export-item:focus-visible { background: var(--bg-3); outline: none; }
+.export-item + .export-item { border-top: 1px solid var(--line); }
+
 .footer-hint { margin: 8px 0 0; font-size: 11px; color: var(--fg-2); text-align: center; }
 
 /* Generic sheets (prompt, log) */

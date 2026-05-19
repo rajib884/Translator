@@ -216,6 +216,7 @@ const els = {
   vadAutoFields: $('vad-auto-fields'),
   vadPttFields:  $('vad-ptt-fields'),
   vadPreset:     $('vad-preset'),
+  vadCustomFields: $('vad-custom-fields'),
   vadStart:      segProxy($('vad-start-segmented')),
   vadEnd:        segProxy($('vad-end-segmented')),
   vadPrefix:     $('vad-prefix'),
@@ -226,6 +227,8 @@ const els = {
   btnHush:       $('btn-hush'),
   btnPause:      $('btn-pause'),
   btnClear:      $('btn-clear'),
+  btnExport:     $('btn-export'),
+  exportMenu:    $('export-menu'),
   btnExportJson: $('btn-export-json'),
   btnExportText: $('btn-export-text'),
   btnMenu:       $('btn-menu'),
@@ -697,8 +700,13 @@ state.ttsCoordinator.onSpeakerStart = (sessionId) => {
   seedPipFromSession(session);
 };
 
+// Three UI modes (Basic / Advanced / Full) sorted by how much chrome they
+// expose. Used by setUIMode for validation and by requestUIModeChange to
+// detect "narrowing" transitions (which trigger a reset confirm).
+const UI_MODES = ['simple', 'mid', 'full'];
+
 function setUIMode(mode) {
-  if (mode !== 'simple' && mode !== 'advanced') mode = 'simple';
+  if (!UI_MODES.includes(mode)) mode = 'simple';
   state.uiMode = mode;
   document.body.dataset.uiMode = mode;
   if (els.modeSwitch) {
@@ -711,9 +719,19 @@ function setUIMode(mode) {
   savePrefs();
 }
 
-function resetAdvancedSettingsForBasic() {
+// Settings that only the "Full" mode exposes — translation mode, direction,
+// and the system-prompt override. Going Full → Advanced (mid) resets them so
+// hidden state can't keep affecting sessions in a way the user can't see.
+function resetFullOnlySettings() {
   els.modeSelect.value = 'audio';
   els.dirSelect.value = 'bidir';
+  state.systemPromptTemplate = null;
+}
+
+function resetAdvancedSettingsForBasic() {
+  // Includes the Full-only resets so the "narrow all the way" path doesn't
+  // skip any layer.
+  resetFullOnlySettings();
   els.audioSource.value = 'mic';
   els.audioInput.value = '';
   els.audioInput.dataset.preferred = '';
@@ -727,7 +745,6 @@ function resetAdvancedSettingsForBasic() {
     els.companionApp.value = '';
     els.companionApp.dataset.preferred = '';
   }
-  state.systemPromptTemplate = null;
   updateUIVisibility();
   updateAudioSourceAvailability();
   updateSpeechModeFields();
@@ -735,19 +752,42 @@ function resetAdvancedSettingsForBasic() {
   onSettingsChange();
 }
 
+function resetFullSettingsForAdvanced() {
+  resetFullOnlySettings();
+  updateUIVisibility();
+  onSettingsChange();
+}
+
 function requestUIModeChange(mode) {
   if (mode === state.uiMode) return;
-  if (mode === 'simple') {
+  // Narrowing transitions (the new mode is to the left of the current one)
+  // reset the now-hidden settings. Widening (e.g. simple → mid → full) is
+  // strictly additive and needs no reset/confirm.
+  const fromIdx = UI_MODES.indexOf(state.uiMode);
+  const toIdx   = UI_MODES.indexOf(mode);
+  const narrowing = toIdx >= 0 && fromIdx >= 0 && toIdx < fromIdx;
+
+  if (narrowing) {
     const session = activeSession();
     if (session && session.running) {
-      log('warn', 'Stop the active session before switching to Basic mode and resetting advanced settings.');
+      log('warn', 'Stop the active session before narrowing the UI mode and resetting settings.');
       return;
     }
-    const ok = window.confirm(
-      'Switch to Basic mode and reset advanced settings for the active session? ' +
-      'This restores voice translation, microphone input, Auto Detect, default devices, and the default prompt.');
-    if (!ok) return;
-    resetAdvancedSettingsForBasic();
+    if (mode === 'simple') {
+      const ok = window.confirm(
+        'Switch to Basic mode and reset advanced settings for the active session? ' +
+        'This restores voice translation, microphone input, Auto Detect, default devices, and the default prompt.');
+      if (!ok) return;
+      resetAdvancedSettingsForBasic();
+    } else if (mode === 'mid') {
+      // Full → Advanced: only the Full-only fields disappear. Reset just
+      // those (mode, direction, system prompt) so the active session can't
+      // keep using a configuration the user can no longer see.
+      const ok = window.confirm(
+        'Switch to Advanced mode and reset translation mode, direction, and system prompt to defaults?');
+      if (!ok) return;
+      resetFullSettingsForAdvanced();
+    }
   }
   setUIMode(mode);
 }
@@ -1284,7 +1324,10 @@ function createNewSession({ activate = true } = {}) {
   state.sessions.set(session.id, session);
   createSessionDOM(session);
   if (state.uiMode === 'simple' && state.sessions.size > 1) {
-    setUIMode('advanced');
+    // Promote to the lowest non-Basic mode that surfaces the tab strip
+    // affordances (close button, "+", multi-chip layout) so the new chip
+    // is actually visible. "mid" is enough — no need to jump to "full".
+    setUIMode('mid');
     log('info', 'Switched to Full mode so all sessions are visible.');
   }
   refreshAddSessionButton();
@@ -1603,6 +1646,15 @@ function updateUIVisibility() {
   if (els.dirHint) {
     els.dirHint.textContent = HINTS.dir[els.dirSelect.value] || HINTS.dir.bidir;
   }
+
+  // VAD detail fields (start/end sensitivity, prefix padding, silence ms)
+  // only matter when the user picks "Custom" — the named presets are
+  // self-explanatory and the numeric knobs just add visual clutter the rest
+  // of the time. Hidden fields still hold their values, so changing presets
+  // back and forth doesn't lose state.
+  if (els.vadCustomFields) {
+    els.vadCustomFields.style.display = (els.vadPreset && els.vadPreset.value === 'custom') ? '' : 'none';
+  }
 }
 
 // ─── VAD preset / advanced fields ────────────────────────────────────────────
@@ -1840,7 +1892,14 @@ function fillLanguages() {
       state.pipPrefs.fontStep = fs;
     }
   }
-  setUIMode(prefs.uiMode === 'advanced' ? 'advanced' : 'simple');
+  // Pref migration: pre-three-mode builds saved 'advanced' to mean "Full"
+  // (the only non-Basic mode at the time). After the Basic/Advanced/Full
+  // split, treat that legacy value as 'full'. New 'mid' value is only ever
+  // written by post-migration builds, so it's safe to pass through.
+  let savedMode = prefs.uiMode;
+  if (savedMode === 'advanced') savedMode = 'full';
+  if (!UI_MODES.includes(savedMode)) savedMode = 'simple';
+  setUIMode(savedMode);
 
   const urlKey = new URLSearchParams(location.search).get('api');
   if (urlKey) {
@@ -3361,6 +3420,32 @@ function conversationTurns(session) {
   return out;
 }
 
+// Export popup menu controls. The two format buttons (JSON / Text) used to
+// sit side-by-side eating real estate in the actions row; collapsing them
+// behind one Export button keeps the row scannable. The menu is dismissed
+// by outside-click (document-level listener installed in wireUI) and by
+// pressing Escape (global keydown handler in wireUI).
+function isExportMenuOpen() {
+  return !!(els.exportMenu && !els.exportMenu.hasAttribute('hidden'));
+}
+function openExportMenu() {
+  if (!els.exportMenu || !els.btnExport) return;
+  els.exportMenu.removeAttribute('hidden');
+  els.btnExport.setAttribute('aria-expanded', 'true');
+  // Move focus to the first menu item so keyboard users land somewhere usable.
+  const firstItem = els.exportMenu.querySelector('.export-item');
+  if (firstItem) firstItem.focus();
+}
+function closeExportMenu() {
+  if (!els.exportMenu || !els.btnExport) return;
+  if (!isExportMenuOpen()) return;
+  els.exportMenu.setAttribute('hidden', '');
+  els.btnExport.setAttribute('aria-expanded', 'false');
+}
+function toggleExportMenu() {
+  if (isExportMenuOpen()) closeExportMenu(); else openExportMenu();
+}
+
 function downloadText(filename, text, type) {
   const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
@@ -4311,8 +4396,23 @@ function wireUI() {
     log('info', 'Playback silenced');
   });
   els.btnClear.addEventListener('click', clearConversation);
-  els.btnExportJson.addEventListener('click', () => exportConversation('json'));
-  els.btnExportText.addEventListener('click', () => exportConversation('text'));
+  // Export now goes through a single button with a popup menu. The Export
+  // button toggles the menu; the menu items run the export AND close the
+  // menu. Outside-click + Escape (handled in the global keydown listener
+  // below) dismiss without exporting.
+  if (els.btnExport && els.exportMenu) {
+    els.btnExport.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      toggleExportMenu();
+    });
+    els.exportMenu.addEventListener('click', (ev) => {
+      // Stop propagation so the document-level close listener doesn't
+      // immediately dismiss the menu after a menuitem click.
+      ev.stopPropagation();
+    });
+  }
+  els.btnExportJson.addEventListener('click', () => { closeExportMenu(); exportConversation('json'); });
+  els.btnExportText.addEventListener('click', () => { closeExportMenu(); exportConversation('text'); });
   els.btnSwap.addEventListener('click', () => {
     const a = els.langSource.value;
     els.langSource.value = els.langTarget.value;
@@ -4337,11 +4437,13 @@ function wireUI() {
   });
   els.vadPreset.addEventListener('change', () => {
     if (els.vadPreset.value !== 'custom') applyVadPreset(els.vadPreset.value);
+    updateUIVisibility();
     onSettingsChange();
   });
   for (const el of [els.vadStart, els.vadEnd, els.vadPrefix, els.vadSilence]) {
     el.addEventListener('change', () => {
       els.vadPreset.value = detectVadPreset();
+      updateUIVisibility();
       onSettingsChange();
     });
   }
@@ -4546,6 +4648,14 @@ function wireUI() {
   // Generic sheet close handlers. Prompt-sheet additionally guards against
   // discarding unsaved edits — see confirmDiscardPromptEdits.
   document.addEventListener('click', (ev) => {
+    // Any click outside the export-menu / its trigger dismisses it. The
+    // menu's own click handler stopPropagation()s to avoid this firing on
+    // menuitem clicks (we want those to run the export AND close).
+    if (isExportMenuOpen()) {
+      const insideMenu = els.exportMenu && els.exportMenu.contains(ev.target);
+      const onTrigger = els.btnExport && els.btnExport.contains(ev.target);
+      if (!insideMenu && !onTrigger) closeExportMenu();
+    }
     const tgt = ev.target.closest('[data-close]');
     if (!tgt) return;
     const id = tgt.getAttribute('data-close');
@@ -4554,6 +4664,15 @@ function wireUI() {
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
+    // Export menu wins over sheets when both are open — it's the most
+    // recently-opened transient UI and closing it first matches user intent
+    // (and matches how native menus stack with dialogs).
+    if (isExportMenuOpen()) {
+      ev.preventDefault();
+      closeExportMenu();
+      if (els.btnExport) els.btnExport.focus();
+      return;
+    }
     // Close only the topmost open modal so layered sheets (e.g. Log opened
     // from inside Settings) close one at a time, matching native dialog UX.
     const id = topmostOpenSheet();
