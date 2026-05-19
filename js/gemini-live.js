@@ -124,6 +124,13 @@ class GeminiLiveClient {
     // drains; we log the first drop and every 50th to surface persistent
     // congestion without flooding the log.
     this._droppedFrames = 0;
+    // GoAway renewal bookkeeping. When the server warns us a disconnect is
+    // coming we don't close immediately — we wait for a "sweet spot" (end of
+    // turn, or a fresh resume handle during idle) and only fall back to the
+    // hard deadline if neither happens in time.
+    this._turnInFlight = false;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
   }
 
   _setState(s) {
@@ -132,6 +139,21 @@ class GeminiLiveClient {
     this.state = s;
     this.onLog('info', `state: ${prev} → ${s}`);
     this.onState(s);
+  }
+
+  // Close the current socket as part of a planned GoAway renewal. The
+  // _onClose reconnect ladder handles re-opening with the saved resume
+  // handle; we only need to clear the renewal bookkeeping here and pick a
+  // close reason that names the trigger so the log is self-explanatory.
+  _renewNow(reason) {
+    if (!this._goAwayPending) return;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this.onLog('info', `Renewing now (reason=${reason})`);
+    if (this.ws) {
+      try { this.ws.close(1000, 'goaway-renewal:' + reason); } catch (_) {}
+    }
   }
 
   start() {
@@ -152,6 +174,9 @@ class GeminiLiveClient {
     }
     this._setupComplete = false;
     this._reconnectAttempts = 0;
+    this._turnInFlight = false;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
     this._setState('idle');
   }
 
@@ -252,6 +277,7 @@ class GeminiLiveClient {
 
     if (msg.setupComplete !== undefined) {
       this._setupComplete = true;
+      this._turnInFlight = false;
       // Reaching setupComplete means the endpoint accepted our key and config.
       // Any future close is "happened after a working session", so the failure
       // budget resets and the next disconnect starts at the base backoff.
@@ -278,12 +304,15 @@ class GeminiLiveClient {
         this.onLog('info', `serverContent.urlContextMetadata (${urls} url${urls === 1 ? '' : 's'})`);
       }
       if (sc.inputTranscription && sc.inputTranscription.text) {
+        this._turnInFlight = true;
         this.onInputChunk(sc.inputTranscription.text);
       }
       if (sc.outputTranscription && sc.outputTranscription.text) {
+        this._turnInFlight = true;
         this.onOutputChunk(sc.outputTranscription.text);
       }
       if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
+        this._turnInFlight = true;
         for (const part of sc.modelTurn.parts) {
           if (part && part.inlineData && part.inlineData.data) {
             this.onAudio(part.inlineData.data);
@@ -294,8 +323,10 @@ class GeminiLiveClient {
         }
       }
       if (sc.turnComplete) {
+        this._turnInFlight = false;
         this.onLog('info', 'serverContent.turnComplete');
         this.onTurnComplete();
+        if (this._goAwayPending) this._renewNow('turnComplete');
       }
     }
 
@@ -305,6 +336,12 @@ class GeminiLiveClient {
         this.resumeHandle = u.newHandle;
         this.onLog('info', `Resume handle received: ${u.newHandle}`);
         try { this.onResumeHandle(u.newHandle); } catch (_) {}
+        // Idle sweet spot: GoAway is pending, no turn is in flight, and the
+        // server just gave us a fresh save point. Close now so we reconnect
+        // with the newest handle and the smallest possible context gap.
+        if (this._goAwayPending && !this._turnInFlight) {
+          this._renewNow('idle-handle');
+        }
       } else {
         // Resumption is not possible at certain points (mid-generation, tool
         // execution). The server still sends an update — log it so a missing
@@ -315,13 +352,24 @@ class GeminiLiveClient {
 
     if (msg.goAway) {
       const secs = parseDurationSecs(msg.goAway.timeLeft) || 5;
-      const delay = Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
-      this.onLog('warn', `GoAway received (${secs.toFixed(0)}s left), reconnecting in ${(delay / 1000).toFixed(0)}s`);
-      this._setState('reconnecting');
+      // Compute the absolute "must-close-by" wall-clock time. If a later
+      // GoAway arrives with more time, prefer the *later* deadline (the
+      // server is extending our grace period). Never shrink it.
+      const newDeadline = Date.now() + Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
+      const deadline = Math.max(this._goAwayDeadlineMs || 0, newDeadline);
+      this._goAwayDeadlineMs = deadline;
+      this._goAwayPending = true;
+      const untilSecs = Math.max(0, (deadline - Date.now()) / 1000);
+      this.onLog('warn',
+        `GoAway received (${secs.toFixed(0)}s left). Renewing at next sweet spot (deadline in ${untilSecs.toFixed(0)}s).`);
+      // We intentionally do NOT call _setState('reconnecting'): the WS is
+      // still open and translating fine until we actually close it. Flipping
+      // the pill to "Reconnect" right now would be a lie. The status only
+      // changes during the real close, which lasts ~1 second.
       if (this._goAwayTimer) clearTimeout(this._goAwayTimer);
       this._goAwayTimer = setTimeout(() => {
-        if (this.ws) { try { this.ws.close(1000, 'goaway'); } catch (_) {} }
-      }, delay);
+        if (this._goAwayPending) this._renewNow('deadline');
+      }, Math.max(0, deadline - Date.now()));
     }
 
     // Tool-calling isn't enabled in our setup, but if Google ever ships it on
@@ -372,6 +420,9 @@ class GeminiLiveClient {
     // below to decide whether a saved resume handle is likely stale.
     const closedBeforeSetup = !this._setupComplete;
     this._setupComplete = false;
+    this._turnInFlight = false;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog(ev.code === 1000 ? 'info' : 'warn',
       `WebSocket closed (${ev.code}${ev.reason ? ': ' + ev.reason : ''})`);

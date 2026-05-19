@@ -4561,7 +4561,7 @@ function wireUI() {
         log('warn', 'No active session to test. Start a session first.');
         return;
       }
-      session.client.simulateGoAway(3);
+      session.client.simulateGoAway(60);
     });
   }
   if (els.btnTestWsclose) {
