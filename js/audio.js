@@ -314,6 +314,14 @@ class AudioCapture {
       return s && s.deviceId ? s.deviceId : '';
     } catch (_) { return null; }
   }
+
+  // The raw display/tab audio MediaStream, if this capture is in display or
+  // both mode. Exposed so the passthrough can tap the original full-quality
+  // stream (pre-worklet downmix/downsample) and route it to virtual cables.
+  getDisplayStream() {
+    const entry = this.streams.find((x) => x.kind === 'display');
+    return entry ? entry.stream : null;
+  }
 }
 
 class CompanionAudioCapture {
@@ -705,9 +713,12 @@ function canSelectOutputDevice() {
 }
 
 // ─── Mic passthrough ─────────────────────────────────────────────────────────
-// Independently routes microphone audio to one or more output devices (e.g.
-// a virtual cable). Completely decoupled from translation sessions so the user
-// can stop/restart sessions without breaking their audio routing.
+// Independently routes microphone audio — and optionally tab/companion audio
+// from active sessions — to one or more output devices (e.g. a virtual cable).
+// The mic path is decoupled from translation sessions so the user can stop and
+// restart sessions without breaking their audio routing. Session-bound sources
+// (tab/companion) are added via attachStream / attachPcm16 and removed on
+// session stop; they mix into the same sinks as the mic.
 class MicPassthrough {
   constructor({ onLevel } = {}) {
     this.onLevel = onLevel || (() => {});
@@ -717,7 +728,17 @@ class MicPassthrough {
     this.source = null;
     this.analyser = null;
     this._analyserBuf = null;
+    // Single mix point: every source (mic, attached streams, attached PCM16)
+    // connects into _mixNode; each per-device MediaStreamDestination connects
+    // from _mixNode. This means sources can come and go without rewiring the
+    // sinks.
+    this._mixNode = null;
     this.sinks = []; // { deviceId, streamDest, audioEl }
+    // Source registries persist across stop()/start() cycles so the caller can
+    // attach sources before the passthrough is enabled (or while it's
+    // toggled off) and have them automatically wire in on next start().
+    this._attachedStreams = new Map(); // key -> { stream, source }
+    this._attachedPcm = new Map();     // key -> { sampleRate, nextStart, alive }
     // Diagnostic surface: warnings accumulate per start() and the caller
     // (applyPassthrough in app.js) drains and logs them. Previously these
     // errors were swallowed inside inner try/catches, so users had no idea
@@ -725,7 +746,8 @@ class MicPassthrough {
     this.warnings = [];
     // Live level meter. Drives the per-row pulse on .is-live-passthrough rows
     // so the user can see real audio flowing (the previous version had no way
-    // to distinguish "routed" from "audio actually playing").
+    // to distinguish "routed" from "audio actually playing"). Meters the mic
+    // input only — tab/companion mix in silently from the UI's perspective.
     this._meter = new LevelMeter({
       onLevel: (l) => this.onLevel(l),
       isActive: () => this.running && this.sinks.length > 0,
@@ -747,7 +769,7 @@ class MicPassthrough {
   }
 
   async start(micDeviceId, deviceIds) {
-    await this.stop();
+    await this.stop({ keepAttachments: true });
     this.warnings = [];
     if (!deviceIds || deviceIds.length === 0) return;
 
@@ -756,19 +778,37 @@ class MicPassthrough {
     });
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
+    // Per-context mix node: every source funnels through this. Sinks attach to
+    // it, so adding/removing tab or companion sources never touches the sink
+    // graph.
+    this._mixNode = this.ctx.createGain();
     this.source = this.ctx.createMediaStreamSource(this.stream);
-    // Side branch for level metering. The analyser doesn't sit in series with
-    // the destinations — both are independent fan-outs from `source` — so the
-    // analyser overhead can never affect what's actually routed to the sinks.
+    this.source.connect(this._mixNode);
+    // Side branch for level metering on the mic input only. Other attached
+    // sources mix in silently from the UI's perspective — the indicator still
+    // tracks the user's voice, which is what the visual was designed for.
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0;
     this._analyserBuf = new Float32Array(this.analyser.fftSize);
     this.source.connect(this.analyser);
 
+    // Wire any sources that were attached while the passthrough was off.
+    // Streams need a fresh MediaStreamSource (created in the new ctx); PCM
+    // entries just need their scheduling cursor reset.
+    for (const [, entry] of this._attachedStreams) {
+      try {
+        entry.source = this.ctx.createMediaStreamSource(entry.stream);
+        entry.source.connect(this._mixNode);
+      } catch (_) { entry.source = null; }
+    }
+    for (const [, entry] of this._attachedPcm) {
+      entry.nextStart = 0;
+    }
+
     for (const id of deviceIds) {
       const dest = this.ctx.createMediaStreamDestination();
-      this.source.connect(dest);
+      this._mixNode.connect(dest);
       const el = new Audio();
       el.autoplay = true;
       el.playsInline = true;
@@ -785,7 +825,7 @@ class MicPassthrough {
         catch (e2) {
           // Even default failed — drop this sink instead of silently keeping
           // a disconnected audio element around.
-          try { this.source.disconnect(dest); } catch (_) {}
+          try { this._mixNode.disconnect(dest); } catch (_) {}
           el.srcObject = null;
           this.warnings.push({ deviceId: id, reason: (e2 && e2.message) || (setSinkErr && setSinkErr.message) || 'setSinkId failed' });
           continue;
@@ -802,7 +842,7 @@ class MicPassthrough {
         await el.play();
       } catch (e) {
         this.warnings.push({ deviceId: resolvedId, reason: `autoplay blocked (${(e && e.message) || 'play() rejected'})` });
-        try { this.source.disconnect(dest); } catch (_) {}
+        try { this._mixNode.disconnect(dest); } catch (_) {}
         el.srcObject = null;
         continue;
       }
@@ -813,7 +853,12 @@ class MicPassthrough {
     else this.onLevel(0);
   }
 
-  async stop() {
+  // keepAttachments: when true, source registries survive (the AudioContext is
+  // torn down so per-context source nodes are dropped, but the MediaStreams
+  // and PCM-writer metadata remain). Used by start() so a routine restart
+  // (mic or sink list change) doesn't make session-attached tab/companion
+  // sources disappear from the passthrough.
+  async stop({ keepAttachments = false } = {}) {
     this._meter.stop();
     for (const s of this.sinks) {
       try { s.audioEl.pause(); } catch (_) {}
@@ -821,6 +866,23 @@ class MicPassthrough {
       try { s.streamDest.disconnect(); } catch (_) {}
     }
     this.sinks = [];
+    // Drop per-context source nodes for attached streams; the MediaStreams
+    // themselves are owned by the caller (the session's AudioCapture) and
+    // must not be stopped here. PCM scheduling state is per-context too —
+    // reset cursors so a fresh start() begins cleanly.
+    for (const [, entry] of this._attachedStreams) {
+      try { entry.source && entry.source.disconnect(); } catch (_) {}
+      entry.source = null;
+    }
+    for (const [, entry] of this._attachedPcm) {
+      entry.nextStart = 0;
+    }
+    if (!keepAttachments) {
+      this._attachedStreams.clear();
+      this._attachedPcm.clear();
+    }
+    try { this._mixNode && this._mixNode.disconnect(); } catch (_) {}
+    this._mixNode = null;
     try { this.source && this.source.disconnect(); } catch (_) {}
     this.source = null;
     try { this.analyser && this.analyser.disconnect(); } catch (_) {}
@@ -842,11 +904,81 @@ class MicPassthrough {
   // this short-circuit each refresh briefly silences the passthrough sink).
   async update(micDeviceId, deviceIds) {
     if (!deviceIds || deviceIds.length === 0) {
-      if (this.running) await this.stop();
+      if (this.running) await this.stop({ keepAttachments: true });
       return;
     }
     if (this.running && this._matchesActive(micDeviceId, deviceIds)) return;
     await this.start(micDeviceId, deviceIds);
+  }
+
+  // Register a session-bound MediaStream (tab/display audio) so it joins the
+  // passthrough mix. Idempotent: re-attaching with the same key swaps the
+  // stream. No-op if the passthrough isn't running; the registry entry will
+  // be wired the next time start() builds a graph.
+  attachStream(key, stream) {
+    if (!stream) return;
+    this.detachStream(key);
+    const entry = { stream, source: null };
+    this._attachedStreams.set(key, entry);
+    if (this.running && this.ctx && this._mixNode) {
+      try {
+        entry.source = this.ctx.createMediaStreamSource(stream);
+        entry.source.connect(this._mixNode);
+      } catch (_) { entry.source = null; }
+    }
+  }
+
+  detachStream(key) {
+    const entry = this._attachedStreams.get(key);
+    if (!entry) return;
+    try { entry.source && entry.source.disconnect(); } catch (_) {}
+    this._attachedStreams.delete(key);
+  }
+
+  // Register a PCM16 source (companion audio) at the given sample rate.
+  // Returns a writer { write(Int16Array), close() }. Each write schedules
+  // a one-shot BufferSource into the mix, scheduled back-to-back via
+  // nextStart so chunks play seamlessly. close() flags the entry inactive
+  // (already-scheduled chunks finish naturally) and removes it from the
+  // registry. Safe to write even when the passthrough is off — silently
+  // dropped until a start() wires the entry.
+  attachPcm16(key, sampleRate) {
+    this.detachPcm16(key);
+    const entry = { sampleRate, nextStart: 0, alive: true };
+    this._attachedPcm.set(key, entry);
+    return {
+      write: (int16) => this._writePcm16(key, int16),
+      close: () => this.detachPcm16(key),
+    };
+  }
+
+  detachPcm16(key) {
+    const entry = this._attachedPcm.get(key);
+    if (!entry) return;
+    entry.alive = false;
+    this._attachedPcm.delete(key);
+  }
+
+  _writePcm16(key, int16) {
+    const entry = this._attachedPcm.get(key);
+    if (!entry || !entry.alive) return;
+    if (!this.running || !this.ctx || !this._mixNode) return;
+    if (!int16 || !int16.length) return;
+    // Same scheduling pattern as TTSPlayer.playChunk: Int16 → Float32 →
+    // createBuffer at the source's native rate. Web Audio handles the
+    // resample to the context rate on the output side.
+    const float = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float[i] = int16[i] / 32768;
+    const buf = this.ctx.createBuffer(1, float.length, entry.sampleRate);
+    buf.copyToChannel(float, 0);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this._mixNode);
+    // 40ms scheduling lead-in matches TTSPlayer — enough slack that
+    // back-to-back chunks butt up cleanly even when JS is doing other work.
+    const startAt = Math.max(this.ctx.currentTime + 0.04, entry.nextStart);
+    src.start(startAt);
+    entry.nextStart = startAt + buf.duration;
   }
 
   _matchesActive(micDeviceId, deviceIds) {

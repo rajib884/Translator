@@ -2459,7 +2459,7 @@ async function testOutputDevice(deviceId) {
     // One envelope per note: 20 ms attack, 380 ms decay, 50 ms gap.
     notes.forEach((_, i) => {
       const t0 = ctx.currentTime + i * noteDur;
-      gain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.6, t0 + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.0001, t0 + noteDur - 0.05);
     });
 
@@ -2656,8 +2656,22 @@ function createAudioCapture(session) {
 }
 
 function createCompanionCapture(session) {
+  // Open a passthrough writer up front so each incoming chunk can fan out to
+  // the virtual-cable sinks as well as to Gemini. Companion already produces
+  // 16 kHz mono PCM16, which is exactly what attachPcm16 expects — no
+  // conversion in between. Writer is a no-op when no passthrough device is
+  // selected; the cost of calling write() is just a Map lookup + early
+  // return inside MicPassthrough._writePcm16.
+  if (state.micPassthrough) {
+    session._passthroughPcm = state.micPassthrough.attachPcm16(session.id, 16000);
+  }
   return new LiveAudio.CompanionAudioCapture({
-    onChunk: (buf) => sendAudioGated(session, buf),
+    onChunk: (buf) => {
+      sendAudioGated(session, buf);
+      if (session._passthroughPcm) {
+        try { session._passthroughPcm.write(new Int16Array(buf)); } catch (_) {}
+      }
+    },
     onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
       if (!session.running) return;
@@ -2710,6 +2724,14 @@ async function changeAudioInput() {
     await nextCapture.start({ mode: audioMode, micDeviceId: session.config.micDeviceId });
     try { session.capture && session.capture.stop(); } catch (_) {}
     session.capture = nextCapture;
+    // Swap the passthrough's tab-audio attachment over to the new capture's
+    // display stream. attachStream is idempotent on the session.id key, so
+    // the previous entry is dropped and the new MediaStreamSource is wired
+    // (or queued if the passthrough is currently off).
+    if (audioMode === 'both' || audioMode === 'display') {
+      const ds = nextCapture.getDisplayStream && nextCapture.getDisplayStream();
+      if (ds && state.micPassthrough) state.micPassthrough.attachStream(session.id, ds);
+    }
     await refreshAudioInputDevices();
     log('info', 'Microphone changed: ' + (els.audioInput.selectedOptions[0]?.textContent || 'System default'));
   } catch (e) {
@@ -3219,6 +3241,18 @@ async function startSession(session) {
     } else {
       session.capture = createAudioCapture(session);
       await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
+      // If the user is capturing tab audio (display or both), also feed the
+      // raw display MediaStream into the passthrough mix. Tap is pre-worklet,
+      // so the virtual cable receives full-quality stereo at the source's
+      // native rate (the Gemini-bound mono/16kHz downmix happens on a
+      // separate branch). No-op when no passthrough device is selected — the
+      // attachment sits in the registry until the user toggles one on.
+      if (audioMode === 'display' || audioMode === 'both') {
+        const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
+        if (displayStream && state.micPassthrough) {
+          state.micPassthrough.attachStream(session.id, displayStream);
+        }
+      }
     }
     session.currentAudioMode = audioMode;
     // Capture which physical mic getUserMedia resolved to so the dropdown's
@@ -3294,6 +3328,16 @@ async function stopSession(session) {
   saveSessions();
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
+  // Drop the session's passthrough attachments now that capture is gone.
+  // The mic source in the passthrough is independent and keeps routing as
+  // long as the user has a passthrough device selected.
+  if (state.micPassthrough) {
+    state.micPassthrough.detachStream(session.id);
+  }
+  if (session._passthroughPcm) {
+    try { session._passthroughPcm.close(); } catch (_) {}
+    session._passthroughPcm = null;
+  }
   try { if (session.player) await session.player.destroy(); } catch (_) {}
   session.client = null;
   session.capture = null;
