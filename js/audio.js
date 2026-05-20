@@ -746,8 +746,9 @@ class MicPassthrough {
     this.warnings = [];
     // Live level meter. Drives the per-row pulse on .is-live-passthrough rows
     // so the user can see real audio flowing (the previous version had no way
-    // to distinguish "routed" from "audio actually playing"). Meters the mic
-    // input only — tab/companion mix in silently from the UI's perspective.
+    // to distinguish "routed" from "audio actually playing"). Tapped from the
+    // mix node, so the indicator reflects the full signal hitting the sinks
+    // — mic plus any attached tab/companion audio.
     this._meter = new LevelMeter({
       onLevel: (l) => this.onLevel(l),
       isActive: () => this.running && this.sinks.length > 0,
@@ -784,14 +785,16 @@ class MicPassthrough {
     this._mixNode = this.ctx.createGain();
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.source.connect(this._mixNode);
-    // Side branch for level metering on the mic input only. Other attached
-    // sources mix in silently from the UI's perspective — the indicator still
-    // tracks the user's voice, which is what the visual was designed for.
+    // Side branch for level metering taps the mix node so the indicator
+    // reflects everything that's actually reaching the sinks — mic plus any
+    // attached tab or companion audio. The analyser is a sink-only node, so
+    // hanging it off _mixNode in parallel with the destinations doesn't
+    // alter the audio that the cable receives.
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0;
     this._analyserBuf = new Float32Array(this.analyser.fftSize);
-    this.source.connect(this.analyser);
+    this._mixNode.connect(this.analyser);
 
     // Wire any sources that were attached while the passthrough was off.
     // Streams need a fresh MediaStreamSource (created in the new ctx); PCM
