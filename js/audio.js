@@ -769,22 +769,41 @@ class MicPassthrough {
     return peak;
   }
 
-  async start(micDeviceId, deviceIds) {
+  // wantsMic: when false, skip getUserMedia entirely — the mix is driven only
+  // by attached streams (tab/display) and PCM sources (companion). The caller
+  // sets this based on the active session's audioSource: 'companion' and
+  // 'display' have their own source and don't need to also capture the mic.
+  // This also means the passthrough can run on machines with no mic / denied
+  // mic permission, as long as at least one attached source feeds the mix.
+  // If wantsMic=true but getUserMedia fails, we log a warning and continue
+  // with attached sources only rather than tearing down the whole passthrough.
+  async start(micDeviceId, deviceIds, { wantsMic = true } = {}) {
     await this.stop({ keepAttachments: true });
     this.warnings = [];
     if (!deviceIds || deviceIds.length === 0) return;
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
-    });
+    if (wantsMic) {
+      try {
+        this.stream = await navigator.mediaDevices.getUserMedia({
+          audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
+        });
+      } catch (e) {
+        // Non-fatal: the mix node still works for attached tab/companion
+        // sources. Caller surfaces the warning to the user.
+        this.warnings.push({ deviceId: '', reason: `mic unavailable (${(e && e.message) || 'getUserMedia rejected'}); passthrough running without mic` });
+        this.stream = null;
+      }
+    }
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
     // Per-context mix node: every source funnels through this. Sinks attach to
     // it, so adding/removing tab or companion sources never touches the sink
     // graph.
     this._mixNode = this.ctx.createGain();
-    this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.source.connect(this._mixNode);
+    if (this.stream) {
+      this.source = this.ctx.createMediaStreamSource(this.stream);
+      this.source.connect(this._mixNode);
+    }
     // Side branch for level metering taps the mix node so the indicator
     // reflects everything that's actually reaching the sinks — mic plus any
     // attached tab or companion audio. The analyser is a sink-only node, so
@@ -905,13 +924,13 @@ class MicPassthrough {
   // the call would re-create the exact same mic+sinks already running (e.g.
   // app.js calls applyPassthrough() after every output-list refresh — without
   // this short-circuit each refresh briefly silences the passthrough sink).
-  async update(micDeviceId, deviceIds) {
+  async update(micDeviceId, deviceIds, { wantsMic = true } = {}) {
     if (!deviceIds || deviceIds.length === 0) {
       if (this.running) await this.stop({ keepAttachments: true });
       return;
     }
-    if (this.running && this._matchesActive(micDeviceId, deviceIds)) return;
-    await this.start(micDeviceId, deviceIds);
+    if (this.running && this._matchesActive(micDeviceId, deviceIds, wantsMic)) return;
+    await this.start(micDeviceId, deviceIds, { wantsMic });
   }
 
   // Register a session-bound MediaStream (tab/display audio) so it joins the
@@ -984,12 +1003,17 @@ class MicPassthrough {
     entry.nextStart = startAt + buf.duration;
   }
 
-  _matchesActive(micDeviceId, deviceIds) {
+  _matchesActive(micDeviceId, deviceIds, wantsMic = true) {
     const currentMic = this.getActiveMicId();
-    const wantMic = micDeviceId || '';
-    // Treat null/undefined currentMic (no live track) as a mismatch — the
-    // caller wants something running and we don't have anything.
-    if (currentMic == null || currentMic !== wantMic) return false;
+    if (wantsMic) {
+      const wantMic = micDeviceId || '';
+      // Treat null/undefined currentMic (no live track) as a mismatch — the
+      // caller wants something running and we don't have anything.
+      if (currentMic == null || currentMic !== wantMic) return false;
+    } else {
+      // Caller wants no mic; mismatch if we currently have one open.
+      if (currentMic != null) return false;
+    }
     const currentSinks = this.getActiveSinkIds();
     if (currentSinks.length !== deviceIds.length) return false;
     const have = new Set(currentSinks);

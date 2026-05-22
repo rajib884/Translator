@@ -98,6 +98,15 @@ class GeminiLiveClient {
     // When true, Gemini's auto VAD is disabled; the client must signal turn
     // boundaries via sendActivityStart / sendActivityEnd. Used by push-to-talk.
     this.manualActivity = !!opts.manualActivity;
+    // Callback returning whether the parent currently considers the activity
+    // engaged (e.g. PTT key held). On every setupComplete (initial connect or
+    // post-reconnect) we re-emit activityStart if this returns true, so the
+    // bracket survives the WebSocket replacement. Without this, the next
+    // key-up sends activityEnd on a fresh WS with no matching start, which
+    // the server rejects with 1007 (Precondition check failed).
+    this.isManualActivityHeld = typeof opts.isManualActivityHeld === 'function'
+      ? opts.isManualActivityHeld
+      : null;
 
     this.onAudio = opts.onAudio || (() => {});
     this.onInputChunk = opts.onInputChunk || (() => {});
@@ -211,6 +220,10 @@ class GeminiLiveClient {
       return;
     }
     this._setupComplete = false;
+    // Re-arm resume handling on every fresh connect. forceCloseWebSocket
+    // disarms it briefly to swallow late-arriving updates from the closing
+    // session; the next connection is a clean slate.
+    this._resumeDisarmed = false;
     const endpointHost = (() => {
       try { return new URL(this.endpoint).host; } catch (_) { return this.endpoint; }
     })();
@@ -305,6 +318,19 @@ class GeminiLiveClient {
       this._setState('connected');
       this._setSwitching(false);
       this.onLog('info', `Connected to Gemini Live (resumed=${!!this.resumeHandle})`);
+      // If the parent says activity is still engaged across the reconnect
+      // (PTT key still physically held during a 1007/network drop or right
+      // after a force-reset), open the bracket on the new WS so the next
+      // activityEnd has a matching start. Otherwise the next key-up sends
+      // an orphan activityEnd and the server closes with 1007.
+      if (this.manualActivity && this.isManualActivityHeld) {
+        let held = false;
+        try { held = !!this.isManualActivityHeld(); } catch (_) {}
+        if (held) {
+          this.onLog('info', 'Re-opening manual activity bracket (held across reconnect).');
+          this.sendActivityStart();
+        }
+      }
       return;
     }
 
@@ -344,12 +370,26 @@ class GeminiLiveClient {
         this.onLog('info', 'serverContent.turnComplete');
         this.onTurnComplete();
         if (this._goAwayPending) this._turnCompleteSinceGoAway = true;
+        // A completed turn is the strongest "this session is working"
+        // signal. Reset the reconnect ratchet so a long-lived session that
+        // weathered a handful of mid-life reconnects doesn't carry the
+        // accumulated count forward into the next blip. Without this,
+        // sessions that had a rough patch hours ago could still exhaust
+        // MAX_RECONNECT_ATTEMPTS later on what would otherwise be the
+        // first fresh failure.
+        this._reconnectAttempts = 0;
       }
     }
 
     if (msg.sessionResumptionUpdate) {
       const u = msg.sessionResumptionUpdate;
-      if (u.resumable && u.newHandle) {
+      // Drop updates that arrive after a force-reset until the next fresh
+      // connection. Without this, a sessionResumptionUpdate in the server's
+      // send queue between forceCloseWebSocket and the actual TCP close
+      // would silently repopulate the handle the user just cleared.
+      if (this._resumeDisarmed) {
+        this.onLog('info', 'sessionResumptionUpdate: dropped (resume disarmed for this connection)');
+      } else if (u.resumable && u.newHandle) {
         this.resumeHandle = u.newHandle;
         this.onLog('info', `Resume handle received: ${u.newHandle}`);
         try { this.onResumeHandle(u.newHandle); } catch (_) {}
@@ -468,6 +508,11 @@ class GeminiLiveClient {
       `WebSocket closed (${ev.code}${ev.reason ? ': ' + ev.reason : ''})`);
 
     if (!this.shouldRun) {
+      // Clear the switching flag too: a stop() during an in-flight GoAway
+      // renewal would otherwise leave the UI stuck on the "Switching" pill
+      // because the only paths that clear it (setupComplete, error/budget
+      // branches below) never fire when we go straight to idle.
+      this._setSwitching(false);
       this._setState('idle');
       return;
     }
@@ -601,6 +646,11 @@ class GeminiLiveClient {
       this.onLog('warn', 'forceCloseWebSocket ignored: no active WebSocket.');
       return;
     }
+    // Disarm resume handling for the brief window between now and the actual
+    // close: any sessionResumptionUpdate already in-flight (or arriving from
+    // the server's send queue between this call and the TCP close) would
+    // otherwise repopulate resumeHandle that the caller is trying to clear.
+    this._resumeDisarmed = true;
     this.onLog('info', `Force-closing WebSocket (${code} ${reason}).`);
     try { this.ws.close(code, reason); } catch (e) {
       this.onLog('warn', 'forceCloseWebSocket failed: ' + (e && e.message ? e.message : e));

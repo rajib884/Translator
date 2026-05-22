@@ -1,1 +1,1 @@
-"C:\Users\user\Downloads\mingw64\bin\g++.exe" -std=c++17 -O2 -mwindows -static -o live_translator.exe src/main.cpp -lws2_32 -lbcrypt -lavrt -lole32 -lmmdevapi -luuid -lpsapi
+"C:\Users\user\Downloads\mingw64\bin\g++.exe" -std=c++17 -O2 -mwindows -static -o build/live_translator.exe src/main.cpp -lws2_32 -lbcrypt -lavrt -lole32 -lmmdevapi -luuid -lpsapi

@@ -849,6 +849,12 @@ function readConfigFromUI() {
     mode:   els.modeSelect.value,
     dir:    els.dirSelect.value,
     vad:    currentVadConfig(),
+    // Persist the user-selected preset name (including 'custom') so a
+    // restored session preserves the user's intent. Without this, the UI
+    // re-derives the preset from cfg.vad numbers via detectVadPreset() —
+    // values that happen to match a named preset would silently hide the
+    // custom-fields panel even when the user explicitly chose Custom.
+    vadPreset: els.vadPreset ? els.vadPreset.value : DEFAULT_VAD_PRESET,
     audioSource:    els.audioSource.value || 'mic',
     micDeviceId:    els.audioInput.value || '',
     outputDeviceIds: getSelectedOutputDeviceIds(),
@@ -1360,7 +1366,12 @@ function loadSessionConfigIntoUI(session) {
   els.vadEnd.value = cfg.vad.endSensitivity;
   els.vadPrefix.value = String(cfg.vad.prefixPaddingMs);
   els.vadSilence.value = String(cfg.vad.silenceDurationMs);
-  els.vadPreset.value = detectVadPreset();
+  // Prefer the persisted preset name when present (covers explicit 'custom').
+  // Older saved configs without vadPreset fall back to deriving from values.
+  const savedPreset = cfg.vadPreset && (VAD_PRESETS[cfg.vadPreset] || cfg.vadPreset === 'custom')
+    ? cfg.vadPreset
+    : detectVadPreset();
+  els.vadPreset.value = savedPreset;
   els.speechMode.value = cfg.pttMode === 'ptt' ? 'ptt' : 'auto';
   updateUIVisibility();
   updateCompanionAppVisibility();
@@ -1479,7 +1490,13 @@ function maybePromoteArchivedSession() {
   cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
   cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   delete cfg.outputDeviceId;
-  const session = new Session({ id: entry.id || newSessionId(), config: cfg });
+  // Guard against id collision with an existing live session. Without this,
+  // a saved archive whose id happened to match the live one (e.g. duplicated
+  // tabs or a manual localStorage edit) would silently `state.sessions.set`
+  // over the live entry, leaking its DOM and runtime resources.
+  let id = entry.id || newSessionId();
+  if (state.sessions.has(id)) id = newSessionId();
+  const session = new Session({ id, config: cfg });
   session.resumeHandle = entry.resumeHandle || null;
   state.sessions.set(session.id, session);
   createSessionDOM(session);
@@ -2061,11 +2078,34 @@ function getPassthroughDeviceIds() {
 
 // Starts/stops the global mic passthrough based on which devices have the
 // mic icon toggled on. Completely independent of translation sessions.
+//
+// wantsMic is derived from the *running* session's audioSource (not the UI
+// dropdown): when companion or display is the source, the session already
+// drives a non-mic stream into the passthrough mix via attachStream/
+// attachPcm16, so we don't need to also open the mic. This makes the
+// passthrough usable on machines with no mic permission. When no session is
+// running we default to mic (the user's intent for the mic-icon checkbox
+// alone). When mic is already in the source (mode 'mic' or 'both', or no
+// running session), we still request it.
 async function applyPassthrough() {
   const ids = getPassthroughDeviceIds();
   const micId = els.audioInput ? els.audioInput.value || '' : '';
+  // Find any running session that doesn't itself need the mic. If all running
+  // sessions are companion/display, we can skip getUserMedia.
+  let wantsMic = true;
+  const running = [];
+  for (const s of state.sessions.values()) {
+    if (s.running) running.push(s);
+  }
+  if (running.length > 0) {
+    const anyNeedsMic = running.some((s) => {
+      const src = s.currentAudioMode || (s.config && s.config.audioSource) || 'mic';
+      return src === 'mic' || src === 'both';
+    });
+    wantsMic = anyNeedsMic;
+  }
   try {
-    await state.micPassthrough.update(micId, ids);
+    await state.micPassthrough.update(micId, ids, { wantsMic });
     // Drain per-sink warnings so the user learns which specific device
     // failed and why, instead of a generic "could not start".
     const warnings = state.micPassthrough.warnings || [];
@@ -2198,6 +2238,11 @@ async function detectAudioDevices() {
     log('warn', 'This browser does not support detecting devices.');
     return;
   }
+  // Tell the permission listener to back off while we're in flight: granting
+  // mic permission here will fire the navigator.permissions 'change' event,
+  // which also calls refresh* — without this flag we'd run the refresh
+  // twice and the device list would briefly flash.
+  state._detectingDevices = true;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     // Stop immediately — we only needed the permission grant.
@@ -2207,6 +2252,8 @@ async function detectAudioDevices() {
     log('info', 'Audio devices detected.');
   } catch (e) {
     log('warn', 'Could not detect devices: ' + (e && e.message ? e.message : e));
+  } finally {
+    state._detectingDevices = false;
   }
 }
 
@@ -3162,6 +3209,12 @@ async function startSession(session) {
     // manualActivity disables Gemini's auto VAD so we control turn boundaries
     // via activityStart/activityEnd (sent from the PTT key handlers below).
     manualActivity: isPtt,
+    // Reports whether the PTT key is currently physically held so the client
+    // can re-emit activityStart on each setupComplete (handles 1007 retries
+    // and force-resets where the bracket would otherwise span two WS
+    // connections — server only accepts activityEnd matched to a start on
+    // the same connection).
+    isManualActivityHeld: () => !!session.pttHeld,
     resumeHandle: session.resumeHandle || null,
     onResumeHandle: (handle) => {
       session.resumeHandle = handle || null;
@@ -3255,6 +3308,12 @@ async function startSession(session) {
       }
     }
     session.currentAudioMode = audioMode;
+    // Kick the passthrough so newly-attached companion PCM / display streams
+    // get wired into the mix. wantsMic is recomputed inside applyPassthrough
+    // based on the running sessions' audio sources, so this also drops the
+    // mic-only path when the active session no longer needs it. No-op when
+    // no passthrough device is checked.
+    applyPassthrough();
     // Capture which physical mic getUserMedia resolved to so the dropdown's
     // "System default" label can grow into "System default (X)".
     if (session.capture && session.capture.actualMicDeviceId) {
@@ -3361,6 +3420,11 @@ async function stopSession(session) {
   }
   refreshBulkActionButtons();
   refreshActiveDeviceIndicators();
+  // Re-evaluate passthrough's wantsMic: if a companion session just stopped
+  // and the only remaining running session needs a mic, applyPassthrough
+  // restarts the passthrough with the mic re-opened. No-op when no
+  // passthrough device is selected.
+  applyPassthrough();
   session._stopping = false;
 }
 
@@ -3394,6 +3458,14 @@ function forceResetActiveSession() {
     return;
   }
   log('warn', 'Force reconnect: clearing resume handle and dropping WebSocket.');
+  // If the PTT key is still held while the user force-resets, close the
+  // activity bracket on the OLD WS before tearing it down. The auto-restart
+  // path in GeminiLiveClient.setupComplete will re-open it on the new WS via
+  // isManualActivityHeld, so this just makes sure the server's state machine
+  // on the old session ends cleanly rather than orphaning an activityStart.
+  if (session.pttHeld) {
+    try { session.client.sendActivityEnd(); } catch (_) {}
+  }
   session.resumeHandle = null;
   session.client.resumeHandle = null;
   session.switching = false;
@@ -3518,6 +3590,14 @@ function closeSheet(id) {
   if (!el) return;
   if (!el.classList.contains('is-open')) return;
   el.classList.remove('is-open');
+
+  // Stop the mic preview as soon as the settings sheet closes (mobile case —
+  // on desktop the sidebar is permanently docked and this branch never
+  // fires). Without this, the OS mic indicator stayed on for up to 10s
+  // (the auto-stop window) even after the user dismissed the sheet.
+  if (id === 'sidebar' && state.inputPreview && state.inputPreview.running) {
+    stopMicPreview();
+  }
 
   // Local `modal` (not `state`) so we don't shadow the module-level `state`
   // object — a future maintainer adding `state.foo` to this function would
@@ -4885,7 +4965,17 @@ function wireUI() {
     if (isExportMenuOpen()) {
       const insideMenu = els.exportMenu && els.exportMenu.contains(ev.target);
       const onTrigger = els.btnExport && els.btnExport.contains(ev.target);
-      if (!insideMenu && !onTrigger) closeExportMenu();
+      if (!insideMenu && !onTrigger) {
+        closeExportMenu();
+        // Return focus to the trigger so keyboard navigation isn't stranded
+        // — mirrors what the Escape handler does and matches native menu UX.
+        // Skipped when the click landed on another focusable element (the
+        // user already moved focus by clicking), but the Export button is a
+        // safe default that the user can immediately re-activate.
+        if (els.btnExport && !ev.target.closest('button, a, input, select, textarea, [tabindex]')) {
+          try { els.btnExport.focus({ preventScroll: true }); } catch (_) {}
+        }
+      }
     }
     const tgt = ev.target.closest('[data-close]');
     if (!tgt) return;
@@ -4989,6 +5079,10 @@ function wireUI() {
     navigator.permissions.query({ name: 'microphone' }).then((perm) => {
       perm.addEventListener && perm.addEventListener('change', () => {
         if (perm.state === 'granted') {
+          // Skip when detectAudioDevices is in flight — it already plans to
+          // call refresh* after its own getUserMedia resolves, and this
+          // listener fires on the same permission grant.
+          if (state._detectingDevices) return;
           refreshAudioInputDevices();
           refreshAudioOutputDevices();
         }
