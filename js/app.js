@@ -1424,6 +1424,22 @@ async function closeSession(session) {
     if (!window.confirm('This session is running. Stop it and remove?')) return;
     await stopSession(session);
   }
+  // If stopSession left a detached capture alive (passthrough was on at stop
+  // time), this is the user explicitly removing the session — tear it down
+  // now so the companion ws + PCM writer don't outlive the tab chip.
+  if (session._captureDetached) {
+    try { session.capture && session.capture.stop(); } catch (_) {}
+    if (state.micPassthrough) state.micPassthrough.detachStream(session.id);
+    if (session._passthroughPcm) {
+      try { session._passthroughPcm.close(); } catch (_) {}
+      session._passthroughPcm = null;
+    }
+    session.capture = null;
+    session._captureDetached = false;
+    // Re-check the passthrough mix — wantsMic may need to come back up now
+    // that the detached companion source is gone.
+    applyPassthrough();
+  }
   if (session.tabEl) session.tabEl.remove();
   if (session.transcriptEl) session.transcriptEl.remove();
   state.sessions.delete(session.id);
@@ -2675,20 +2691,23 @@ function cssEscape(s) {
 // ─── Per-session capture/player factories ────────────────────────────────────
 function sendAudioGated(session, buf) {
   if (!session.client || session.paused) return;
-  // In PTT mode we stream real audio only while the bound key is held.
-  // Outside that window, send silence so the WebSocket stays warm but the
-  // model receives no input to act on.
+  // In PTT (manual-activity) mode, simply don't send anything outside the
+  // bracket. Previously we sent zero-filled "silence" frames between
+  // activityStart and the next activityStart, on the theory that it kept
+  // the WS warm. But Gemini's manual-VAD mode appears to react badly to
+  // audio chunks that arrive between activityEnd and the next activityStart
+  // — the server intermittently closes with 1007 (Precondition check
+  // failed) after PTT presses. WS keepalive happens at the TCP layer; we
+  // don't need to send audio for that. The empty `return` below also
+  // covers the mid-session mic-swap window, where two captures briefly run
+  // in parallel; dropping frames during the swap is fine because we'd
+  // otherwise double-feed the model.
   const isPtt = session.config && session.config.pttMode === 'ptt';
   const pttMuted = isPtt && !session.pttHeld;
-  // During a mid-session mic swap, two captures briefly run in parallel (the
-  // new one starts before the old one stops, so the user doesn't hear a gap
-  // in their meter). Treat both feeds as silence for the overlap so the model
-  // doesn't receive doubled audio and Gemini's VAD doesn't get confused.
   if (session.muteInput || pttMuted || session._swappingCapture) {
-    session.client.sendAudio(new ArrayBuffer(buf.byteLength));
-  } else {
-    session.client.sendAudio(buf);
+    return;
   }
+  session.client.sendAudio(buf);
 }
 
 function createAudioCapture(session) {
@@ -3276,6 +3295,25 @@ async function startSession(session) {
       }
     }
     const audioMode = cfg.audioSource || 'mic';
+    // If a previous stopSession left a detached capture alive (because the
+    // user had a passthrough device targeting it), and the audio source
+    // hasn't changed, reuse it instead of tearing down + restarting. This
+    // makes restart cheap and avoids a brief silence on the passthrough
+    // sink. Changing audioSource between stops invalidates the detached
+    // capture — we discard it before creating the new one.
+    if (session._captureDetached && session.capture && session.currentAudioMode !== audioMode) {
+      try { session.capture.stop(); } catch (_) {}
+      if (state.micPassthrough) state.micPassthrough.detachStream(session.id);
+      if (session._passthroughPcm) {
+        try { session._passthroughPcm.close(); } catch (_) {}
+        session._passthroughPcm = null;
+      }
+      session.capture = null;
+      session._captureDetached = false;
+    }
+    const reuseDetached = session._captureDetached && session.capture &&
+      session.currentAudioMode === audioMode;
+
     if (audioMode === 'companion') {
       if (!state.companionAvailable && !(await detectCompanionService({ silent: false }))) {
         throw new Error('Companion audio service is not running.');
@@ -3289,21 +3327,32 @@ async function startSession(session) {
         else throw new Error(`"${selectedExe}" is no longer making sound. Start playback in it and try again.`);
       }
       const wsUrl = pid ? `${COMPANION_WS_URL}?pid=${pid}` : COMPANION_WS_URL;
-      session.capture = createCompanionCapture(session);
-      await session.capture.start({ wsUrl });
+      if (reuseDetached) {
+        log('info', 'Reusing companion capture from passthrough.');
+        session._captureDetached = false;
+      } else {
+        session.capture = createCompanionCapture(session);
+        await session.capture.start({ wsUrl });
+      }
     } else {
-      session.capture = createAudioCapture(session);
-      await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
-      // If the user is capturing tab audio (display or both), also feed the
-      // raw display MediaStream into the passthrough mix. Tap is pre-worklet,
-      // so the virtual cable receives full-quality stereo at the source's
-      // native rate (the Gemini-bound mono/16kHz downmix happens on a
-      // separate branch). No-op when no passthrough device is selected — the
-      // attachment sits in the registry until the user toggles one on.
-      if (audioMode === 'display' || audioMode === 'both') {
-        const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
-        if (displayStream && state.micPassthrough) {
-          state.micPassthrough.attachStream(session.id, displayStream);
+      if (reuseDetached) {
+        log('info', 'Reusing audio capture from passthrough.');
+        session._captureDetached = false;
+      } else {
+        session.capture = createAudioCapture(session);
+        await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
+        // If the user is capturing tab audio (display or both), also feed
+        // the raw display MediaStream into the passthrough mix. Tap is
+        // pre-worklet, so the virtual cable receives full-quality stereo at
+        // the source's native rate (the Gemini-bound mono/16kHz downmix
+        // happens on a separate branch). No-op when no passthrough device
+        // is selected — the attachment sits in the registry until the user
+        // toggles one on.
+        if (audioMode === 'display' || audioMode === 'both') {
+          const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
+          if (displayStream && state.micPassthrough) {
+            state.micPassthrough.attachStream(session.id, displayStream);
+          }
         }
       }
     }
@@ -3386,22 +3435,53 @@ async function stopSession(session) {
   if (session.client) session.client.resumeHandle = null;
   saveSessions();
   try { session.client && session.client.stop(); } catch (_) {}
-  try { session.capture && session.capture.stop(); } catch (_) {}
-  // Drop the session's passthrough attachments now that capture is gone.
-  // The mic source in the passthrough is independent and keeps routing as
-  // long as the user has a passthrough device selected.
-  if (state.micPassthrough) {
-    state.micPassthrough.detachStream(session.id);
+
+  // Passthrough survival policy: when the user stops a session that's
+  // currently feeding companion or display audio into a passthrough sink,
+  // tearing down the capture would also silence the virtual cable. The
+  // user explicitly asked for passthrough to keep working "regardless of
+  // session state" — so we keep the session's capture (and its attached
+  // PCM/stream sources) alive, with session.client/player nulled out.
+  // The detached capture's onChunk closes over `session`; once
+  // session.client is null, sendAudioGated early-returns and the chunks
+  // only feed the passthrough writer. closeSession (× on the tab) tears
+  // down the detached capture, as does a startSession with a different
+  // audioSource.
+  const passthroughActive = state.micPassthrough &&
+    getPassthroughDeviceIds().length > 0;
+  const audioMode = session.currentAudioMode ||
+    (session.config && session.config.audioSource) || '';
+  const captureFeedsPassthrough =
+    (audioMode === 'companion' || audioMode === 'display' || audioMode === 'both') &&
+    (session.capture || session._passthroughPcm);
+  const keepCaptureForPassthrough = passthroughActive && captureFeedsPassthrough;
+
+  if (keepCaptureForPassthrough) {
+    session._captureDetached = true;
+    log('info', 'Session stopped — companion/display capture kept alive for passthrough.');
+  } else {
+    try { session.capture && session.capture.stop(); } catch (_) {}
+    // Drop the session's passthrough attachments now that capture is gone.
+    // The mic source in the passthrough is independent and keeps routing as
+    // long as the user has a passthrough device selected.
+    if (state.micPassthrough) {
+      state.micPassthrough.detachStream(session.id);
+    }
   }
-  if (session._passthroughPcm) {
+  if (!keepCaptureForPassthrough && session._passthroughPcm) {
     try { session._passthroughPcm.close(); } catch (_) {}
     session._passthroughPcm = null;
   }
   try { if (session.player) await session.player.destroy(); } catch (_) {}
   session.client = null;
-  session.capture = null;
   session.player = null;
-  session.currentAudioMode = '';
+  // When the capture survives for passthrough, keep both the reference and
+  // currentAudioMode so a subsequent startSession can recognise + reuse it.
+  // Otherwise wipe them so the next start sees a clean slate.
+  if (!keepCaptureForPassthrough) {
+    session.capture = null;
+    session.currentAudioMode = '';
+  }
   session.running = false;
   session.paused = false;
   session.switching = false;
@@ -5021,6 +5101,12 @@ function wireUI() {
         try { session.client && session.client.stop(); } catch (_) {}
         try { session.capture && session.capture.stop(); } catch (_) {}
         try { session.player && session.player.destroy(); } catch (_) {}
+      } else if (session._captureDetached) {
+        // A detached capture (passthrough-only) outlives the session, but
+        // the page is going away — stop it so the companion exe disconnects
+        // cleanly and we don't leave a hanging local ws.
+        try { session.capture && session.capture.stop(); } catch (_) {}
+        session._captureDetached = false;
       }
       // ageTimer survives across BFCache restore (Safari especially) — a
       // restored page would tick the age display against a destroyed session.
