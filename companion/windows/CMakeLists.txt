@@ -3,6 +3,25 @@ project(live_translator_companion LANGUAGES CXX)
 
 add_executable(live-translator-companion WIN32
   src/main.cpp
+  src/env.cpp
+  src/logging.cpp
+  src/string_util.cpp
+  src/process_util.cpp
+  src/http_util.cpp
+  src/ws_util.cpp
+  src/json_parse.cpp
+  src/audio_format.cpp
+  src/activation_handler.cpp
+  src/system_loopback.cpp
+  src/process_loopback.cpp
+  src/audio_apps.cpp
+  src/endpoints.cpp
+  src/pt_ring.cpp
+  src/passthrough_session.cpp
+  src/passthrough_loop.cpp
+  src/hotkey_hook.cpp
+  src/hotkey_session.cpp
+  src/http_router.cpp
 )
 
 target_compile_features(live-translator-companion PRIVATE cxx_std_17)
