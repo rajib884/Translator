@@ -1094,8 +1094,12 @@ class PassthroughSession {
     // at ~12 fps. Source threads update peakLevel atomically; the ticker just
     // drains it. Cheap enough to always run.
     levelThread = std::thread([this] {
+      // Win32 Sleep() instead of std::this_thread::sleep_for — the latter
+      // links against ucrtbase!nanosleep64 on newer MinGW-w64, which is
+      // missing on stock Windows installs and surfaces as "Entry Point Not
+      // Found" at startup.
       while (running.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Sleep(80);
         if (!running.load()) break;
         emit_level_if_due();
       }
