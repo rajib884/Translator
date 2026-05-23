@@ -88,6 +88,12 @@ Every translation pipeline is owned by a `Session`. The browser holds up to
   - `capture` — `AudioCapture` or `CompanionAudioCapture`.
   - `player` — `TTSPlayer` for audio mode, `null` for text/transcribe.
   - `resumeHandle` — latest session-resumption token. Persisted to localStorage.
+- **Per-session passthrough**: `session.micPassthrough` — a `MicPassthrough`
+  instance created with the Session and torn down on `closeSession`. Its
+  enabled set (`config.passthroughDeviceIds`) and lifecycle are independent
+  of `running`/`stopped`; source attachments (mic, display, companion PCM)
+  flow in at `startSession` and out at `stopSession`, but the sink graph
+  survives so the user's routing persists across start/stop cycles.
 - **Transcript state**: `liveTurn` (in-progress DOM nodes), `pendingInput` /
   `pendingOutput` buffers, finalized `history[]`.
 - **DOM handles**: tab chip, status bits, meter fills, transcript host.
@@ -108,7 +114,6 @@ Singleton bag of cross-cutting state:
 | `sessions` | All live sessions, keyed by id. |
 | `activeSessionId` | Whose chrome we're showing. |
 | `ttsCoordinator` | Global "who speaks" arbiter (see §4.2). |
-| `micPassthrough` | One `MicPassthrough` shared across all sessions. |
 | `inputPreview` | Lazy settings-panel mic visualizer. |
 | `archivedSessions` | Saved sessions beyond `MAX_SESSIONS` — preserved on disk but not loaded. |
 | `pipPrefs` | Display mode + font size for the PiP window. |
@@ -308,21 +313,28 @@ totally failed devices are dropped and a warning is added. `_applyDevicesQueue`
 is a serial promise queue so a `playChunk` can never schedule into a
 half-torn-down sink graph.
 
-### 5.3 Mic passthrough (`MicPassthrough`) — [js/audio.js:722-1015](js/audio.js#L722-L1015)
+### 5.3 Audio passthrough (`MicPassthrough`) — [js/audio.js:722-1015](js/audio.js#L722-L1015)
 
-Independent of any session: routes the user's mic (and optionally each
-session's tab/companion audio) to one or more output devices — typically a
-virtual cable so the translated meeting audio + the user's spoken-input
+One instance **per Session** (`session.micPassthrough`). A pure
+mixer/router: attached sources funnel through a shared `_mixNode`
+(`GainNode`) and out to one or more user-chosen output devices — typically a
+virtual cable so the translated meeting audio + the session's spoken-input
 arrives on the other side.
 
-Single `_mixNode` (`GainNode`) is the shared mix bus. Sources connect *in*,
-sinks connect *out*. `attachStream(key, stream)` registers a session's display
-MediaStream into the mix; `attachPcm16(key, sampleRate)` returns a writer that
-schedules companion PCM into the mix (same scheduling pattern as `TTSPlayer`).
+The class does **not** open its own mic. Sources are attached by the owning
+session at native rate, so the sinks receive full-quality audio rather than
+the 16 kHz downsample sent to Gemini:
 
-Session attachments persist across passthrough on/off cycles via
-`_attachedStreams` / `_attachedPcm` registries, so the user can toggle the
-passthrough without breaking session audio routing.
+- `attachStream('mic', stream)` — raw mic `MediaStream` from `AudioCapture.getMicStream()`.
+- `attachStream('display', stream)` — raw display/tab `MediaStream` from `AudioCapture.getDisplayStream()`.
+- `attachPcm16('companion', 16000)` — writer for companion PCM (already native 16 kHz).
+
+`start(deviceIds)` / `update(deviceIds)` reconfigure the sink set; the source
+registries persist across stop/start so a sink-list change doesn't drop the
+attached audio. The enabled state (`config.passthroughDeviceIds`) is
+independent of the session's running/stopped state — only the *sources*
+come and go with `startSession` / `stopSession`. The instance itself is
+torn down in `closeSession`.
 
 ### 5.4 Shared `LevelMeter` — [js/audio.js:15-68](js/audio.js#L15-L68)
 
@@ -514,6 +526,12 @@ spot a violation before it ships.
 9. **`session._stopping` is one-shot per stop.** `stopSession` can be entered
    from a user click, a WS close, a display-share end, *and* page unload —
    sometimes concurrently. The guard makes it idempotent.
+10. **Exactly one `MicPassthrough` per Session, torn down on close.** Source
+    attachments use fixed keys (`'mic'` / `'display'` / `'companion'`) inside
+    that instance — not session ids, since each instance is already
+    per-session. The passthrough's enabled set lives in
+    `session.config.passthroughDeviceIds` and survives `startSession` /
+    `stopSession`; only the source attachments come and go.
 
 ---
 

@@ -322,6 +322,14 @@ class AudioCapture {
     const entry = this.streams.find((x) => x.kind === 'display');
     return entry ? entry.stream : null;
   }
+
+  // The raw mic MediaStream, if this capture is in mic or both mode. Same
+  // purpose as getDisplayStream(): the passthrough taps the original full-
+  // rate mic stream rather than the worklet's 16 kHz downsampled output.
+  getMicStream() {
+    const entry = this.streams.find((x) => x.kind === 'mic');
+    return entry ? entry.stream : null;
+  }
 }
 
 class CompanionAudioCapture {
@@ -712,26 +720,25 @@ function canSelectOutputDevice() {
          TTSPlayer.canSelectOutputDevice();
 }
 
-// ─── Mic passthrough ─────────────────────────────────────────────────────────
-// Independently routes microphone audio — and optionally tab/companion audio
-// from active sessions — to one or more output devices (e.g. a virtual cable).
-// The mic path is decoupled from translation sessions so the user can stop and
-// restart sessions without breaking their audio routing. Session-bound sources
-// (tab/companion) are added via attachStream / attachPcm16 and removed on
-// session stop; they mix into the same sinks as the mic.
+// ─── Audio passthrough ──────────────────────────────────────────────────────
+// One instance per Session. Pure mixer/router: takes attached sources (mic
+// MediaStream, display MediaStream, companion PCM16 — all at native rate)
+// and fans them out to one or more selected output devices (e.g. a virtual
+// cable). The session's AudioCapture owns the mic getUserMedia; this class
+// just plugs into the resulting MediaStream so the cable receives full-
+// quality audio rather than the 16 kHz wire format. Sink lifecycle (run/
+// stop) is independent of the session's running state — start/stop of the
+// session only adds and removes source attachments.
 class MicPassthrough {
   constructor({ onLevel } = {}) {
     this.onLevel = onLevel || (() => {});
     this.running = false;
     this.ctx = null;
-    this.stream = null;
-    this.source = null;
     this.analyser = null;
     this._analyserBuf = null;
-    // Single mix point: every source (mic, attached streams, attached PCM16)
-    // connects into _mixNode; each per-device MediaStreamDestination connects
-    // from _mixNode. This means sources can come and go without rewiring the
-    // sinks.
+    // Single mix point: every attached source connects into _mixNode; each
+    // per-device MediaStreamDestination connects from _mixNode. Sources can
+    // come and go without rewiring the sinks.
     this._mixNode = null;
     this.sinks = []; // { deviceId, streamDest, audioEl }
     // Source registries persist across stop()/start() cycles so the caller can
@@ -742,13 +749,11 @@ class MicPassthrough {
     // Diagnostic surface: warnings accumulate per start() and the caller
     // (applyPassthrough in app.js) drains and logs them. Previously these
     // errors were swallowed inside inner try/catches, so users had no idea
-    // why one of their selected speakers wasn't receiving the mic.
+    // why one of their selected speakers wasn't receiving the audio.
     this.warnings = [];
-    // Live level meter. Drives the per-row pulse on .is-live-passthrough rows
-    // so the user can see real audio flowing (the previous version had no way
-    // to distinguish "routed" from "audio actually playing"). Tapped from the
-    // mix node, so the indicator reflects the full signal hitting the sinks
-    // — mic plus any attached tab/companion audio.
+    // Live level meter. Tapped from the mix node so the indicator reflects
+    // the full signal hitting the sinks regardless of which source(s)
+    // produce it.
     this._meter = new LevelMeter({
       onLevel: (l) => this.onLevel(l),
       isActive: () => this.running && this.sinks.length > 0,
@@ -769,27 +774,20 @@ class MicPassthrough {
     return peak;
   }
 
-  async start(micDeviceId, deviceIds) {
+  async start(deviceIds) {
     await this.stop({ keepAttachments: true });
     this.warnings = [];
     if (!deviceIds || deviceIds.length === 0) return;
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
-    });
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
     // Per-context mix node: every source funnels through this. Sinks attach to
-    // it, so adding/removing tab or companion sources never touches the sink
-    // graph.
+    // it, so adding/removing sources never touches the sink graph.
     this._mixNode = this.ctx.createGain();
-    this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.source.connect(this._mixNode);
     // Side branch for level metering taps the mix node so the indicator
-    // reflects everything that's actually reaching the sinks — mic plus any
-    // attached tab or companion audio. The analyser is a sink-only node, so
-    // hanging it off _mixNode in parallel with the destinations doesn't
-    // alter the audio that the cable receives.
+    // reflects everything that's actually reaching the sinks. The analyser
+    // is a sink-only node, so hanging it off _mixNode in parallel with the
+    // destinations doesn't alter the audio that the cable receives.
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0;
@@ -859,8 +857,8 @@ class MicPassthrough {
   // keepAttachments: when true, source registries survive (the AudioContext is
   // torn down so per-context source nodes are dropped, but the MediaStreams
   // and PCM-writer metadata remain). Used by start() so a routine restart
-  // (mic or sink list change) doesn't make session-attached tab/companion
-  // sources disappear from the passthrough.
+  // (sink list change) doesn't make session-attached sources disappear from
+  // the passthrough.
   async stop({ keepAttachments = false } = {}) {
     this._meter.stop();
     for (const s of this.sinks) {
@@ -886,15 +884,9 @@ class MicPassthrough {
     }
     try { this._mixNode && this._mixNode.disconnect(); } catch (_) {}
     this._mixNode = null;
-    try { this.source && this.source.disconnect(); } catch (_) {}
-    this.source = null;
     try { this.analyser && this.analyser.disconnect(); } catch (_) {}
     this.analyser = null;
     this._analyserBuf = null;
-    if (this.stream) {
-      this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
-      this.stream = null;
-    }
     try { this.ctx && this.ctx.close(); } catch (_) {}
     this.ctx = null;
     this.running = false;
@@ -902,16 +894,16 @@ class MicPassthrough {
   }
 
   // Restarts with new settings. Cheap no-op when deviceIds is empty OR when
-  // the call would re-create the exact same mic+sinks already running (e.g.
+  // the call would re-create the exact same sinks already running (e.g.
   // app.js calls applyPassthrough() after every output-list refresh — without
   // this short-circuit each refresh briefly silences the passthrough sink).
-  async update(micDeviceId, deviceIds) {
+  async update(deviceIds) {
     if (!deviceIds || deviceIds.length === 0) {
       if (this.running) await this.stop({ keepAttachments: true });
       return;
     }
-    if (this.running && this._matchesActive(micDeviceId, deviceIds)) return;
-    await this.start(micDeviceId, deviceIds);
+    if (this.running && this._matchesActive(deviceIds)) return;
+    await this.start(deviceIds);
   }
 
   // Register a session-bound MediaStream (tab/display audio) so it joins the
@@ -984,12 +976,7 @@ class MicPassthrough {
     entry.nextStart = startAt + buf.duration;
   }
 
-  _matchesActive(micDeviceId, deviceIds) {
-    const currentMic = this.getActiveMicId();
-    const wantMic = micDeviceId || '';
-    // Treat null/undefined currentMic (no live track) as a mismatch — the
-    // caller wants something running and we don't have anything.
-    if (currentMic == null || currentMic !== wantMic) return false;
+  _matchesActive(deviceIds) {
     const currentSinks = this.getActiveSinkIds();
     if (currentSinks.length !== deviceIds.length) return false;
     const have = new Set(currentSinks);
@@ -999,9 +986,13 @@ class MicPassthrough {
     return true;
   }
 
+  // The deviceId of the currently-attached mic source, if any. The mic
+  // stream is owned by the session's AudioCapture and registered via
+  // attachStream('mic', stream); we just read its track settings.
   getActiveMicId() {
-    if (!this.stream) return null;
-    const tracks = this.stream.getAudioTracks();
+    const entry = this._attachedStreams.get('mic');
+    if (!entry || !entry.stream) return null;
+    const tracks = entry.stream.getAudioTracks();
     if (!tracks.length || tracks[0].readyState !== 'live') return null;
     try {
       const s = tracks[0].getSettings();

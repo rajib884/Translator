@@ -322,6 +322,17 @@ class Session {
     // Outside the window we send silence to keep the stream healthy without
     // triggering the model.
     this.pttHeld = false;
+
+    // Per-session audio passthrough. One instance per Session — its enabled
+    // set (config.passthroughDeviceIds) and lifecycle are independent of
+    // running/stopped. Sources (mic, display, companion PCM) attach during
+    // startSession and detach during stopSession; the sink graph itself
+    // survives across cycles so the user's chosen routing isn't lost.
+    this.micPassthrough = new LiveAudio.MicPassthrough({
+      onLevel: (l) => paintPassthroughLevel(this, l),
+    });
+    // Companion PCM writer, allocated alongside CompanionAudioCapture.
+    this._passthroughPcm = null;
   }
 
   get isAudio() { return this.config.mode === 'audio'; }
@@ -677,13 +688,11 @@ const state = {
   sessions: new Map(),
   activeSessionId: null,
   ttsCoordinator: new TTSCoordinator(),
-  micPassthrough: new LiveAudio.MicPassthrough({
-    // paintPassthroughLevel is hoisted (function declaration). Pushes the
-    // live mic peak into a CSS variable on each .is-live-passthrough row so
-    // the user can see audio actually flowing, not just a static "routed"
-    // indicator.
-    onLevel: (l) => paintPassthroughLevel(l),
-  }),
+  // Audio passthrough is per-session (session.micPassthrough); see the
+  // Session constructor. There is no global passthrough — each session owns
+  // its own routing, and its config (passthroughDeviceIds) survives
+  // start/stop cycles independently of the others.
+
   // Lazily allocated InputPreview for the settings panel's mic visualizer.
   // Stays null until the user clicks the preview button.
   inputPreview: null,
@@ -789,7 +798,13 @@ function resetAdvancedSettingsForBasic() {
   updateUIVisibility();
   updateAudioSourceAvailability();
   updateSpeechModeFields();
-  applyPassthrough();
+  // The reset cleared passthrough checkboxes; clear the active session's
+  // config so applyPassthrough tears down its sinks too.
+  const session = activeSession();
+  if (session) {
+    session.config.passthroughDeviceIds = [];
+    applyPassthrough(session);
+  }
   onSettingsChange();
 }
 
@@ -852,6 +867,9 @@ function readConfigFromUI() {
     audioSource:    els.audioSource.value || 'mic',
     micDeviceId:    els.audioInput.value || '',
     outputDeviceIds: getSelectedOutputDeviceIds(),
+    // Per-session passthrough sinks. Empty array = passthrough disabled
+    // for this session. Persists across the session's start/stop cycles.
+    passthroughDeviceIds: getPassthroughDeviceIds(),
     companionApp:   els.companionApp ? els.companionApp.value : '',
     // 'auto' = automatic VAD on Gemini's side, 'ptt' = client signals activity
     // via the companion-app global hotkey. The hotkey binding itself is global
@@ -1352,6 +1370,13 @@ function loadSessionConfigIntoUI(session) {
   cfg.outputDeviceIds = outIds;
   setSelectedOutputDeviceIds(outIds);
   els.audioOutput.dataset.preferred = JSON.stringify(outIds);
+  // Restore the active session's passthrough checkbox selection so the UI
+  // reflects this session's config (rather than the previously active
+  // session's). Empty array = passthrough disabled.
+  const ptIds = Array.isArray(cfg.passthroughDeviceIds) ? cfg.passthroughDeviceIds : [];
+  cfg.passthroughDeviceIds = ptIds;
+  setPassthroughDeviceIds(ptIds);
+  els.audioOutput.dataset.preferredPassthrough = JSON.stringify(ptIds);
   if (els.companionApp) {
     els.companionApp.value = cfg.companionApp || '';
     els.companionApp.dataset.preferred = cfg.companionApp || '';
@@ -1404,6 +1429,11 @@ function createNewSession({ activate = true } = {}) {
   // The new session has a fresh id, so setActiveSession's early-return won't
   // fire and the previous session's .is-active class is correctly removed.
   if (activate) setActiveSession(session.id);
+  // Start the new session's passthrough sinks if its config has any. Fire
+  // and forget — failures inside applyPassthrough are logged, not thrown.
+  if ((session.config.passthroughDeviceIds || []).length > 0) {
+    applyPassthrough(session);
+  }
   return session;
 }
 
@@ -1412,6 +1442,10 @@ async function closeSession(session) {
   if (session.running) {
     if (!window.confirm('This session is running. Stop it and remove?')) return;
     await stopSession(session);
+  }
+  if (session.micPassthrough) {
+    try { await session.micPassthrough.stop(); } catch (_) {}
+    session.micPassthrough = null;
   }
   if (session.tabEl) session.tabEl.remove();
   if (session.transcriptEl) session.transcriptEl.remove();
@@ -1479,6 +1513,7 @@ function maybePromoteArchivedSession() {
   cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
   cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   delete cfg.outputDeviceId;
+  if (!Array.isArray(cfg.passthroughDeviceIds)) cfg.passthroughDeviceIds = [];
   const session = new Session({ id: entry.id || newSessionId(), config: cfg });
   session.resumeHandle = entry.resumeHandle || null;
   state.sessions.set(session.id, session);
@@ -1580,6 +1615,15 @@ function restoreSessionsFromStorage() {
   // Use the current UI snapshot as a fallback for any missing config fields,
   // then overlay the saved per-session config.
   const fallback = readConfigFromUI();
+  // Legacy migration source for passthroughDeviceIds: the device-list
+  // checkboxes haven't been rendered yet (refreshAudioOutputDevices runs
+  // after this), so readConfigFromUI returns []. Pull the seed straight
+  // from the prefs dataset that loadPrefs already populated.
+  let legacyPassthrough = [];
+  try {
+    legacyPassthrough = JSON.parse(els.audioOutput.dataset.preferredPassthrough || '[]');
+    if (!Array.isArray(legacyPassthrough)) legacyPassthrough = [];
+  } catch (_) { legacyPassthrough = []; }
   // If an older build saved more than MAX_SESSIONS, keep only the first N
   // visible. The rest are stashed in state.archivedSessions so saveSessions()
   // can write them back verbatim — they're not destroyed, just hidden until
@@ -1596,6 +1640,14 @@ function restoreSessionsFromStorage() {
     cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
     cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
     delete cfg.outputDeviceId;
+    // Migration: older saves don't carry passthroughDeviceIds (it lived in
+    // global prefs). If the saved entry omits the field, adopt the legacy
+    // prefs.passthroughDeviceIds (already staged into the audioOutput
+    // dataset by loadPrefs). Sessions saved by this build will have the
+    // field present and skip this fallback.
+    const savedHadPt = entry.config && Array.isArray(entry.config.passthroughDeviceIds);
+    if (!savedHadPt) cfg.passthroughDeviceIds = legacyPassthrough.slice();
+    else if (!Array.isArray(cfg.passthroughDeviceIds)) cfg.passthroughDeviceIds = [];
     const session = new Session({
       id: entry.id || newSessionId(),
       config: cfg,
@@ -2053,31 +2105,44 @@ function ensureAtLeastOneOutputTicked() {
   return true;
 }
 
+// Reads passthrough checkboxes from the device list — always reflects the
+// currently active session's settings UI (the panel re-renders on session
+// switch, so the DOM is a snapshot of the active session's config).
 function getPassthroughDeviceIds() {
   if (!els.audioOutput) return [];
   return Array.from(els.audioOutput.querySelectorAll('input.dev-passthrough:checked'))
     .map((cb) => cb.value);
 }
 
-// Starts/stops the global mic passthrough based on which devices have the
-// mic icon toggled on. Completely independent of translation sessions.
-async function applyPassthrough() {
-  const ids = getPassthroughDeviceIds();
-  const micId = els.audioInput ? els.audioInput.value || '' : '';
+function setPassthroughDeviceIds(ids) {
+  if (!els.audioOutput) return;
+  const want = new Set((ids || []).map((id) => id || ''));
+  els.audioOutput.querySelectorAll('input.dev-passthrough').forEach((cb) => {
+    cb.checked = want.has(cb.value);
+  });
+}
+
+// Starts/stops a single session's audio passthrough based on its
+// config.passthroughDeviceIds. The instance lives on session.micPassthrough
+// and persists across the session's running/stopped cycles — only the
+// sinks are reconfigured here.
+async function applyPassthrough(session) {
+  if (!session || !session.micPassthrough) return;
+  const ids = session.config.passthroughDeviceIds || [];
   try {
-    await state.micPassthrough.update(micId, ids);
+    await session.micPassthrough.update(ids);
     // Drain per-sink warnings so the user learns which specific device
     // failed and why, instead of a generic "could not start".
-    const warnings = state.micPassthrough.warnings || [];
+    const warnings = session.micPassthrough.warnings || [];
     for (const w of warnings) {
       const label = describeSelectedOutputs([w.deviceId || '']);
-      log('warn', `Mic passthrough to ${label}: ${w.reason}.`);
+      log('warn', `Audio passthrough to ${label}: ${w.reason}.`);
     }
-    if (ids.length > 0 && !state.micPassthrough.running && warnings.length === 0) {
-      log('warn', 'Mic passthrough could not start (check browser permissions).');
+    if (ids.length > 0 && !session.micPassthrough.running && warnings.length === 0) {
+      log('warn', 'Audio passthrough could not start (check browser permissions).');
     }
   } catch (e) {
-    log('warn', 'Mic passthrough error: ' + (e && e.message ? e.message : e));
+    log('warn', 'Audio passthrough error: ' + (e && e.message ? e.message : e));
   }
   refreshActiveDeviceIndicators();
 }
@@ -2370,7 +2435,12 @@ async function refreshAudioOutputDevices() {
     refreshActiveDeviceIndicators();
     // Await so the device-refresh path doesn't race a still-applying passthrough
     // start (the audio element may not yet have finished setSinkId/play).
-    await applyPassthrough();
+    // Each session's passthrough is per-session; apply across all sessions
+    // so background sessions also pick up the refresh (their checkbox state
+    // lives in config, not in the DOM list which is active-only).
+    for (const session of state.sessions.values()) {
+      await applyPassthrough(session);
+    }
   } catch (e) {
     setOutputDeviceListDisabled(true);
     els.audioOutputHint.textContent = 'Could not read audio output devices.';
@@ -2523,41 +2593,49 @@ function describeSelectedOutputs(ids) {
   return names.join(', ');
 }
 
-// Walks every running session + the global passthrough and reports which
-// concrete deviceIds are actually attached to a live mic track or a wired-up
-// sink right now. Used to paint the "live" badges in the device list.
+// Walks every running session and reports which concrete deviceIds are
+// actually attached to a live mic track or a wired-up sink right now. Used
+// to paint the "live" badges in the device list. Each session's
+// passthrough contributes its own mic + sink ids; the union across all
+// sessions is what the UI shows.
 function collectLiveDeviceState() {
   const micIds = new Set();
   const ttsIds = new Set();
   const passthroughIds = new Set();
   for (const session of state.sessions.values()) {
-    if (!session.running) continue;
-    if (session.capture && typeof session.capture.getActiveMicId === 'function') {
-      const mid = session.capture.getActiveMicId();
-      if (mid !== null) micIds.add(mid);
+    if (session.running) {
+      if (session.capture && typeof session.capture.getActiveMicId === 'function') {
+        const mid = session.capture.getActiveMicId();
+        if (mid !== null) micIds.add(mid);
+      }
+      if (session.player && typeof session.player.getActiveSinkIds === 'function') {
+        for (const sid of session.player.getActiveSinkIds()) ttsIds.add(sid);
+      }
     }
-    if (session.player && typeof session.player.getActiveSinkIds === 'function') {
-      for (const sid of session.player.getActiveSinkIds()) ttsIds.add(sid);
-    }
-  }
-  if (state.micPassthrough && state.micPassthrough.running) {
-    const mid = state.micPassthrough.getActiveMicId
-      ? state.micPassthrough.getActiveMicId() : null;
-    if (mid !== null) micIds.add(mid);
-    if (state.micPassthrough.getActiveSinkIds) {
-      for (const sid of state.micPassthrough.getActiveSinkIds()) passthroughIds.add(sid);
+    const pt = session.micPassthrough;
+    if (pt && pt.running) {
+      if (typeof pt.getActiveMicId === 'function') {
+        const mid = pt.getActiveMicId();
+        if (mid !== null) micIds.add(mid);
+      }
+      if (typeof pt.getActiveSinkIds === 'function') {
+        for (const sid of pt.getActiveSinkIds()) passthroughIds.add(sid);
+      }
     }
   }
   return { micIds, ttsIds, passthroughIds };
 }
 
-// Paints the current mic level (0..1) into the --pt-level CSS variable on
-// every .is-live-passthrough row, so the meter bar at the bottom of those
-// rows widens/narrows with the user's voice. Wired to MicPassthrough's
-// onLevel callback — fires at rAF rate via LevelMeter. Cheap when nothing
-// is live (querySelectorAll matches zero rows).
-function paintPassthroughLevel(level) {
+// Paints the current passthrough level (0..1) into the --pt-level CSS
+// variable on every .is-live-passthrough row, so the meter bar at the
+// bottom of those rows widens/narrows with the audio. Wired to each
+// session's MicPassthrough onLevel — fires at rAF rate via LevelMeter.
+// The device list reflects only the active session; ignore level pushes
+// from other sessions so a quieter background session doesn't drag down
+// the active row's reading.
+function paintPassthroughLevel(session, level) {
   if (!els.audioOutput) return;
+  if (!session || !isActive(session)) return;
   const pct = levelToPct(level);
   els.audioOutput
     .querySelectorAll('.device-option.is-live-passthrough')
@@ -2662,8 +2740,8 @@ function createCompanionCapture(session) {
   // conversion in between. Writer is a no-op when no passthrough device is
   // selected; the cost of calling write() is just a Map lookup + early
   // return inside MicPassthrough._writePcm16.
-  if (state.micPassthrough) {
-    session._passthroughPcm = state.micPassthrough.attachPcm16(session.id, 16000);
+  if (session.micPassthrough) {
+    session._passthroughPcm = session.micPassthrough.attachPcm16('companion', 16000);
   }
   return new LiveAudio.CompanionAudioCapture({
     onChunk: (buf) => {
@@ -2724,13 +2802,19 @@ async function changeAudioInput() {
     await nextCapture.start({ mode: audioMode, micDeviceId: session.config.micDeviceId });
     try { session.capture && session.capture.stop(); } catch (_) {}
     session.capture = nextCapture;
-    // Swap the passthrough's tab-audio attachment over to the new capture's
-    // display stream. attachStream is idempotent on the session.id key, so
-    // the previous entry is dropped and the new MediaStreamSource is wired
-    // (or queued if the passthrough is currently off).
-    if (audioMode === 'both' || audioMode === 'display') {
-      const ds = nextCapture.getDisplayStream && nextCapture.getDisplayStream();
-      if (ds && state.micPassthrough) state.micPassthrough.attachStream(session.id, ds);
+    // Swap the passthrough's mic and tab-audio attachments over to the new
+    // capture's streams. attachStream is idempotent on its key, so the
+    // previous entries are dropped and the new MediaStreamSources are wired
+    // (or queued if the passthrough's sinks aren't live).
+    if (session.micPassthrough) {
+      if (audioMode === 'mic' || audioMode === 'both') {
+        const ms = nextCapture.getMicStream && nextCapture.getMicStream();
+        if (ms) session.micPassthrough.attachStream('mic', ms);
+      }
+      if (audioMode === 'both' || audioMode === 'display') {
+        const ds = nextCapture.getDisplayStream && nextCapture.getDisplayStream();
+        if (ds) session.micPassthrough.attachStream('display', ds);
+      }
     }
     await refreshAudioInputDevices();
     log('info', 'Microphone changed: ' + (els.audioInput.selectedOptions[0]?.textContent || 'System default'));
@@ -2740,8 +2824,10 @@ async function changeAudioInput() {
   } finally {
     session._swappingCapture = false;
   }
-  // Passthrough uses the same mic — restart it with the new device.
-  applyPassthrough();
+  // Re-apply this session's passthrough so any sink-list change picked up
+  // alongside the device swap is applied; the mic attachment above already
+  // routes the new stream into the existing mix.
+  applyPassthrough(session);
 }
 
 // ─── Status pill / per-session display ────────────────────────────────────────
@@ -3241,16 +3327,20 @@ async function startSession(session) {
     } else {
       session.capture = createAudioCapture(session);
       await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
-      // If the user is capturing tab audio (display or both), also feed the
-      // raw display MediaStream into the passthrough mix. Tap is pre-worklet,
-      // so the virtual cable receives full-quality stereo at the source's
-      // native rate (the Gemini-bound mono/16kHz downmix happens on a
-      // separate branch). No-op when no passthrough device is selected — the
-      // attachment sits in the registry until the user toggles one on.
-      if (audioMode === 'display' || audioMode === 'both') {
-        const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
-        if (displayStream && state.micPassthrough) {
-          state.micPassthrough.attachStream(session.id, displayStream);
+      // Feed the raw mic/display MediaStreams into this session's passthrough
+      // mix. Tap is pre-worklet, so the virtual cable receives full-quality
+      // audio at the source's native rate (the Gemini-bound mono/16kHz
+      // downmix happens on a separate branch). No-op when no passthrough
+      // device is selected — attachments sit in the registry until the user
+      // toggles one on.
+      if (session.micPassthrough) {
+        if (audioMode === 'mic' || audioMode === 'both') {
+          const micStream = session.capture.getMicStream && session.capture.getMicStream();
+          if (micStream) session.micPassthrough.attachStream('mic', micStream);
+        }
+        if (audioMode === 'display' || audioMode === 'both') {
+          const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
+          if (displayStream) session.micPassthrough.attachStream('display', displayStream);
         }
       }
     }
@@ -3328,11 +3418,12 @@ async function stopSession(session) {
   saveSessions();
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
-  // Drop the session's passthrough attachments now that capture is gone.
-  // The mic source in the passthrough is independent and keeps routing as
-  // long as the user has a passthrough device selected.
-  if (state.micPassthrough) {
-    state.micPassthrough.detachStream(session.id);
+  // Drop the session's source attachments now that capture is gone. The
+  // passthrough's sink graph stays wired so the user's chosen routing
+  // survives the stop/start cycle — only the sources are detached here.
+  if (session.micPassthrough) {
+    session.micPassthrough.detachStream('mic');
+    session.micPassthrough.detachStream('display');
   }
   if (session._passthroughPcm) {
     try { session._passthroughPcm.close(); } catch (_) {}
@@ -4708,8 +4799,15 @@ function wireUI() {
   }
   els.audioOutput.addEventListener('change', (e) => {
     if (e.target.classList.contains('dev-passthrough')) {
+      const session = activeSession();
+      if (session) {
+        session.config.passthroughDeviceIds = getPassthroughDeviceIds();
+        saveSessions();
+        applyPassthrough(session);
+      }
+      // Also persist as the default for newly-created sessions so a
+      // freshly-opened tab inherits the user's most recent selection.
       savePrefs();
-      applyPassthrough();
     } else {
       changeAudioOutput();
     }
@@ -4938,7 +5036,9 @@ function wireUI() {
       // not every running-state path here was guaranteed to flow through it.
       if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
     }
-    try { state.micPassthrough.stop(); } catch (_) {}
+    for (const session of state.sessions.values()) {
+      try { session.micPassthrough && session.micPassthrough.stop(); } catch (_) {}
+    }
     try { state.inputPreview && state.inputPreview.stop(); } catch (_) {}
     if (state.pip) state.pip.close();
   });
@@ -4955,8 +5055,8 @@ function wireUI() {
     for (const session of state.sessions.values()) {
       if (session.player && session.player.ctx) ctxs.push(session.player.ctx);
       if (session.capture && session.capture.ctx) ctxs.push(session.capture.ctx);
+      if (session.micPassthrough && session.micPassthrough.ctx) ctxs.push(session.micPassthrough.ctx);
     }
-    if (state.micPassthrough && state.micPassthrough.ctx) ctxs.push(state.micPassthrough.ctx);
     for (const ctx of ctxs) {
       if (ctx.state === 'suspended') { ctx.resume().catch(() => {}); }
     }
@@ -4997,12 +5097,13 @@ function wireUI() {
   }
 }
 
-// True when any session is running OR mic passthrough is live — i.e. there
-// is at least one device the indicators might need to reflect.
+// True when any session is running OR any session's audio passthrough is
+// live — i.e. there is at least one device the indicators might need to
+// reflect.
 function hasActiveAudio() {
-  if (state.micPassthrough && state.micPassthrough.running) return true;
   for (const s of state.sessions.values()) {
     if (s.running) return true;
+    if (s.micPassthrough && s.micPassthrough.running) return true;
   }
   return false;
 }

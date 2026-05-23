@@ -846,7 +846,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 }
 #btn-mic-preview.is-active .icon { animation: live-pulse 1.6s ease-out infinite; }
 
-/* Right: mic passthrough toggle (decoupled from sessions) */
+/* Right: per-row passthrough toggle (each device row in the output list) */
 .passthrough-toggle {
   display: flex; align-items: center; justify-content: center;
   padding: 10px 14px;
