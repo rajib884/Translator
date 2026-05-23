@@ -29,12 +29,10 @@ push-to-talk keyboard hook.
    │   └─────┬───────┘   └─────┬────────┘            ▲                           │
    │         │ PCM16            │ JSON envelopes      │ TTSCoordinator (global)  │
    │         ▼                  ▼                                                │
-   │   MicPassthrough     transcript callbacks ──▶ DOM (live turn, history)      │
-   │         │                                                                   │
-   │         ▼                                                                   │
-   │   virtual-cable sinks                                                       │
-   │                                                                             │
-   └────────────────────────────┬────────────────────────────────────────────────┘
+   │   CompanionPassthrough  transcript callbacks ──▶ DOM (live turn, history)   │
+   │         │ (WS to companion's /passthrough — capture + mix + render run in   │
+   │         │ the .exe; this class only ships sink list + source descriptor)    │
+   └─────────┼───────────────────────┬────────────────────────────────────────────┘
                                 │ WSS
                                 ▼
                 Gemini Live  (generativelanguage.googleapis.com)
@@ -43,10 +41,12 @@ push-to-talk keyboard hook.
   optional, localhost:
    ┌──────────────────────────────────────────────────────────┐
    │ companion/windows/live-translator-companion.exe          │
-   │   GET  /status      service health                       │
-   │   GET  /apps        JSON list of audible processes       │
-   │   WS   /audio[?pid] 16 kHz mono PCM16 loopback           │
-   │   WS   /hotkey      JSON bind + key-down/up events       │
+   │   GET  /status        service health                     │
+   │   GET  /apps          JSON list of audible processes     │
+   │   GET  /outputs       JSON list of WASAPI render endpoints│
+   │   WS   /audio[?pid]   16 kHz mono PCM16 loopback         │
+   │   WS   /hotkey        JSON bind + key-down/up events     │
+   │   WS   /passthrough   per-session capture + mix + render │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -56,12 +56,12 @@ push-to-talk keyboard hook.
 
 | Path | Lines | Role |
 |---|---|---|
-| [index.html](index.html) | 420 | Layout, semantic landmarks, sheet/modal scaffolding, control bar, session-tab strip. Three UI modes (`Basic / Advanced / Full`) gated purely by CSS classes (`.advanced-only`, `.full-only`). |
-| [css/style.css](css/style.css) | 1122 | Mobile-first responsive theme; sidebar↔overlay, status pill colors, segmented controls, live meter visuals, dark palette. |
-| [js/audio.js](js/audio.js) | 1056 | All audio plumbing: capture (mic+display), companion WS capture, TTS playback (multi-sink), mic passthrough mix, settings-panel input preview, shared LevelMeter. |
-| [js/gemini-live.js](js/gemini-live.js) | 573 | Gemini Live WebSocket client. Setup payload, message dispatch, GoAway → resume handoff, exponential reconnect, backpressure, system-prompt templates. |
-| [js/app.js](js/app.js) | 4704 | Everything else. Session model, TTSCoordinator, PTT client, PiP, persistence, UI wiring, lifecycle. |
-| [companion/windows/src/main.cpp](companion/windows/src/main.cpp) | 1228 | Native HTTP + WS server. Default-render or per-PID loopback via WASAPI; global low-level keyboard hook for PTT. |
+| [index.html](index.html) | 450 | Layout, semantic landmarks, sheet/modal scaffolding, control bar, session-tab strip. Three UI modes (`Basic / Advanced / Full`) gated purely by CSS classes (`.advanced-only`, `.full-only`). |
+| [css/style.css](css/style.css) | 1191 | Mobile-first responsive theme; sidebar↔overlay, status pill colors, segmented controls, live meter visuals, dark palette. |
+| [js/audio.js](js/audio.js) | 1040 | All audio plumbing: capture (mic+display), companion WS capture, TTS playback (multi-sink), companion-side passthrough client, settings-panel input preview, shared LevelMeter. |
+| [js/gemini-live.js](js/gemini-live.js) | 619 | Gemini Live WebSocket client. Setup payload, message dispatch, GoAway → resume handoff, exponential reconnect, backpressure, system-prompt templates. |
+| [js/app.js](js/app.js) | 5278 | Everything else. Session model, TTSCoordinator, PTT client, PiP, persistence, UI wiring, lifecycle. |
+| [companion/windows/src/main.cpp](companion/windows/src/main.cpp) | 2513 | Native HTTP + WS server. Default-render or per-PID loopback via WASAPI; global low-level keyboard hook for PTT; per-session passthrough engine (capture + mix + multi-sink WASAPI render). |
 | [README.md](README.md) | 238 | User-facing readme. |
 | [plan.md](plan.md) | 202 | Working analysis of seamless-handoff feasibility — not implemented, but the seams it identifies are real. |
 | [Documentation/](Documentation/) | — | Vendored Google Live API docs (read-only reference). |
@@ -88,12 +88,14 @@ Every translation pipeline is owned by a `Session`. The browser holds up to
   - `capture` — `AudioCapture` or `CompanionAudioCapture`.
   - `player` — `TTSPlayer` for audio mode, `null` for text/transcribe.
   - `resumeHandle` — latest session-resumption token. Persisted to localStorage.
-- **Per-session passthrough**: `session.micPassthrough` — a `MicPassthrough`
-  instance created with the Session and torn down on `closeSession`. Its
-  enabled set (`config.passthroughDeviceIds`) and lifecycle are independent
-  of `running`/`stopped`; source attachments (mic, display, companion PCM)
-  flow in at `startSession` and out at `stopSession`, but the sink graph
-  survives so the user's routing persists across start/stop cycles.
+- **Per-session passthrough**: `session.micPassthrough` — a `CompanionPassthrough`
+  instance created with the Session and torn down on `closeSession`. Audio
+  capture, mixing, and render now happen entirely in the .exe; this object
+  is just a per-session WebSocket client to `/passthrough`. The user's
+  selection (`config.passthroughDeviceIds`) survives `running`/`stopped`
+  cycles; the WS itself only stays open while the session is running AND
+  has at least one sink + one source. Sources are mirrored from the
+  session's audioSource config — see §5.3.
 - **Transcript state**: `liveTurn` (in-progress DOM nodes), `pendingInput` /
   `pendingOutput` buffers, finalized `history[]`.
 - **DOM handles**: tab chip, status bits, meter fills, transcript host.
@@ -313,28 +315,48 @@ totally failed devices are dropped and a warning is added. `_applyDevicesQueue`
 is a serial promise queue so a `playChunk` can never schedule into a
 half-torn-down sink graph.
 
-### 5.3 Audio passthrough (`MicPassthrough`) — [js/audio.js:722-1015](js/audio.js#L722-L1015)
+### 5.3 Audio passthrough (`CompanionPassthrough`) — [js/audio.js:734-908](js/audio.js#L734-L908)
 
-One instance **per Session** (`session.micPassthrough`). A pure
-mixer/router: attached sources funnel through a shared `_mixNode`
-(`GainNode`) and out to one or more user-chosen output devices — typically a
-virtual cable so the translated meeting audio + the session's spoken-input
-arrives on the other side.
+One instance **per Session** (`session.micPassthrough`). A thin WebSocket
+client to the companion's `/passthrough` endpoint — the .exe owns capture,
+mixing, and render. The browser-side class only:
 
-The class does **not** open its own mic. Sources are attached by the owning
-session at native rate, so the sinks receive full-quality audio rather than
-the 16 kHz downsample sent to Gemini:
+1. Maintains the WS lifetime (open when sinks + sources are both present,
+   closed otherwise — no point keeping the cable rendering silence).
+2. Ships a `{ action: "configure", sinks, micId, micLabel, pid, loopback }`
+   payload whenever the user's selection or the session's source descriptor
+   changes.
+3. Receives periodic `{ event: "level", peak }` frames from the companion
+   and pushes them into `paintPassthroughLevel` for the device-list meter.
 
-- `attachStream('mic', stream)` — raw mic `MediaStream` from `AudioCapture.getMicStream()`.
-- `attachStream('display', stream)` — raw display/tab `MediaStream` from `AudioCapture.getDisplayStream()`.
-- `attachPcm16('companion', 16000)` — writer for companion PCM (already native 16 kHz).
+The **source descriptor** is mirrored from the session's audioSource config
+([buildPassthroughSources in js/app.js](js/app.js)). What the session feeds
+Gemini is what the companion captures for the passthrough:
 
-`start(deviceIds)` / `update(deviceIds)` reconfigure the sink set; the source
-registries persist across stop/start so a sink-list change doesn't drop the
-attached audio. The enabled state (`config.passthroughDeviceIds`) is
-independent of the session's running/stopped state — only the *sources*
-come and go with `startSession` / `stopSession`. The instance itself is
-torn down in `closeSession`.
+| `audioSource` | Companion passthrough source |
+|---|---|
+| `mic`       | WASAPI capture endpoint matched by friendly-name to the browser's mic dropdown label |
+| `companion` | WASAPI loopback (per-pid if `companionApp` is set, otherwise system loopback) |
+| `both`      | mic only — display/tab passthrough was dropped (companion can't `getDisplayMedia`) |
+| `display`   | none — passthrough goes silent for display-only mode |
+
+The **sink list** is companion-enumerated render endpoints, picked by the
+user in the "Passthrough output" UI section. Different ID space from the
+browser-side TTS output section above it: passthrough ids are WASAPI
+endpoint strings (`{0.0.0.00000000}.{guid}`), TTS ids are origin-hashed
+`MediaDeviceInfo.deviceId` values — they don't interchange.
+
+The user's selection (`config.passthroughDeviceIds`) survives running/stopped
+cycles. The WS lifetime does not: stopping the session closes the WS so the
+companion stops its render threads; starting the session re-opens with the
+saved sinks plus the mirrored source. The instance itself is torn down in
+`closeSession`.
+
+> Trade-off: under `audioSource = 'mic'` or `'companion'`, the companion
+> opens its own capture in addition to the session's Gemini-bound capture.
+> That doubles the OS audio-session count (two mic indicators or two
+> per-pid loopback activations on the same target), but isolates the
+> passthrough render entirely from the browser's audio graph.
 
 ### 5.4 Shared `LevelMeter` — [js/audio.js:15-68](js/audio.js#L15-L68)
 
@@ -479,10 +501,12 @@ sent anywhere but Google.
 
 | Endpoint | Notes |
 |---|---|
-| `GET /status` | Plain text; used as a liveness probe by the browser. |
+| `GET /status` | JSON: `{ status, version, audio, features }`. Used as a liveness probe by the browser. `features` list includes `passthrough` so the UI can hide the section on companions too old to know it. |
 | `GET /apps`   | Enumerates audio sessions on the default render device, groups by exe, returns lowest PID per group. Only apps *currently making sound* appear. |
+| `GET /outputs`| JSON: `{ outputs: [{ id, name, isDefault }] }`. WASAPI render endpoints, surfaced by the browser's "Passthrough output" picker. Distinct ID space from `MediaDeviceInfo.deviceId` — these strings come straight from `IMMDevice::GetId`. |
 | `WS /audio[?pid=N]` | Binary frames of 16 kHz mono PCM16 (≤ 100 ms each). With `pid`, uses `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` and `INCLUDE_TARGET_PROCESS_TREE` to capture the process tree (so Chrome's many child processes are picked up via the parent PID). |
 | `WS /hotkey`  | JSON. Client sends `{ action: "bind", vkCode, ctrl, shift, alt, win, exclusive }`. Companion installs a `WH_KEYBOARD_LL` hook and forwards `{ event: "down" }` / `{ event: "up" }`. One binding per connection. |
+| `WS /passthrough` | Per-session passthrough engine. Client sends `{ action: "configure", sinks: [endpointId…], micId, micLabel, pid, loopback }`; companion captures the requested mic + loopback at 48 kHz stereo float, mixes into a per-sink ring buffer, and renders to each WASAPI endpoint with its own event-driven render thread. Replies with `{ event: "ready", sinks, mic, loopback, warnings }` after each configure and `{ event: "level", peak }` ~12×/sec. Closing the WS tears down every thread for that session. |
 
 Per-app capture needs Windows 10 build 20348+; SDK-aware fallback declarations
 let the source compile on older SDKs but the runtime requirement is the same.
@@ -521,17 +545,19 @@ spot a violation before it ships.
    future code path that grabs the speaker slot must also release it.
 7. **`AudioCapture._abortStart` runs on every throw in `start`.** Leaks the
    mic indicator + AudioContext otherwise.
-8. **`TTSPlayer._applyDevicesQueue` and `MicPassthrough._writePcm16`
-   short-circuit when the graph isn't fully wired.** Don't bypass the queue.
+8. **`TTSPlayer._applyDevicesQueue` short-circuits when the graph isn't
+   fully wired.** Don't bypass the queue. (Passthrough's old `_writePcm16`
+   queue is gone — the companion owns mixing now.)
 9. **`session._stopping` is one-shot per stop.** `stopSession` can be entered
    from a user click, a WS close, a display-share end, *and* page unload —
    sometimes concurrently. The guard makes it idempotent.
-10. **Exactly one `MicPassthrough` per Session, torn down on close.** Source
-    attachments use fixed keys (`'mic'` / `'display'` / `'companion'`) inside
-    that instance — not session ids, since each instance is already
-    per-session. The passthrough's enabled set lives in
-    `session.config.passthroughDeviceIds` and survives `startSession` /
-    `stopSession`; only the source attachments come and go.
+10. **Exactly one `CompanionPassthrough` per Session, torn down on close.**
+    Each instance owns one WebSocket to the companion's `/passthrough` and
+    is solely responsible for that session's routing. The user's sink
+    selection lives in `session.config.passthroughDeviceIds` and survives
+    `startSession` / `stopSession`; the WS is opened in `startSession` (via
+    `applyPassthrough`) and closed in `stopSession` (the companion captures
+    nothing while the session is idle).
 
 ---
 

@@ -203,6 +203,9 @@ const els = {
   audioOutput:   $('audio-output'),
   audioOutputSection: $('audio-output-section'),
   audioOutputHint:$('audio-output-hint'),
+  passthroughOutput: $('passthrough-output'),
+  passthroughOutputSection: $('passthrough-output-section'),
+  passthroughOutputHint: $('passthrough-output-hint'),
   btnDetectDevices: $('btn-detect-devices'),
   modeSelect:    segProxy($('mode-segmented')),
   modeHint:      $('mode-hint'),
@@ -328,11 +331,9 @@ class Session {
     // running/stopped. Sources (mic, display, companion PCM) attach during
     // startSession and detach during stopSession; the sink graph itself
     // survives across cycles so the user's chosen routing isn't lost.
-    this.micPassthrough = new LiveAudio.MicPassthrough({
+    this.micPassthrough = new LiveAudio.CompanionPassthrough({
       onLevel: (l) => paintPassthroughLevel(this, l),
     });
-    // Companion PCM writer, allocated alongside CompanionAudioCapture.
-    this._passthroughPcm = null;
   }
 
   get isAudio() { return this.config.mode === 'audio'; }
@@ -735,6 +736,10 @@ const state = {
   systemPromptTemplate: null,
   companionAvailable: false,
   companionApps: [],
+  // Companion-enumerated render endpoints for the passthrough section.
+  // Refreshed by refreshPassthroughOutputDevices() whenever the companion
+  // becomes available or the user clicks the refresh button.
+  passthroughOutputs: [],
 };
 
 // Mirror the TTS coordinator's "who's speaking now" signal into PiP follow
@@ -786,7 +791,8 @@ function resetAdvancedSettingsForBasic() {
   els.audioInput.value = '';
   els.audioInput.dataset.preferred = '';
   els.audioOutput.dataset.preferred = JSON.stringify(['']);
-  els.audioOutput.dataset.preferredPassthrough = JSON.stringify([]);
+  if (els.passthroughOutput) els.passthroughOutput.dataset.preferred = JSON.stringify([]);
+  setPassthroughDeviceIds([]);
   setSelectedOutputDeviceIds(['']);
   els.speechMode.value = 'auto';
   els.vadPreset.value = DEFAULT_VAD_PRESET;
@@ -1376,7 +1382,9 @@ function loadSessionConfigIntoUI(session) {
   const ptIds = Array.isArray(cfg.passthroughDeviceIds) ? cfg.passthroughDeviceIds : [];
   cfg.passthroughDeviceIds = ptIds;
   setPassthroughDeviceIds(ptIds);
-  els.audioOutput.dataset.preferredPassthrough = JSON.stringify(ptIds);
+  if (els.passthroughOutput) {
+    els.passthroughOutput.dataset.preferred = JSON.stringify(ptIds);
+  }
   if (els.companionApp) {
     els.companionApp.value = cfg.companionApp || '';
     els.companionApp.dataset.preferred = cfg.companionApp || '';
@@ -1615,13 +1623,17 @@ function restoreSessionsFromStorage() {
   // Use the current UI snapshot as a fallback for any missing config fields,
   // then overlay the saved per-session config.
   const fallback = readConfigFromUI();
-  // Legacy migration source for passthroughDeviceIds: the device-list
-  // checkboxes haven't been rendered yet (refreshAudioOutputDevices runs
-  // after this), so readConfigFromUI returns []. Pull the seed straight
-  // from the prefs dataset that loadPrefs already populated.
+  // Seed for sessions saved before passthroughDeviceIds moved into per-session
+  // config — they took the value from global prefs. The new section's
+  // dataset.preferred was populated by loadPrefs already; read it here so
+  // entries that lacked the field inherit the user's last choice. Stored
+  // values are now WASAPI endpoint ids (from the companion); any legacy
+  // browser deviceIds get dropped silently the first time
+  // refreshPassthroughOutputDevices rebuilds the list.
   let legacyPassthrough = [];
   try {
-    legacyPassthrough = JSON.parse(els.audioOutput.dataset.preferredPassthrough || '[]');
+    const seed = els.passthroughOutput && els.passthroughOutput.dataset.preferred;
+    legacyPassthrough = JSON.parse(seed || '[]');
     if (!Array.isArray(legacyPassthrough)) legacyPassthrough = [];
   } catch (_) { legacyPassthrough = []; }
   // If an older build saved more than MAX_SESSIONS, keep only the first N
@@ -1887,6 +1899,20 @@ async function detectCompanionService({ silent = true } = {}) {
   if (state.companionAvailable && els.companionApp) {
     refreshCompanionApps({ silent: true });
   }
+  // Passthrough sinks live entirely on the companion now — refresh the
+  // device list (or hide the section if companion just dropped).
+  if (els.passthroughOutput) {
+    refreshPassthroughOutputDevices().catch(() => {});
+  }
+  // Tear down passthrough WS on sessions when companion disappears so
+  // the per-session client doesn't keep retrying a dead endpoint.
+  if (wasAvailable && !state.companionAvailable) {
+    for (const s of state.sessions.values()) {
+      if (s.micPassthrough) {
+        try { s.micPassthrough.stop(); } catch (_) {}
+      }
+    }
+  }
   return state.companionAvailable;
 }
 
@@ -1975,7 +2001,9 @@ function fillLanguages() {
   els.audioSource.value = prefs.audio  || 'mic';
   const prefOutIds = normalizeOutputDeviceIds(prefs.outputs, prefs.output);
   els.audioOutput.dataset.preferred = JSON.stringify(prefOutIds);
-  els.audioOutput.dataset.preferredPassthrough = JSON.stringify(prefs.passthroughDeviceIds || []);
+  if (els.passthroughOutput) {
+    els.passthroughOutput.dataset.preferred = JSON.stringify(prefs.passthroughDeviceIds || []);
+  }
   setSelectedOutputDeviceIds(prefOutIds);
   if (els.companionApp) {
     els.companionApp.dataset.preferred = prefs.companionApp || '';
@@ -2105,46 +2133,167 @@ function ensureAtLeastOneOutputTicked() {
   return true;
 }
 
-// Reads passthrough checkboxes from the device list — always reflects the
-// currently active session's settings UI (the panel re-renders on session
-// switch, so the DOM is a snapshot of the active session's config).
+// Reads passthrough checkboxes from the dedicated companion-output section.
+// The values stored here are WASAPI render endpoint ids (returned by the
+// companion's /outputs enumeration) — distinct ID space from the browser's
+// MediaDeviceInfo.deviceId values that live in the TTS section above.
 function getPassthroughDeviceIds() {
-  if (!els.audioOutput) return [];
-  return Array.from(els.audioOutput.querySelectorAll('input.dev-passthrough:checked'))
+  if (!els.passthroughOutput) return [];
+  return Array.from(els.passthroughOutput.querySelectorAll('input.dev-passthrough:checked'))
     .map((cb) => cb.value);
 }
 
 function setPassthroughDeviceIds(ids) {
-  if (!els.audioOutput) return;
+  if (!els.passthroughOutput) return;
   const want = new Set((ids || []).map((id) => id || ''));
-  els.audioOutput.querySelectorAll('input.dev-passthrough').forEach((cb) => {
+  els.passthroughOutput.querySelectorAll('input.dev-passthrough').forEach((cb) => {
     cb.checked = want.has(cb.value);
   });
 }
 
-// Starts/stops a single session's audio passthrough based on its
-// config.passthroughDeviceIds. The instance lives on session.micPassthrough
-// and persists across the session's running/stopped cycles — only the
-// sinks are reconfigured here.
+async function refreshPassthroughOutputDevices() {
+  if (!els.passthroughOutput) return;
+  if (!state.companionAvailable) {
+    setPassthroughSectionVisible(false);
+    return;
+  }
+  let endpoints = [];
+  try {
+    const res = await fetchWithTimeout(`${COMPANION_HTTP_URL}/outputs`, {
+      mode: 'cors',
+      cache: 'no-store',
+      headers: { 'X-Live-Translator': 'outputs' },
+    }, 1500);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    endpoints = Array.isArray(data && data.outputs) ? data.outputs : [];
+  } catch (e) {
+    log('warn', 'Could not list passthrough outputs: ' + (e && e.message ? e.message : e));
+    setPassthroughSectionVisible(false);
+    return;
+  }
+  state.passthroughOutputs = endpoints;
+
+  // Same "honour live selection over snapshot" pattern the TTS list uses —
+  // any in-flight checkbox click survives the rebuild.
+  let preferred = [];
+  try { preferred = JSON.parse(els.passthroughOutput.dataset.preferred || '[]'); }
+  catch (_) {}
+  if (!Array.isArray(preferred)) preferred = [];
+  const currently = new Set(getPassthroughDeviceIds());
+  const wanted = new Set([...currently, ...preferred.map((v) => v || '')]);
+
+  const frag = document.createDocumentFragment();
+  for (const ep of endpoints) {
+    const id = ep.id || '';
+    const label = ep.isDefault && ep.name ? `${ep.name} (default)` : (ep.name || id);
+    frag.appendChild(buildPassthroughDeviceOption(id, label, wanted.has(id)));
+  }
+  els.passthroughOutput.innerHTML = '';
+  els.passthroughOutput.appendChild(frag);
+  els.passthroughOutput.dataset.preferred = JSON.stringify(getPassthroughDeviceIds());
+
+  if (els.passthroughOutputHint) {
+    els.passthroughOutputHint.textContent = endpoints.length
+      ? 'Tick a virtual cable or speaker to route this session’s source audio there.'
+      : 'No render endpoints reported by the companion.';
+  }
+  setPassthroughSectionVisible(true);
+  refreshActiveDeviceIndicators();
+
+  // Re-apply every running session's passthrough so a refresh that surfaces
+  // a newly-added endpoint immediately starts routing if it was already in
+  // the saved selection.
+  for (const session of state.sessions.values()) {
+    await applyPassthrough(session);
+  }
+}
+
+function setPassthroughSectionVisible(show) {
+  if (!els.passthroughOutputSection) return;
+  els.passthroughOutputSection.style.display = show ? '' : 'none';
+}
+
+// Drive a single session's passthrough configuration on the companion. The
+// sink list comes from config.passthroughDeviceIds (WASAPI render endpoint
+// ids, populated by the Passthrough output section in the UI). The source
+// descriptor mirrors what the session is feeding Gemini — mic label and/or
+// loopback pid — so the companion captures the same audio that's being
+// translated and fans it out to the user's chosen virtual cables. Display/
+// tab passthrough is unavailable on the companion side (only the browser
+// can do getDisplayMedia) and is silently dropped from the source set; the
+// "both" audioSource still routes its mic half.
 async function applyPassthrough(session) {
   if (!session || !session.micPassthrough) return;
-  const ids = session.config.passthroughDeviceIds || [];
+  const ids = (session.config.passthroughDeviceIds || []).slice();
+  const sources = buildPassthroughSources(session);
   try {
-    await session.micPassthrough.update(ids);
-    // Drain per-sink warnings so the user learns which specific device
-    // failed and why, instead of a generic "could not start".
+    await session.micPassthrough.configure(ids, sources);
     const warnings = session.micPassthrough.warnings || [];
     for (const w of warnings) {
-      const label = describeSelectedOutputs([w.deviceId || '']);
-      log('warn', `Audio passthrough to ${label}: ${w.reason}.`);
-    }
-    if (ids.length > 0 && !session.micPassthrough.running && warnings.length === 0) {
-      log('warn', 'Audio passthrough could not start (check browser permissions).');
+      const label = w.deviceId
+          ? describePassthroughOutput(w.deviceId)
+          : 'passthrough';
+      log('warn', `Audio passthrough ${label}: ${w.reason}.`);
     }
   } catch (e) {
     log('warn', 'Audio passthrough error: ' + (e && e.message ? e.message : e));
   }
   refreshActiveDeviceIndicators();
+}
+
+// Source descriptor for the companion's per-session passthrough engine.
+// Mirrors the session's current audioSource so the virtual cable hears the
+// same thing being translated. Returns an empty descriptor when the session
+// isn't running — the WS still has its sinks remembered in passthroughDeviceIds,
+// but the companion has nothing to capture until startSession brings sources
+// online again.
+function buildPassthroughSources(session) {
+  const empty = { micId: '', micLabel: '', pid: 0, loopback: false };
+  if (!session || !session.running) return empty;
+  const mode = session.currentAudioMode || session.config.audioSource || 'mic';
+  const out = { ...empty };
+  if (mode === 'mic' || mode === 'both') {
+    // Browser device ids are origin-hashed and can't be used outside this
+    // page — the companion matches by friendly name instead. The mic dropdown
+    // option text is sourced from MediaDeviceInfo.label, which is what the
+    // companion's WASAPI capture endpoints report as their friendly name.
+    out.micLabel = lookupMicLabel(session.config.micDeviceId);
+  }
+  if (mode === 'companion') {
+    out.loopback = true;
+    const exe = session.config.companionApp;
+    if (exe) {
+      const match = state.companionApps && state.companionApps.find((a) => a.name === exe);
+      if (match) out.pid = match.pid;
+    }
+  }
+  // 'display' alone has no companion-capturable source; the passthrough goes
+  // silent for that mode (cable plays silence). Documented limitation.
+  return out;
+}
+
+function hasAnyPassthroughSource(s) {
+  return !!s && (s.micId || s.micLabel || s.pid || s.loopback);
+}
+
+function lookupMicLabel(deviceId) {
+  if (!els.audioInput) return '';
+  const value = deviceId || '';
+  const opts = els.audioInput.querySelectorAll('option');
+  for (const o of opts) {
+    if (o.value === value) return o.textContent || '';
+  }
+  return '';
+}
+
+function describePassthroughOutput(id) {
+  if (!els.passthroughOutput) return id || 'output';
+  const cb = els.passthroughOutput.querySelector(`input.dev-passthrough[value="${cssEscape(id)}"]`);
+  if (!cb) return id || 'output';
+  const row = cb.closest('.device-option');
+  const span = row && row.querySelector('.device-name');
+  return span ? span.textContent : (id || 'output');
 }
 
 // ─── Input device preview ────────────────────────────────────────────────────
@@ -2373,11 +2522,6 @@ async function refreshAudioOutputDevices() {
     catch (_) { preferred = []; }
     if (!Array.isArray(preferred)) preferred = [];
 
-    let prefPassthrough = [];
-    try { prefPassthrough = JSON.parse(els.audioOutput.dataset.preferredPassthrough || '[]'); }
-    catch (_) { prefPassthrough = []; }
-    if (!Array.isArray(prefPassthrough)) prefPassthrough = [];
-
     const devices = await navigator.mediaDevices.enumerateDevices();
 
     // Re-read selection AFTER the enumerate await — a user click that landed
@@ -2385,10 +2529,7 @@ async function refreshAudioOutputDevices() {
     // the await. (Race fix: previously we snapshotted before the await and
     // any toggle made during enumeration was reverted by the rebuild.)
     const currently = new Set(getSelectedOutputDeviceIds());
-    const currentPt = new Set(getPassthroughDeviceIds());
-    // Anything currently ticked wins over stale dataset values.
     const wantedTts = new Set([...currently, ...preferred.map((v) => v || '')]);
-    const wantedPt  = new Set([...currentPt, ...prefPassthrough.map((v) => v || '')]);
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
     const seen = new Set();
     const frag = document.createDocumentFragment();
@@ -2400,7 +2541,7 @@ async function refreshAudioOutputDevices() {
     const sysDefaultLabel = (defaultOutEntry && defaultOutEntry.label)
       ? defaultOutEntry.label
       : 'System default';
-    frag.appendChild(buildDeviceOption('', sysDefaultLabel, wantedTts.has(''), wantedPt.has('')));
+    frag.appendChild(buildDeviceOption('', sysDefaultLabel, wantedTts.has('')));
     seen.add('');
 
     outputs.forEach((device, index) => {
@@ -2411,7 +2552,7 @@ async function refreshAudioOutputDevices() {
       if (id === 'default' || id === 'communications') return;
       if (seen.has(id)) return;
       seen.add(id);
-      frag.appendChild(buildDeviceOption(id, outputDeviceLabel(device, index), wantedTts.has(id), wantedPt.has(id)));
+      frag.appendChild(buildDeviceOption(id, outputDeviceLabel(device, index), wantedTts.has(id)));
     });
 
     els.audioOutput.innerHTML = '';
@@ -2421,26 +2562,17 @@ async function refreshAudioOutputDevices() {
     // or the user previously saved an empty selection, System default wins.
     ensureAtLeastOneOutputTicked();
     els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
-    els.audioOutput.dataset.preferredPassthrough = JSON.stringify(getPassthroughDeviceIds());
 
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
       els.audioOutputHint.textContent = hasLabels
-        ? 'Tick speakers for translated audio; tap the mic icon to also route your microphone there.'
+        ? 'Tick speakers for translated audio.'
         : 'Device names may appear after microphone permission.';
     } else {
       els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
     }
     savePrefs();
     refreshActiveDeviceIndicators();
-    // Await so the device-refresh path doesn't race a still-applying passthrough
-    // start (the audio element may not yet have finished setSinkId/play).
-    // Each session's passthrough is per-session; apply across all sessions
-    // so background sessions also pick up the refresh (their checkbox state
-    // lives in config, not in the DOM list which is active-only).
-    for (const session of state.sessions.values()) {
-      await applyPassthrough(session);
-    }
   } catch (e) {
     setOutputDeviceListDisabled(true);
     els.audioOutputHint.textContent = 'Could not read audio output devices.';
@@ -2448,7 +2580,7 @@ async function refreshAudioOutputDevices() {
   }
 }
 
-function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
+function buildDeviceOption(value, label, ttsChecked) {
   const row = document.createElement('div');
   row.className = 'device-option';
   row.dataset.deviceId = value;
@@ -2472,21 +2604,6 @@ function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
   ttsLabel.appendChild(nameSpan);
   ttsLabel.appendChild(liveBadge);
 
-  // Right side: passthrough mic toggle (decoupled from session lifecycle)
-  const ptLabel = document.createElement('label');
-  ptLabel.className = 'passthrough-toggle';
-  ptLabel.title = 'Pass microphone audio to this device (runs independently of sessions)';
-  const ptCb = document.createElement('input');
-  ptCb.type = 'checkbox';
-  ptCb.className = 'dev-passthrough';
-  ptCb.value = value;
-  ptCb.checked = !!passthroughChecked;
-  const ptIcon = document.createElement('span');
-  ptIcon.className = 'pt-icon';
-  ptIcon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-mic"/></svg>';
-  ptLabel.appendChild(ptCb);
-  ptLabel.appendChild(ptIcon);
-
   const testBtn = document.createElement('button');
   testBtn.className = 'device-test';
   testBtn.type = 'button';
@@ -2497,7 +2614,39 @@ function buildDeviceOption(value, label, ttsChecked, passthroughChecked) {
 
   row.appendChild(ttsLabel);
   row.appendChild(testBtn);
-  row.appendChild(ptLabel);
+  return row;
+}
+
+// Row for the companion-enumerated passthrough output section. Distinct from
+// buildDeviceOption() because:
+//   - the device id here is a WASAPI endpoint id (companion-owned, stable per
+//     OS) rather than the browser's per-origin opaque MediaDeviceInfo.deviceId;
+//   - there is no "test speaker" affordance — the companion owns playback and
+//     we don't have a quick way to trigger a test tone through it;
+//   - the live indicator surfaces companion-reported sink activity instead of
+//     browser-side `<audio>` element state.
+function buildPassthroughDeviceOption(value, label, checked) {
+  const row = document.createElement('div');
+  row.className = 'device-option passthrough-row';
+  row.dataset.deviceId = value;
+  const wrap = document.createElement('label');
+  wrap.className = 'device-tts-label';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'dev-passthrough';
+  cb.value = value;
+  cb.checked = !!checked;
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'device-name';
+  nameSpan.textContent = label;
+  const liveBadge = document.createElement('span');
+  liveBadge.className = 'live-badge';
+  liveBadge.setAttribute('aria-hidden', 'true');
+  liveBadge.innerHTML = '<span class="live-dot"></span><span class="live-text">routing</span>';
+  wrap.appendChild(cb);
+  wrap.appendChild(nameSpan);
+  wrap.appendChild(liveBadge);
+  row.appendChild(wrap);
   return row;
 }
 
@@ -2627,22 +2776,21 @@ function collectLiveDeviceState() {
 }
 
 // Paints the current passthrough level (0..1) into the --pt-level CSS
-// variable on every .is-live-passthrough row, so the meter bar at the
-// bottom of those rows widens/narrows with the audio. Wired to each
-// session's MicPassthrough onLevel — fires at rAF rate via LevelMeter.
-// The device list reflects only the active session; ignore level pushes
-// from other sessions so a quieter background session doesn't drag down
-// the active row's reading.
+// variable on every .is-live-passthrough row in the passthrough section.
+// Wired to each session's CompanionPassthrough onLevel, which fires when
+// the companion emits its periodic level events. Only the active session
+// drives the visual — other sessions running in the background don't fight
+// the indicator.
 function paintPassthroughLevel(session, level) {
-  if (!els.audioOutput) return;
+  if (!els.passthroughOutput) return;
   if (!session || !isActive(session)) return;
   const pct = levelToPct(level);
-  els.audioOutput
+  els.passthroughOutput
     .querySelectorAll('.device-option.is-live-passthrough')
     .forEach((row) => { row.style.setProperty('--pt-level', pct + '%'); });
 }
 
-// Paints the live indicators on the output-device list and the input dropdown.
+// Paints the live indicators on the device lists and the input dropdown.
 // Idempotent and cheap; safe to call on a timer or any event.
 function refreshActiveDeviceIndicators() {
   const { micIds, ttsIds, passthroughIds } = collectLiveDeviceState();
@@ -2650,9 +2798,15 @@ function refreshActiveDeviceIndicators() {
   if (els.audioOutput) {
     els.audioOutput.querySelectorAll('.device-option').forEach((row) => {
       const id = row.dataset.deviceId || '';
+      row.classList.toggle('is-live-tts', ttsIds.has(id));
+    });
+  }
+
+  if (els.passthroughOutput) {
+    els.passthroughOutput.querySelectorAll('.device-option').forEach((row) => {
+      const id = row.dataset.deviceId || '';
       const wasPt = row.classList.contains('is-live-passthrough');
       const isPt = passthroughIds.has(id);
-      row.classList.toggle('is-live-tts', ttsIds.has(id));
       row.classList.toggle('is-live-passthrough', isPt);
       // Zero out the level when a row drops out of live state so the meter
       // bar doesn't freeze at its last value after passthrough is disabled.
@@ -2734,21 +2888,13 @@ function createAudioCapture(session) {
 }
 
 function createCompanionCapture(session) {
-  // Open a passthrough writer up front so each incoming chunk can fan out to
-  // the virtual-cable sinks as well as to Gemini. Companion already produces
-  // 16 kHz mono PCM16, which is exactly what attachPcm16 expects — no
-  // conversion in between. Writer is a no-op when no passthrough device is
-  // selected; the cost of calling write() is just a Map lookup + early
-  // return inside MicPassthrough._writePcm16.
-  if (session.micPassthrough) {
-    session._passthroughPcm = session.micPassthrough.attachPcm16('companion', 16000);
-  }
+  // The browser used to fan companion PCM into a local passthrough mixer;
+  // with the companion handling its own per-session passthrough, the loopback
+  // it captures for Gemini is the same loopback it routes to the cable, so
+  // no PCM forwarding from this side is needed.
   return new LiveAudio.CompanionAudioCapture({
     onChunk: (buf) => {
       sendAudioGated(session, buf);
-      if (session._passthroughPcm) {
-        try { session._passthroughPcm.write(new Int16Array(buf)); } catch (_) {}
-      }
     },
     onLevel: (l) => setMicLevelFor(session, l),
     onDisplayEnded: () => {
@@ -2802,20 +2948,6 @@ async function changeAudioInput() {
     await nextCapture.start({ mode: audioMode, micDeviceId: session.config.micDeviceId });
     try { session.capture && session.capture.stop(); } catch (_) {}
     session.capture = nextCapture;
-    // Swap the passthrough's mic and tab-audio attachments over to the new
-    // capture's streams. attachStream is idempotent on its key, so the
-    // previous entries are dropped and the new MediaStreamSources are wired
-    // (or queued if the passthrough's sinks aren't live).
-    if (session.micPassthrough) {
-      if (audioMode === 'mic' || audioMode === 'both') {
-        const ms = nextCapture.getMicStream && nextCapture.getMicStream();
-        if (ms) session.micPassthrough.attachStream('mic', ms);
-      }
-      if (audioMode === 'both' || audioMode === 'display') {
-        const ds = nextCapture.getDisplayStream && nextCapture.getDisplayStream();
-        if (ds) session.micPassthrough.attachStream('display', ds);
-      }
-    }
     await refreshAudioInputDevices();
     log('info', 'Microphone changed: ' + (els.audioInput.selectedOptions[0]?.textContent || 'System default'));
   } catch (e) {
@@ -3327,22 +3459,11 @@ async function startSession(session) {
     } else {
       session.capture = createAudioCapture(session);
       await session.capture.start({ mode: audioMode, micDeviceId: cfg.micDeviceId });
-      // Feed the raw mic/display MediaStreams into this session's passthrough
-      // mix. Tap is pre-worklet, so the virtual cable receives full-quality
-      // audio at the source's native rate (the Gemini-bound mono/16kHz
-      // downmix happens on a separate branch). No-op when no passthrough
-      // device is selected — attachments sit in the registry until the user
-      // toggles one on.
-      if (session.micPassthrough) {
-        if (audioMode === 'mic' || audioMode === 'both') {
-          const micStream = session.capture.getMicStream && session.capture.getMicStream();
-          if (micStream) session.micPassthrough.attachStream('mic', micStream);
-        }
-        if (audioMode === 'display' || audioMode === 'both') {
-          const displayStream = session.capture.getDisplayStream && session.capture.getDisplayStream();
-          if (displayStream) session.micPassthrough.attachStream('display', displayStream);
-        }
-      }
+      // Source feeding for the passthrough is no longer hand-wired here:
+      // the companion captures its own mic/loopback when applyPassthrough()
+      // sends the session's source descriptor. Display/tab passthrough was
+      // dropped along with the in-browser mix (the companion can't open
+      // getDisplayMedia); a `'display'` mode passthrough now goes silent.
     }
     session.currentAudioMode = audioMode;
     // Capture which physical mic getUserMedia resolved to so the dropdown's
@@ -3372,6 +3493,12 @@ async function startSession(session) {
   session.paused = false;
   if (isActive(session)) applyControlButtonsForActiveSession();
   refreshBulkActionButtons();
+
+  // Now that the session is officially running and its currentAudioMode is
+  // set, push the source descriptor to the companion. If passthroughDeviceIds
+  // is empty (user hasn't selected any virtual cable) configure() is a no-op
+  // and the WS stays closed.
+  applyPassthrough(session);
 
   session.startedAt = Date.now();
   if (session.ageTimer) clearInterval(session.ageTimer);
@@ -3418,16 +3545,13 @@ async function stopSession(session) {
   saveSessions();
   try { session.client && session.client.stop(); } catch (_) {}
   try { session.capture && session.capture.stop(); } catch (_) {}
-  // Drop the session's source attachments now that capture is gone. The
-  // passthrough's sink graph stays wired so the user's chosen routing
-  // survives the stop/start cycle — only the sources are detached here.
+  // Tear down the companion-side passthrough sources. configure() with an
+  // empty source descriptor while sinks remain in the saved selection
+  // closes the WS (the companion has nothing to capture or render); the
+  // sink list survives in session.config.passthroughDeviceIds so the next
+  // startSession reopens with the user's routing intact.
   if (session.micPassthrough) {
-    session.micPassthrough.detachStream('mic');
-    session.micPassthrough.detachStream('display');
-  }
-  if (session._passthroughPcm) {
-    try { session._passthroughPcm.close(); } catch (_) {}
-    session._passthroughPcm = null;
+    try { session.micPassthrough.configure([], { micId: '', micLabel: '', pid: 0, loopback: false }); } catch (_) {}
   }
   try { if (session.player) await session.player.destroy(); } catch (_) {}
   session.client = null;
@@ -4797,21 +4921,23 @@ function wireUI() {
   if (els.btnDetectDevices) {
     els.btnDetectDevices.addEventListener('click', detectAudioDevices);
   }
-  els.audioOutput.addEventListener('change', (e) => {
-    if (e.target.classList.contains('dev-passthrough')) {
+  els.audioOutput.addEventListener('change', () => { changeAudioOutput(); });
+
+  if (els.passthroughOutput) {
+    els.passthroughOutput.addEventListener('change', (e) => {
+      if (!e.target.classList.contains('dev-passthrough')) return;
       const session = activeSession();
       if (session) {
         session.config.passthroughDeviceIds = getPassthroughDeviceIds();
         saveSessions();
         applyPassthrough(session);
       }
+      els.passthroughOutput.dataset.preferred = JSON.stringify(getPassthroughDeviceIds());
       // Also persist as the default for newly-created sessions so a
       // freshly-opened tab inherits the user's most recent selection.
       savePrefs();
-    } else {
-      changeAudioOutput();
-    }
-  });
+    });
+  }
   els.audioOutput.addEventListener('click', async (e) => {
     const btn = e.target.closest('.device-test');
     if (!btn || !els.audioOutput.contains(btn)) return;
