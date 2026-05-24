@@ -18,6 +18,7 @@
 namespace companion {
 
 PassthroughSession::PassthroughSession(SOCKET s) : sock(s) {
+  dlog("pt session: ctor sock=%llu", (unsigned long long)s);
   // Light-touch ticker that streams `{event:"level"}` frames to the browser
   // at ~12 fps. Source threads update peakLevel atomically; the ticker just
   // drains it. Cheap enough to always run.
@@ -35,7 +36,12 @@ PassthroughSession::PassthroughSession(SOCKET s) : sock(s) {
 }
 
 void PassthroughSession::shutdown() {
-  if (!running.exchange(false)) return;  // already shut down
+  if (!running.exchange(false)) {
+    dlog("pt session: shutdown (already shut down)");
+    return;
+  }
+  dlog("pt session: shutdown begin (mic=%d loop=%d)",
+       micAlive.load() ? 1 : 0, loopbackAlive.load() ? 1 : 0);
   micAlive = false;
   loopbackAlive = false;
   std::vector<std::unique_ptr<PtSink>> drained;
@@ -45,10 +51,12 @@ void PassthroughSession::shutdown() {
     drained = std::move(sinks);
     sinks.clear();
   }
+  dlog("pt session: shutdown joining %zu sink thread(s)", drained.size());
   if (micThread.joinable()) micThread.join();
   if (loopbackThread.joinable()) loopbackThread.join();
   for (auto& s : drained) { if (s->thread.joinable()) s->thread.join(); }
   if (levelThread.joinable()) levelThread.join();
+  dlog("pt session: shutdown complete");
 }
 
 void PassthroughSession::close_socket() {
@@ -105,7 +113,10 @@ std::string PassthroughSession::format_float(float f) {
 }
 
 bool PassthroughSession::send_json(const std::string& text) {
-  if (!sockAlive.load()) return false;
+  if (!sockAlive.load()) {
+    dlog("pt send_json: socket dead, dropping (len=%zu)", text.size());
+    return false;
+  }
   std::lock_guard<std::mutex> lock(sendMu);
   uint8_t hdr[4];
   size_t hdr_len;
@@ -117,9 +128,13 @@ bool PassthroughSession::send_json(const std::string& text) {
     hdr[2] = (uint8_t)((len >> 8) & 0xff);
     hdr[3] = (uint8_t)(len & 0xff);
     hdr_len = 4;
-  } else return false;
+  } else {
+    dlog("pt send_json: payload too large (len=%zu), dropping", len);
+    return false;
+  }
   if (!send_all(sock, hdr, hdr_len) ||
       !send_all(sock, reinterpret_cast<const uint8_t*>(text.data()), len)) {
+    dlog("pt send_json: send_all failed (len=%zu), marking socket dead", len);
     sockAlive = false;
     return false;
   }
@@ -134,19 +149,27 @@ void PassthroughSession::mic_source_thread() {
   IMMDevice* device = nullptr;
   if (!srcCfg.micEndpointId.empty()) {
     device = open_endpoint_by_id(srcCfg.micEndpointId);
+    dlog("pt mic source: open_endpoint_by_id -> %p", (void*)device);
   }
   if (!device && !srcCfg.micLabel.empty()) {
     device = find_capture_endpoint_by_label(srcCfg.micLabel);
+    dlog("pt mic source: find_capture_endpoint_by_label(\"%s\") -> %p",
+         srcCfg.micLabel.c_str(), (void*)device);
   }
   if (!device) {
     // Final fallback: default capture endpoint so the user still gets *some*
     // mic in the cable when the label match fails (browser sometimes hands us
     // an empty label until permission is granted).
     IMMDeviceEnumerator* en = nullptr;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                   __uuidof(IMMDeviceEnumerator), (void**)&en)) && en) {
-      en->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+    HRESULT enHr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                    __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(enHr) && en) {
+      HRESULT defHr = en->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+      dlog("pt mic source: default capture fallback hr=0x%08x device=%p",
+           defHr, (void*)device);
       en->Release();
+    } else {
+      dlog("pt mic source: enumerator create failed hr=0x%08x", enHr);
     }
   }
   if (!device) {
@@ -164,21 +187,43 @@ void PassthroughSession::mic_source_thread() {
   DWORD taskIdx = 0;
 
   HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
-  if (SUCCEEDED(hr)) hr = client->GetMixFormat(&raw_format);
+  dlog("pt mic source: Activate hr=0x%08x client=%p", hr, (void*)client);
+  if (SUCCEEDED(hr)) {
+    hr = client->GetMixFormat(&raw_format);
+    dlog("pt mic source: GetMixFormat hr=0x%08x raw_format=%p", hr, (void*)raw_format);
+  }
   CoTaskPtr<WAVEFORMATEX> format(raw_format);
   if (SUCCEEDED(hr)) {
     event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event) hr = E_OUTOFMEMORY;
+    if (!event) { hr = E_OUTOFMEMORY; dlog("pt mic source: CreateEvent failed"); }
+  }
+  if (SUCCEEDED(hr) && format) {
+    dlog("pt mic source: format tag=%u ch=%u rate=%lu bits=%u block=%u",
+         format->wFormatTag, format->nChannels, format->nSamplesPerSec,
+         format->wBitsPerSample, format->nBlockAlign);
   }
   if (SUCCEEDED(hr)) {
     hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
                             AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                             2000000, 0, format.get(), nullptr);
+    dlog("pt mic source: Initialize hr=0x%08x", hr);
   }
-  if (SUCCEEDED(hr)) hr = client->SetEventHandle(event);
-  if (SUCCEEDED(hr)) hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
-  if (SUCCEEDED(hr)) task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
-  if (SUCCEEDED(hr)) hr = client->Start();
+  if (SUCCEEDED(hr)) {
+    hr = client->SetEventHandle(event);
+    dlog("pt mic source: SetEventHandle hr=0x%08x", hr);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
+    dlog("pt mic source: GetService(capture) hr=0x%08x capture=%p", hr, (void*)capture);
+  }
+  if (SUCCEEDED(hr)) {
+    task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+    dlog("pt mic source: AvSetMmThreadCharacteristics task=%p", (void*)task);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = client->Start();
+    dlog("pt mic source: Start hr=0x%08x", hr);
+  }
   if (FAILED(hr)) {
     dlog("pt mic source: init failed hr=0x%08x", hr);
     if (event) CloseHandle(event);
@@ -196,26 +241,48 @@ void PassthroughSession::mic_source_thread() {
   const int in_rate = (int)format->nSamplesPerSec;
   const bool is_float = is_float_format(format.get());
   const WORD bytes_per_sample = bits / 8;
+  dlog("pt mic source: loop start ch=%u bits=%u block=%u rate=%d is_float=%d",
+       channels, bits, block, in_rate, is_float ? 1 : 0);
   StereoResampler resampler;
   uint64_t frame = 0;
   std::vector<float> inL, inR, outL, outR;
+  uint64_t packetCount = 0;
+  uint64_t lastHeartbeatFrame = 0;
 
   while (micAlive.load() && running.load()) {
     DWORD wait = WaitForSingleObject(event, 200);
-    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) break;
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) {
+      dlog("pt mic source: WaitForSingleObject unexpected=%lu, breaking", wait);
+      break;
+    }
     while (true) {
       UINT32 packet = 0;
       hr = capture->GetNextPacketSize(&packet);
-      if (FAILED(hr) || packet == 0) break;
+      if (FAILED(hr)) {
+        dlog("pt mic source: GetNextPacketSize failed hr=0x%08x", hr);
+        break;
+      }
+      if (packet == 0) break;
       BYTE* data = nullptr;
       UINT32 frames = 0;
       DWORD flags = 0;
       hr = capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
-      if (FAILED(hr)) break;
+      if (FAILED(hr)) {
+        dlog("pt mic source: GetBuffer failed hr=0x%08x", hr);
+        break;
+      }
+      ++packetCount;
+      if (packetCount <= 3 || (packetCount % 200) == 0) {
+        dlog("pt mic source: packet #%llu frames=%u flags=0x%08lx data=%p block=%u",
+             (unsigned long long)packetCount, frames, flags, (void*)data, block);
+      }
+      if (data == nullptr && frames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+        dlog("pt mic source: WARNING null data ptr with frames=%u flags=0x%08lx", frames, flags);
+      }
 
       inL.assign(frames, 0.0f);
       inR.assign(frames, 0.0f);
-      if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+      if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
         for (UINT32 i = 0; i < frames; ++i) {
           const BYTE* p = data + i * block;
           float l = sample_to_float(p, bits, is_float);
@@ -237,10 +304,18 @@ void PassthroughSession::mic_source_thread() {
         update_peak(peak);
         distribute(frame, outL.data(), outR.data(), outL.size());
         frame += outL.size();
+        if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {  // every ~5s
+          dlog("pt mic source: heartbeat frame=%llu packets=%llu",
+               (unsigned long long)frame, (unsigned long long)packetCount);
+          lastHeartbeatFrame = frame;
+        }
       }
     }
   }
 
+  dlog("pt mic source: loop exit micAlive=%d running=%d frames=%llu packets=%llu",
+       micAlive.load() ? 1 : 0, running.load() ? 1 : 0,
+       (unsigned long long)frame, (unsigned long long)packetCount);
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -269,8 +344,12 @@ void PassthroughSession::loopback_source_thread() {
   HRESULT hr = S_OK;
 
   if (pid != 0) {
+    dlog("pt loopback source: activating per-pid loopback for pid=%lu", pid);
     HANDLE actEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!actEvent) { loopbackAlive = false; CoUninitialize(); return; }
+    if (!actEvent) {
+      dlog("pt loopback source: CreateEventW failed for activation");
+      loopbackAlive = false; CoUninitialize(); return;
+    }
 
     AUDIOCLIENT_ACTIVATION_PARAMS activation = {};
     activation.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
@@ -288,6 +367,8 @@ void PassthroughSession::loopback_source_thread() {
     hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
                                      __uuidof(IAudioClient),
                                      &propvar, handler, &asyncOp);
+    dlog("pt loopback source: ActivateAudioInterfaceAsync hr=0x%08x asyncOp=%p",
+         hr, (void*)asyncOp);
     if (FAILED(hr) || !asyncOp) {
       handler->Release();
       CloseHandle(actEvent);
@@ -302,6 +383,8 @@ void PassthroughSession::loopback_source_thread() {
     IUnknown* unk = nullptr;
     asyncOp->GetActivateResult(&activate_hr, &unk);
     asyncOp->Release();
+    dlog("pt loopback source: GetActivateResult hr=0x%08x unk=%p",
+         activate_hr, (void*)unk);
     if (FAILED(activate_hr) || !unk) {
       if (unk) unk->Release();
       loopbackAlive = false;
@@ -310,7 +393,10 @@ void PassthroughSession::loopback_source_thread() {
     }
     unk->QueryInterface(__uuidof(IAudioClient), (void**)&client);
     unk->Release();
-    if (!client) { loopbackAlive = false; CoUninitialize(); return; }
+    if (!client) {
+      dlog("pt loopback source: QI(IAudioClient) returned null");
+      loopbackAlive = false; CoUninitialize(); return;
+    }
 
     // Fixed format that the process-loopback virtual device accepts: stereo
     // float 48k matches our internal mix rate so the downstream resampler is
@@ -322,18 +408,34 @@ void PassthroughSession::loopback_source_thread() {
     format.nBlockAlign = 8;
     format.nAvgBytesPerSec = 384000;
     raw_format = &format;
+    dlog("pt loopback source: pid path using fixed float32 stereo 48k");
   } else {
+    dlog("pt loopback source: activating system loopback on default render endpoint");
     // System loopback on the default render endpoint.
     IMMDeviceEnumerator* enumerator = nullptr;
     IMMDevice* device = nullptr;
     hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                           __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
-    if (SUCCEEDED(hr)) hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (SUCCEEDED(hr)) hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
-    if (SUCCEEDED(hr)) hr = client->GetMixFormat(&raw_format);
+    dlog("pt loopback source: enumerator hr=0x%08x", hr);
+    if (SUCCEEDED(hr)) {
+      hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+      dlog("pt loopback source: GetDefaultAudioEndpoint hr=0x%08x device=%p",
+           hr, (void*)device);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+      dlog("pt loopback source: device->Activate hr=0x%08x client=%p",
+           hr, (void*)client);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = client->GetMixFormat(&raw_format);
+      dlog("pt loopback source: GetMixFormat hr=0x%08x raw_format=%p",
+           hr, (void*)raw_format);
+    }
     if (device) device->Release();
     if (enumerator) enumerator->Release();
     if (FAILED(hr)) {
+      dlog("pt loopback source: system loopback setup failed hr=0x%08x", hr);
       if (client) client->Release();
       loopbackAlive = false;
       CoUninitialize();
@@ -342,14 +444,37 @@ void PassthroughSession::loopback_source_thread() {
     format_owner.reset(raw_format);
   }
 
+  if (raw_format) {
+    dlog("pt loopback source: format tag=%u ch=%u rate=%lu bits=%u block=%u",
+         raw_format->wFormatTag, raw_format->nChannels, raw_format->nSamplesPerSec,
+         raw_format->wBitsPerSample, raw_format->nBlockAlign);
+  } else {
+    dlog("pt loopback source: WARNING raw_format is null before Initialize");
+  }
+
   event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!event) dlog("pt loopback source: CreateEventW failed");
   DWORD flagsInit = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
   hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flagsInit,
                           2000000, 0, raw_format, nullptr);
-  if (SUCCEEDED(hr)) hr = client->SetEventHandle(event);
-  if (SUCCEEDED(hr)) hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
-  if (SUCCEEDED(hr)) task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
-  if (SUCCEEDED(hr)) hr = client->Start();
+  dlog("pt loopback source: Initialize hr=0x%08x", hr);
+  if (SUCCEEDED(hr)) {
+    hr = client->SetEventHandle(event);
+    dlog("pt loopback source: SetEventHandle hr=0x%08x", hr);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
+    dlog("pt loopback source: GetService(capture) hr=0x%08x capture=%p",
+         hr, (void*)capture);
+  }
+  if (SUCCEEDED(hr)) {
+    task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+    dlog("pt loopback source: AvSetMmThreadCharacteristics task=%p", (void*)task);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = client->Start();
+    dlog("pt loopback source: Start hr=0x%08x", hr);
+  }
   if (FAILED(hr)) {
     dlog("pt loopback source: init failed hr=0x%08x", hr);
     if (event) CloseHandle(event);
@@ -366,26 +491,49 @@ void PassthroughSession::loopback_source_thread() {
   const int in_rate = (int)raw_format->nSamplesPerSec;
   const bool is_float = is_float_format(raw_format);
   const WORD bytes_per_sample = bits / 8;
+  dlog("pt loopback source: loop start ch=%u bits=%u block=%u rate=%d is_float=%d",
+       channels, bits, block, in_rate, is_float ? 1 : 0);
   StereoResampler resampler;
   uint64_t frame = 0;
   std::vector<float> inL, inR, outL, outR;
+  uint64_t packetCount = 0;
+  uint64_t lastHeartbeatFrame = 0;
 
   while (loopbackAlive.load() && running.load()) {
     DWORD wait = WaitForSingleObject(event, 200);
-    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) break;
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) {
+      dlog("pt loopback source: WaitForSingleObject unexpected=%lu, breaking", wait);
+      break;
+    }
     while (true) {
       UINT32 packet = 0;
       hr = capture->GetNextPacketSize(&packet);
-      if (FAILED(hr) || packet == 0) break;
+      if (FAILED(hr)) {
+        dlog("pt loopback source: GetNextPacketSize failed hr=0x%08x", hr);
+        break;
+      }
+      if (packet == 0) break;
       BYTE* data = nullptr;
       UINT32 frames = 0;
       DWORD flags = 0;
       hr = capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
-      if (FAILED(hr)) break;
+      if (FAILED(hr)) {
+        dlog("pt loopback source: GetBuffer failed hr=0x%08x", hr);
+        break;
+      }
+      ++packetCount;
+      if (packetCount <= 3 || (packetCount % 200) == 0) {
+        dlog("pt loopback source: packet #%llu frames=%u flags=0x%08lx data=%p block=%u",
+             (unsigned long long)packetCount, frames, flags, (void*)data, block);
+      }
+      if (data == nullptr && frames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+        dlog("pt loopback source: WARNING null data ptr with frames=%u flags=0x%08lx",
+             frames, flags);
+      }
 
       inL.assign(frames, 0.0f);
       inR.assign(frames, 0.0f);
-      if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+      if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
         for (UINT32 i = 0; i < frames; ++i) {
           const BYTE* p = data + i * block;
           float l = sample_to_float(p, bits, is_float);
@@ -406,10 +554,18 @@ void PassthroughSession::loopback_source_thread() {
         update_peak(peak);
         distribute(frame, outL.data(), outR.data(), outL.size());
         frame += outL.size();
+        if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {
+          dlog("pt loopback source: heartbeat frame=%llu packets=%llu",
+               (unsigned long long)frame, (unsigned long long)packetCount);
+          lastHeartbeatFrame = frame;
+        }
       }
     }
   }
 
+  dlog("pt loopback source: loop exit loopbackAlive=%d running=%d frames=%llu packets=%llu",
+       loopbackAlive.load() ? 1 : 0, running.load() ? 1 : 0,
+       (unsigned long long)frame, (unsigned long long)packetCount);
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -439,11 +595,26 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
   DWORD taskIdx = 0;
 
   HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
-  if (SUCCEEDED(hr)) hr = client->GetMixFormat(&raw_format);
+  dlog("pt sink \"%s\": Activate hr=0x%08x client=%p",
+       sink->endpointIdUtf8.c_str(), hr, (void*)client);
+  if (SUCCEEDED(hr)) {
+    hr = client->GetMixFormat(&raw_format);
+    dlog("pt sink \"%s\": GetMixFormat hr=0x%08x raw_format=%p",
+         sink->endpointIdUtf8.c_str(), hr, (void*)raw_format);
+  }
   CoTaskPtr<WAVEFORMATEX> format(raw_format);
   if (SUCCEEDED(hr)) {
     event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event) hr = E_OUTOFMEMORY;
+    if (!event) {
+      hr = E_OUTOFMEMORY;
+      dlog("pt sink \"%s\": CreateEventW failed", sink->endpointIdUtf8.c_str());
+    }
+  }
+  if (SUCCEEDED(hr) && format) {
+    dlog("pt sink \"%s\": format tag=%u ch=%u rate=%lu bits=%u block=%u",
+         sink->endpointIdUtf8.c_str(),
+         format->wFormatTag, format->nChannels, format->nSamplesPerSec,
+         format->wBitsPerSample, format->nBlockAlign);
   }
   // 100 ms buffer is a comfortable trade-off — small enough to keep latency
   // reasonable for a passthrough, large enough that GC pauses on the source
@@ -452,22 +623,47 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
     hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
                             AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                             1000000, 0, format.get(), nullptr);
+    dlog("pt sink \"%s\": Initialize hr=0x%08x",
+         sink->endpointIdUtf8.c_str(), hr);
   }
-  if (SUCCEEDED(hr)) hr = client->SetEventHandle(event);
-  if (SUCCEEDED(hr)) hr = client->GetService(__uuidof(IAudioRenderClient), (void**)&render);
+  if (SUCCEEDED(hr)) {
+    hr = client->SetEventHandle(event);
+    dlog("pt sink \"%s\": SetEventHandle hr=0x%08x",
+         sink->endpointIdUtf8.c_str(), hr);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = client->GetService(__uuidof(IAudioRenderClient), (void**)&render);
+    dlog("pt sink \"%s\": GetService(render) hr=0x%08x render=%p",
+         sink->endpointIdUtf8.c_str(), hr, (void*)render);
+  }
   UINT32 bufferFrames = 0;
-  if (SUCCEEDED(hr)) hr = client->GetBufferSize(&bufferFrames);
-  if (SUCCEEDED(hr)) task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+  if (SUCCEEDED(hr)) {
+    hr = client->GetBufferSize(&bufferFrames);
+    dlog("pt sink \"%s\": GetBufferSize hr=0x%08x bufferFrames=%u",
+         sink->endpointIdUtf8.c_str(), hr, bufferFrames);
+  }
+  if (SUCCEEDED(hr)) {
+    task = AvSetMmThreadCharacteristicsW(L"Audio", &taskIdx);
+    dlog("pt sink \"%s\": AvSetMmThreadCharacteristics task=%p",
+         sink->endpointIdUtf8.c_str(), (void*)task);
+  }
 
   // Pre-fill the buffer with silence so the device-side clock starts cleanly.
   if (SUCCEEDED(hr) && bufferFrames > 0) {
     BYTE* buf = nullptr;
-    if (SUCCEEDED(render->GetBuffer(bufferFrames, &buf)) && buf) {
+    HRESULT prefillHr = render->GetBuffer(bufferFrames, &buf);
+    if (SUCCEEDED(prefillHr) && buf) {
       memset(buf, 0, bufferFrames * format->nBlockAlign);
       render->ReleaseBuffer(bufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+    } else {
+      dlog("pt sink \"%s\": prefill GetBuffer hr=0x%08x buf=%p",
+           sink->endpointIdUtf8.c_str(), prefillHr, (void*)buf);
     }
   }
-  if (SUCCEEDED(hr)) hr = client->Start();
+  if (SUCCEEDED(hr)) {
+    hr = client->Start();
+    dlog("pt sink \"%s\": Start hr=0x%08x", sink->endpointIdUtf8.c_str(), hr);
+  }
   if (FAILED(hr)) {
     dlog("pt sink \"%s\": init failed hr=0x%08x", sink->endpointIdUtf8.c_str(), hr);
     if (event) CloseHandle(event);
@@ -486,6 +682,9 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
   const bool is_float = is_float_format(format.get());
   const WORD bytes_per_sample = bits / 8;
   (void)bytes_per_sample;
+  dlog("pt sink \"%s\": render loop start ch=%u bits=%u block=%u rate=%d is_float=%d bufferFrames=%u",
+       sink->endpointIdUtf8.c_str(), channels, bits, block, out_rate,
+       is_float ? 1 : 0, bufferFrames);
 
   // Resample mix-rate (48k stereo float) → out_rate, applied per pull. For
   // the common case (out_rate == 48k) this loop is a 1:1 pass-through.
@@ -497,22 +696,43 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
   mixL.reserve(4096);
   mixR.reserve(4096);
 
+  uint64_t iterCount = 0;
+  uint64_t totalWritten = 0;
+  uint64_t lastHeartbeat = 0;
+
   while (sink->alive.load() && running.load()) {
     DWORD wait = WaitForSingleObject(event, 200);
-    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) break;
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) {
+      dlog("pt sink \"%s\": WaitForSingleObject unexpected=%lu, breaking",
+           sink->endpointIdUtf8.c_str(), wait);
+      break;
+    }
 
     UINT32 padding = 0;
-    if (FAILED(client->GetCurrentPadding(&padding))) break;
+    HRESULT padHr = client->GetCurrentPadding(&padding);
+    if (FAILED(padHr)) {
+      dlog("pt sink \"%s\": GetCurrentPadding failed hr=0x%08x",
+           sink->endpointIdUtf8.c_str(), padHr);
+      break;
+    }
     UINT32 free = bufferFrames > padding ? bufferFrames - padding : 0;
     if (free == 0) continue;
 
     BYTE* buf = nullptr;
-    if (FAILED(render->GetBuffer(free, &buf)) || !buf) break;
+    HRESULT gbHr = render->GetBuffer(free, &buf);
+    if (FAILED(gbHr) || !buf) {
+      dlog("pt sink \"%s\": render GetBuffer failed hr=0x%08x buf=%p free=%u",
+           sink->endpointIdUtf8.c_str(), gbHr, (void*)buf, free);
+      break;
+    }
 
     // Pull enough mix-rate frames to produce `free` output frames after
     // resample. ratio = mix / out: e.g. 48000/48000 = 1.0; 48000/44100 ≈ 1.088.
+    // The "+1" covers the right neighbor of the last interp step (linear interp
+    // needs srcL[idx+1] for the final output sample). Single rsPrev carryover
+    // supplies the left neighbor across call boundaries.
     const double ratio = static_cast<double>(kPtMixRate) / static_cast<double>(out_rate);
-    size_t needMix = static_cast<size_t>(std::ceil(free * ratio)) + 2;
+    size_t needMix = static_cast<size_t>(std::ceil(free * ratio)) + 1;
     mixL.assign(needMix, 0.0f);
     mixR.assign(needMix, 0.0f);
     sink->ring.consume(mixL.data(), mixR.data(), needMix);
@@ -556,12 +776,38 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
       ++written;
     }
 
-    rsPos -= static_cast<double>(mixL.size());
-    if (!srcL.empty()) { rsPrevL = srcL.back(); rsPrevR = srcR.back(); rsHavePrev = true; }
+    // Carry the sample at floor(rsPos) into next call as rsPrev (it becomes
+    // srcL_next[0]); keep only the fractional remainder of rsPos so position 0
+    // of next iter's srcL aligns with where we stopped. Subtracting mixL.size()
+    // (the previous behaviour) overshot by ~2 frames per call, driving rsPos
+    // negative and — without the (now-removed) clamp — invoking UB via
+    // (size_t)negative_double on the next iteration.
+    const size_t consumedFull = static_cast<size_t>(rsPos);
+    const size_t carryIdx = consumedFull < srcL.size() ? consumedFull : srcL.size() - 1;
+    rsPrevL = srcL[carryIdx];
+    rsPrevR = srcR[carryIdx];
+    rsHavePrev = true;
+    rsPos -= static_cast<double>(consumedFull);
 
-    render->ReleaseBuffer(written, written == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+    HRESULT rbHr = render->ReleaseBuffer(written, written == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+    if (FAILED(rbHr)) {
+      dlog("pt sink \"%s\": ReleaseBuffer failed hr=0x%08x written=%u",
+           sink->endpointIdUtf8.c_str(), rbHr, written);
+    }
+    totalWritten += written;
+    ++iterCount;
+    if (iterCount <= 3 || totalWritten - lastHeartbeat >= (uint64_t)out_rate * 5) {
+      dlog("pt sink \"%s\": iter=%llu free=%u needMix=%zu written=%u rsPosAfter=%.4f totalWritten=%llu",
+           sink->endpointIdUtf8.c_str(), (unsigned long long)iterCount,
+           free, needMix, written, rsPos, (unsigned long long)totalWritten);
+      lastHeartbeat = totalWritten;
+    }
   }
 
+  dlog("pt sink \"%s\": render loop exit alive=%d running=%d iters=%llu totalWritten=%llu",
+       sink->endpointIdUtf8.c_str(), sink->alive.load() ? 1 : 0,
+       running.load() ? 1 : 0,
+       (unsigned long long)iterCount, (unsigned long long)totalWritten);
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -573,6 +819,9 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
 }
 
 void PassthroughSession::configure(const std::string& payload) {
+  dlog("pt configure: payload (%zu bytes): %.*s",
+       payload.size(),
+       (int)(payload.size() > 400 ? 400 : payload.size()), payload.data());
   // Pull sinks and source descriptors from the JSON. Anything missing means
   // "stop using that source/sink".
   std::vector<std::string> wantedSinks = json_string_array(payload, "sinks");
@@ -587,6 +836,12 @@ void PassthroughSession::configure(const std::string& payload) {
   DWORD pid = json_int(payload, "pid", 0);
   bool wantLoopback = json_bool(payload, "loopback") || pid != 0;
   bool wantMic = !micLabel.empty() || !micId.empty();
+  dlog("pt configure: parsed wantedSinks=%zu micLabel=\"%s\" micId-len=%zu pid=%lu wantLoopback=%d wantMic=%d",
+       wantedSinks.size(), micLabel.c_str(), micId.size(),
+       pid, wantLoopback ? 1 : 0, wantMic ? 1 : 0);
+  for (size_t i = 0; i < wantedSinks.size(); ++i) {
+    dlog("pt configure: wantedSinks[%zu] = \"%s\"", i, wantedSinks[i].c_str());
+  }
 
   PtSourceConfig nextCfg;
   nextCfg.haveMic = wantMic;
@@ -613,6 +868,7 @@ void PassthroughSession::configure(const std::string& payload) {
     keep.reserve(sinks.size());
     for (auto& s : sinks) {
       if (wanted.count(s->endpointIdUtf8) == 0) {
+        dlog("pt configure: stopping sink \"%s\"", s->endpointIdUtf8.c_str());
         s->alive = false;
         drained.push_back(std::move(s));
       } else {
@@ -624,6 +880,7 @@ void PassthroughSession::configure(const std::string& payload) {
     sinks = std::move(keep);
     for (const auto& id : wantedSinks) {
       if (!wanted.count(id)) continue;  // already running
+      dlog("pt configure: starting sink \"%s\"", id.c_str());
       auto sink = std::make_unique<PtSink>();
       int wlen = MultiByteToWideChar(CP_UTF8, 0, id.data(), (int)id.size(), nullptr, 0);
       sink->endpointId.resize(wlen);
@@ -635,6 +892,9 @@ void PassthroughSession::configure(const std::string& payload) {
       sinks.push_back(std::move(sink));
       activeSinkIds.push_back(id);
     }
+  }
+  if (!drained.empty()) {
+    dlog("pt configure: joining %zu drained sink(s)", drained.size());
   }
   for (auto& s : drained) { if (s->thread.joinable()) s->thread.join(); }
 
@@ -652,6 +912,8 @@ void PassthroughSession::configure(const std::string& payload) {
   };
 
   if (needRestartMic()) {
+    dlog("pt configure: restarting mic source (was=%d -> want=%d)",
+         srcCfg.haveMic ? 1 : 0, nextCfg.haveMic ? 1 : 0);
     micAlive = false;
     if (micThread.joinable()) micThread.join();
     srcCfg.haveMic = nextCfg.haveMic;
@@ -664,6 +926,9 @@ void PassthroughSession::configure(const std::string& payload) {
   }
 
   if (needRestartLoop()) {
+    dlog("pt configure: restarting loopback source (was=%d/pid=%lu -> want=%d/pid=%lu)",
+         srcCfg.haveLoopback ? 1 : 0, srcCfg.pid,
+         nextCfg.haveLoopback ? 1 : 0, nextCfg.pid);
     loopbackAlive = false;
     if (loopbackThread.joinable()) loopbackThread.join();
     srcCfg.haveLoopback = nextCfg.haveLoopback;
@@ -674,6 +939,10 @@ void PassthroughSession::configure(const std::string& payload) {
     }
   }
 
+  dlog("pt configure: done, activeSinks=%zu mic=%s loopback=%s",
+       activeSinkIds.size(),
+       srcCfg.haveMic ? "active" : "off",
+       srcCfg.haveLoopback ? (srcCfg.pid != 0 ? "pid" : "system") : "off");
   send_event_ready(warnings, activeSinkIds,
                    srcCfg.haveMic ? "active" : "off",
                    srcCfg.haveLoopback
