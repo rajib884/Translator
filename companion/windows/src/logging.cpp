@@ -9,6 +9,48 @@
 
 namespace companion {
 
+namespace {
+
+LONG CALLBACK unhandled_exception_filter(EXCEPTION_POINTERS* info) {
+  if (!info || !info->ExceptionRecord) {
+    dlog("CRASH: unhandled_exception_filter invoked with null info");
+    return EXCEPTION_EXECUTE_HANDLER;
+  }
+  const DWORD code = info->ExceptionRecord->ExceptionCode;
+  void* pc = info->ExceptionRecord->ExceptionAddress;
+  const DWORD tid = GetCurrentThreadId();
+
+  HMODULE mod = nullptr;
+  uintptr_t modBase = 0;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCSTR>(pc), &mod) && mod) {
+    modBase = reinterpret_cast<uintptr_t>(mod);
+  }
+  const uintptr_t pcRel = reinterpret_cast<uintptr_t>(pc) -
+                          (modBase ? modBase : reinterpret_cast<uintptr_t>(pc));
+
+  if (code == EXCEPTION_ACCESS_VIOLATION &&
+      info->ExceptionRecord->NumberParameters >= 2) {
+    const ULONG_PTR op = info->ExceptionRecord->ExceptionInformation[0];
+    const ULONG_PTR fault = info->ExceptionRecord->ExceptionInformation[1];
+    const char* opStr = op == 0 ? "read" : op == 1 ? "write" : "execute";
+    dlog("CRASH: AccessViolation tid=%lu pc=%p (mod+0x%llx) %s addr=0x%p",
+         tid, pc, (unsigned long long)pcRel, opStr, (void*)fault);
+  } else {
+    dlog("CRASH: code=0x%08lx tid=%lu pc=%p (mod+0x%llx)",
+         code, tid, pc, (unsigned long long)pcRel);
+  }
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+}  // namespace
+
+void install_crash_handler() {
+  SetUnhandledExceptionFilter(unhandled_exception_filter);
+  dlog("crash handler installed");
+}
+
 void dlog(const char* fmt, ...) {
   static FILE* log_file = nullptr;
   static std::once_flag init_flag;

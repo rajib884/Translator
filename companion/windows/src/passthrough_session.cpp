@@ -101,6 +101,22 @@ void PassthroughSession::distribute(uint64_t startFrame, const float* L, const f
   }
 }
 
+void PassthroughSession::distribute_logged(const char* who, uint64_t startFrame,
+                                           const float* L, const float* R, size_t n,
+                                           bool verbose) {
+  if (verbose) {
+    size_t nSinks = 0;
+    { std::lock_guard<std::mutex> lock(sinksMu); nSinks = sinks.size(); }
+    dlog("pt %s: distribute start frame=%llu n=%zu sinks=%zu Lptr=%p Rptr=%p",
+         who, (unsigned long long)startFrame, n, nSinks, (void*)L, (void*)R);
+  }
+  distribute(startFrame, L, R, n);
+  if (verbose) {
+    dlog("pt %s: distribute done frame=%llu n=%zu",
+         who, (unsigned long long)startFrame, n);
+  }
+}
+
 void PassthroughSession::update_peak(float p) {
   float prev = peakLevel.load();
   while (p > prev && !peakLevel.compare_exchange_weak(prev, p)) {}
@@ -272,7 +288,7 @@ void PassthroughSession::mic_source_thread() {
         break;
       }
       ++packetCount;
-      if (packetCount <= 3 || (packetCount % 200) == 0) {
+      if (packetCount <= 30 || (packetCount % 500) == 0) {
         dlog("pt mic source: packet #%llu frames=%u flags=0x%08lx data=%p block=%u",
              (unsigned long long)packetCount, frames, flags, (void*)data, block);
       }
@@ -302,7 +318,8 @@ void PassthroughSession::mic_source_thread() {
         for (float v : outL) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         for (float v : outR) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         update_peak(peak);
-        distribute(frame, outL.data(), outR.data(), outL.size());
+        const bool verbose = packetCount <= 10 || (packetCount % 500) == 0;
+        distribute_logged("mic source", frame, outL.data(), outR.data(), outL.size(), verbose);
         frame += outL.size();
         if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {  // every ~5s
           dlog("pt mic source: heartbeat frame=%llu packets=%llu",
@@ -522,7 +539,7 @@ void PassthroughSession::loopback_source_thread() {
         break;
       }
       ++packetCount;
-      if (packetCount <= 3 || (packetCount % 200) == 0) {
+      if (packetCount <= 30 || (packetCount % 500) == 0) {
         dlog("pt loopback source: packet #%llu frames=%u flags=0x%08lx data=%p block=%u",
              (unsigned long long)packetCount, frames, flags, (void*)data, block);
       }
@@ -552,7 +569,8 @@ void PassthroughSession::loopback_source_thread() {
         for (float v : outL) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         for (float v : outR) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         update_peak(peak);
-        distribute(frame, outL.data(), outR.data(), outL.size());
+        const bool verbose = packetCount <= 10 || (packetCount % 500) == 0;
+        distribute_logged("loopback source", frame, outL.data(), outR.data(), outL.size(), verbose);
         frame += outL.size();
         if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {
           dlog("pt loopback source: heartbeat frame=%llu packets=%llu",
@@ -686,15 +704,19 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
        sink->endpointIdUtf8.c_str(), channels, bits, block, out_rate,
        is_float ? 1 : 0, bufferFrames);
 
-  // Resample mix-rate (48k stereo float) → out_rate, applied per pull. For
-  // the common case (out_rate == 48k) this loop is a 1:1 pass-through.
+  // Persistent mix-rate buffer of unconsumed samples across render calls.
+  // Linear-interp resample mix-rate (48k stereo float) → out_rate. `rsPos`
+  // is the fractional position within `mixBufL` of the next interp's left
+  // endpoint; samples at indices [0, floor(rsPos)) are dropped after each
+  // call. The previous design carried only a single rsPrev sample, which
+  // silently lost the extra mix samples pulled by the `+1`/`+2` over-pull
+  // — ~2 frames per render call — producing periodic clicks and a steady
+  // ring-buffer underrun.
+  const double ratio = static_cast<double>(kPtMixRate) / static_cast<double>(out_rate);
+  std::vector<float> mixBufL, mixBufR;
+  mixBufL.reserve(8192);
+  mixBufR.reserve(8192);
   double rsPos = 0.0;
-  float rsPrevL = 0.0f, rsPrevR = 0.0f;
-  bool rsHavePrev = false;
-
-  std::vector<float> mixL, mixR;
-  mixL.reserve(4096);
-  mixR.reserve(4096);
 
   uint64_t iterCount = 0;
   uint64_t totalWritten = 0;
@@ -707,6 +729,11 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
            sink->endpointIdUtf8.c_str(), wait);
       break;
     }
+    ++iterCount;
+    const bool verbose = iterCount <= 5 || (iterCount % 1000) == 0;
+    if (verbose) dlog("pt sink \"%s\": iter=%llu A:waited wait=%lu",
+                       sink->endpointIdUtf8.c_str(),
+                       (unsigned long long)iterCount, wait);
 
     UINT32 padding = 0;
     HRESULT padHr = client->GetCurrentPadding(&padding);
@@ -716,6 +743,9 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
       break;
     }
     UINT32 free = bufferFrames > padding ? bufferFrames - padding : 0;
+    if (verbose) dlog("pt sink \"%s\": iter=%llu B:padding=%u free=%u mixBuf=%zu",
+                       sink->endpointIdUtf8.c_str(),
+                       (unsigned long long)iterCount, padding, free, mixBufL.size());
     if (free == 0) continue;
 
     BYTE* buf = nullptr;
@@ -726,31 +756,30 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
       break;
     }
 
-    // Pull enough mix-rate frames to produce `free` output frames after
-    // resample. ratio = mix / out: e.g. 48000/48000 = 1.0; 48000/44100 ≈ 1.088.
-    // The "+1" covers the right neighbor of the last interp step (linear interp
-    // needs srcL[idx+1] for the final output sample). Single rsPrev carryover
-    // supplies the left neighbor across call boundaries.
-    const double ratio = static_cast<double>(kPtMixRate) / static_cast<double>(out_rate);
-    size_t needMix = static_cast<size_t>(std::ceil(free * ratio)) + 1;
-    mixL.assign(needMix, 0.0f);
-    mixR.assign(needMix, 0.0f);
-    sink->ring.consume(mixL.data(), mixR.data(), needMix);
-
-    // Resample mix → out_rate. Linear, with state retained per render call.
-    std::vector<float> srcL, srcR;
-    srcL.reserve(needMix + 1); srcR.reserve(needMix + 1);
-    if (rsHavePrev) { srcL.push_back(rsPrevL); srcR.push_back(rsPrevR); }
-    srcL.insert(srcL.end(), mixL.begin(), mixL.end());
-    srcR.insert(srcR.end(), mixR.begin(), mixR.end());
+    // Pull just enough mix-rate samples into the persistent buffer so that
+    // the inner loop can produce `free` output samples without overshooting.
+    // `+2` is a small slack for FP rounding on the rsPos+free*ratio bound;
+    // unconsumed slack stays in mixBufL for the next call (no waste).
+    const size_t needMix =
+        static_cast<size_t>(std::ceil(rsPos + free * ratio)) + 2;
+    if (mixBufL.size() < needMix) {
+      const size_t off = mixBufL.size();
+      const size_t toPull = needMix - off;
+      mixBufL.resize(off + toPull, 0.0f);
+      mixBufR.resize(off + toPull, 0.0f);
+      sink->ring.consume(mixBufL.data() + off, mixBufR.data() + off, toPull);
+    }
+    if (verbose) dlog("pt sink \"%s\": iter=%llu C:after pull mixBuf=%zu rsPos=%.4f needMix=%zu",
+                       sink->endpointIdUtf8.c_str(),
+                       (unsigned long long)iterCount, mixBufL.size(), rsPos, needMix);
 
     UINT32 written = 0;
     for (UINT32 i = 0; i < free; ++i) {
-      if (rsPos + 1.0 >= srcL.size()) break;
+      if (rsPos + 1.0 >= mixBufL.size()) break;
       const size_t idx = (size_t)rsPos;
       const double frac = rsPos - idx;
-      float L = srcL[idx] + (float)((srcL[idx + 1] - srcL[idx]) * frac);
-      float R = srcR[idx] + (float)((srcR[idx + 1] - srcR[idx]) * frac);
+      float L = mixBufL[idx] + (float)((mixBufL[idx + 1] - mixBufL[idx]) * frac);
+      float R = mixBufR[idx] + (float)((mixBufR[idx + 1] - mixBufR[idx]) * frac);
 
       BYTE* dst = buf + i * block;
       if (is_float && bits == 32) {
@@ -776,30 +805,33 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
       ++written;
     }
 
-    // Carry the sample at floor(rsPos) into next call as rsPrev (it becomes
-    // srcL_next[0]); keep only the fractional remainder of rsPos so position 0
-    // of next iter's srcL aligns with where we stopped. Subtracting mixL.size()
-    // (the previous behaviour) overshot by ~2 frames per call, driving rsPos
-    // negative and — without the (now-removed) clamp — invoking UB via
-    // (size_t)negative_double on the next iteration.
-    const size_t consumedFull = static_cast<size_t>(rsPos);
-    const size_t carryIdx = consumedFull < srcL.size() ? consumedFull : srcL.size() - 1;
-    rsPrevL = srcL[carryIdx];
-    rsPrevR = srcR[carryIdx];
-    rsHavePrev = true;
-    rsPos -= static_cast<double>(consumedFull);
+    // Drop the samples we've finished using as left endpoints. The interp at
+    // i=written-1 used mixBuf[idx] and mixBuf[idx+1]; the next call's first
+    // interp will use mixBuf[floor(rsPos)] (now == old idx+1) and the one
+    // after it. So drop [0, floor(rsPos)) and keep the rest for next call.
+    size_t drop = static_cast<size_t>(rsPos);
+    if (drop > mixBufL.size()) drop = mixBufL.size();
+    if (drop > 0) {
+      mixBufL.erase(mixBufL.begin(), mixBufL.begin() + drop);
+      mixBufR.erase(mixBufR.begin(), mixBufR.begin() + drop);
+      rsPos -= static_cast<double>(drop);
+    }
 
     HRESULT rbHr = render->ReleaseBuffer(written, written == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     if (FAILED(rbHr)) {
       dlog("pt sink \"%s\": ReleaseBuffer failed hr=0x%08x written=%u",
            sink->endpointIdUtf8.c_str(), rbHr, written);
     }
+    if (verbose) dlog("pt sink \"%s\": iter=%llu D:released hr=0x%08x written=%u drop=%zu mixBuf=%zu rsPos=%.4f",
+                       sink->endpointIdUtf8.c_str(),
+                       (unsigned long long)iterCount, rbHr, written, drop,
+                       mixBufL.size(), rsPos);
     totalWritten += written;
-    ++iterCount;
-    if (iterCount <= 3 || totalWritten - lastHeartbeat >= (uint64_t)out_rate * 5) {
-      dlog("pt sink \"%s\": iter=%llu free=%u needMix=%zu written=%u rsPosAfter=%.4f totalWritten=%llu",
-           sink->endpointIdUtf8.c_str(), (unsigned long long)iterCount,
-           free, needMix, written, rsPos, (unsigned long long)totalWritten);
+    if (totalWritten - lastHeartbeat >= (uint64_t)out_rate * 5) {
+      dlog("pt sink \"%s\": heartbeat iter=%llu totalWritten=%llu mixBuf=%zu",
+           sink->endpointIdUtf8.c_str(),
+           (unsigned long long)iterCount, (unsigned long long)totalWritten,
+           mixBufL.size());
       lastHeartbeat = totalWritten;
     }
   }

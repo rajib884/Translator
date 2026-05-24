@@ -79,6 +79,12 @@ class PassthroughSession {
   // for passthrough use).
   void distribute(uint64_t startFrame, const float* L, const float* R, size_t n);
 
+  // Wrap distribute() with bracketing dlog() lines tagged with `who` ("mic
+  // source" / "loopback source") so a crash inside ring.mixIn (or inside
+  // sinksMu acquisition) leaves a breadcrumb trail in the log.
+  void distribute_logged(const char* who, uint64_t startFrame,
+                         const float* L, const float* R, size_t n, bool verbose);
+
   void update_peak(float p);
 
   static std::string format_float(float f);

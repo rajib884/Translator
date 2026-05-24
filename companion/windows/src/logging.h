@@ -10,4 +10,10 @@ namespace companion {
 // became measurable during the every-500ms silent-tick heartbeat).
 void dlog(const char* fmt, ...);
 
+// Install a Windows unhandled-exception filter that writes the exception
+// code, faulting PC, faulting address (for AVs), and thread id via dlog()
+// before the process is terminated. Without this, an access violation in
+// any worker thread kills the exe silently with no log line.
+void install_crash_handler();
+
 }  // namespace companion

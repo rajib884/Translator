@@ -21,6 +21,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   using namespace companion;
 
   FreeConsole();
+  install_crash_handler();
   WSADATA wsa = {};
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 
