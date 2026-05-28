@@ -13,7 +13,7 @@
   <link rel="apple-touch-icon" href="favico.png" />
   <link rel="stylesheet" href="css/style.css" />
 </head>
-<body>
+<body class="no-companion">
 
   <!-- Icon sprite. Hidden but reachable via <use href="#icon-mic">. Currently
        only the mic shape is centralised here — it's the only icon that
@@ -131,7 +131,7 @@
               <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto Detect</button>
               <button class="seg-opt"           data-value="ptt"  type="button" role="radio" aria-checked="false">Push to talk</button>
             </div>
-            <p class="hint" id="speech-mode-hint">Auto Detect: model decides when you start/stop speaking. Push to talk: you hold a key while speaking (needs the companion app).</p>
+            <p class="hint" id="speech-mode-hint">Auto Detect: model decides when you start/stop speaking. Push to talk: tap the Talk button to engage the mic, tap again to release.</p>
           </div>
 
           <div id="vad-auto-fields">
@@ -172,17 +172,17 @@
           </div>
 
           <div id="vad-ptt-fields" style="display:none">
-            <div class="field">
-              <label>Hotkey</label>
+            <div class="field companion-only">
+              <label>Hotkey <span class="hint-inline">(optional, needs companion)</span></label>
               <div class="input-row">
                 <button class="btn ghost ptt-key-btn" id="btn-ptt-key" type="button">
                   <span id="ptt-key-label">Not set — click to bind</span>
                 </button>
                 <button class="icon-btn small" id="btn-ptt-clear" type="button" title="Clear hotkey" aria-label="Clear hotkey">×</button>
               </div>
-              <p class="hint" id="ptt-hint">Companion app must be running. Hotkey is shared across all PTT sessions and works system-wide.</p>
+              <p class="hint" id="ptt-hint">Optional: install the companion app to bind a system-wide hotkey. The Talk button works without it.</p>
             </div>
-            <div class="field">
+            <div class="field companion-only">
               <label>Mode</label>
               <div class="segmented" id="ptt-mode-segmented" role="radiogroup" aria-label="Push-to-talk mode">
                 <button class="seg-opt is-active" data-value="hold"   type="button" role="radio" aria-checked="true">Hold to talk</button>
@@ -190,7 +190,7 @@
               </div>
               <p class="hint" id="ptt-mode-hint">Hold: speak while the key is pressed. Toggle: tap once to start, tap again to stop.</p>
             </div>
-            <div class="field">
+            <div class="field companion-only">
               <label class="checkbox-row">
                 <input type="checkbox" id="ptt-exclusive" />
                 <span>Capture key exclusively (block other apps)</span>
@@ -306,7 +306,7 @@
 
         <section class="section actions">
           <button id="btn-pip" class="btn ghost" type="button">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><path d="M18 14v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5"/></svg>Pop out
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>Pop out
           </button>
           <button id="btn-log" class="btn ghost advanced-only" type="button">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Log
@@ -370,6 +370,17 @@
         <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>
       </button>
     </div>
+    <!-- Push-to-talk toggle. Hidden until the active session is configured
+         for PTT (pttMode === 'ptt'). Tap to engage the mic; tap again to
+         release. Synced with the matching button in the pop-out window.
+         Uses .is-hidden (not the [hidden] attr) so the .btn display:inline-flex
+         doesn't override it. -->
+    <button id="btn-ptt" class="btn ptt advanced-only is-hidden" type="button" disabled
+            data-engaged="false" aria-pressed="false"
+            title="Push to talk — tap to start, tap to stop"
+            aria-label="Push to talk">
+      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span><span class="btn-tx">Speak</span>
+    </button>
     <button id="btn-pause" class="icon-btn full-only" type="button" disabled
             title="Pause mic" aria-label="Pause mic" aria-pressed="false">
       <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
@@ -385,7 +396,7 @@
     </button>
     <button id="btn-pip-quick" class="icon-btn quick advanced-only" type="button"
             title="Pop out current translation" aria-label="Pop out current translation">
-      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><path d="M18 14v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5"/></svg>
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>
     </button>
   </footer>
 

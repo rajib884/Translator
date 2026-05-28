@@ -198,6 +198,15 @@ body[data-ui-mode="mid"] .full-only { display: none !important; }
    simple too, even when only one class is on it). */
 body[data-ui-mode="simple"] .full-only { display: none !important; }
 
+/* Companion-dependent UI — hidden whenever the local companion service isn't
+   reachable. JS toggles body.no-companion based on detectCompanionService(). */
+body.no-companion .companion-only { display: none !important; }
+
+/* Generic "hide" utility. The HTML [hidden] attribute is too easy to override
+   (the .btn class defaults to display: inline-flex), so JS toggles this class
+   for elements that need to disappear/reappear at runtime. */
+.is-hidden { display: none !important; }
+
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 999px;
@@ -536,7 +545,7 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
 .controls {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: 1fr auto auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto auto;
   gap: 8px;
   padding: 10px 12px;
   padding-bottom: calc(10px + var(--safe-bottom));
@@ -550,6 +559,16 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
 .start-stop { display: contents; }
 .start-stop[data-running="true"]  #btn-start { display: none; }
 .start-stop[data-running="false"] #btn-stop  { display: none; }
+
+/* PTT toggle: idle = subtle outline, engaged = accent fill so the live state
+   is obvious at a glance from the meter row. */
+.btn.ptt { color: var(--fg-1); }
+.btn.ptt[data-engaged="true"] {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.btn.ptt[data-engaged="true"]:not(:disabled):hover { filter: brightness(1.08); }
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -601,8 +620,8 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
 
 /* Narrow phones: collapse secondary labels to icons */
 @media (max-width: 380px) {
-  .btn.warn .btn-tx, .btn.danger .btn-tx, #btn-force-reset .btn-tx { display: none; }
-  .btn.warn, .btn.danger, #btn-force-reset { padding: 0; width: 44px; }
+  .btn.warn .btn-tx, .btn.danger .btn-tx, #btn-force-reset .btn-tx, #btn-ptt .btn-tx { display: none; }
+  .btn.warn, .btn.danger, #btn-force-reset, #btn-ptt { padding: 0; width: 44px; }
 }
 
 /* ─── Sidebar / Sheet ─── */
@@ -771,6 +790,7 @@ textarea {
 }
 code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--bg-3); padding: 1px 5px; border-radius: 4px; }
 .hint { margin: 0; font-size: 11px; color: var(--fg-2); }
+.hint-inline { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: 10px; color: var(--fg-2); margin-left: 4px; }
 .checkbox-row {
   display: inline-flex; align-items: center; gap: 8px;
   cursor: pointer; font-size: 12px; font-weight: 500;

@@ -58,8 +58,11 @@ const HINTS = {
     oneway: 'Translates only your speech (useful for broadcasts).',
   },
   speechMode(mode, companionOk) {
-    if (!companionOk) return 'Push to talk needs the companion app running.';
-    if (mode === 'ptt') return 'Hold the bound key while speaking. Release to let the model translate.';
+    if (mode === 'ptt') {
+      return companionOk
+        ? 'Tap the Talk button to start speaking; tap again to stop. Optionally bind a system-wide hotkey via the companion app.'
+        : 'Tap the Talk button to start speaking; tap again to stop.';
+    }
     return 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
   },
   audioSource(canDisplay, companionOk) {
@@ -229,6 +232,7 @@ const els = {
   btnStop:       $('btn-stop'),
   btnHush:       $('btn-hush'),
   btnPause:      $('btn-pause'),
+  btnPtt:        $('btn-ptt'),
   btnClear:      $('btn-clear'),
   btnExport:     $('btn-export'),
   exportMenu:    $('export-menu'),
@@ -1228,33 +1232,23 @@ function updatePttButton() {
     els.pttExclusive.checked = !!(state.pttBinding && state.pttBinding.exclusive);
   }
   if (els.pttHint) {
-    const companionMissing = !state.companionAvailable;
-    if (companionMissing) {
-      els.pttHint.textContent = 'Push-to-talk needs the companion app running. Start it, then refresh.';
+    if (!state.companionAvailable) {
+      els.pttHint.textContent = 'Optional: install the companion app to bind a system-wide hotkey. The Talk button below works without it.';
     } else if (!state.pttBinding) {
-      els.pttHint.textContent = 'Click "Not set" and press a key (or key combo) to bind the global hotkey.';
+      els.pttHint.textContent = 'Optional global hotkey. Click "Not set" and press a key (or key combo) to bind.';
     } else {
       els.pttHint.textContent = 'Hotkey works system-wide via the companion app — even when this page is in the background.';
     }
   }
 }
 
-// Toggle which sub-section is visible (auto-VAD fields vs PTT fields) and
-// disable the PTT option entirely when the companion app isn't reachable.
+// Toggle which sub-section is visible (auto-VAD fields vs PTT fields). PTT
+// itself is standalone (driven by the in-page Talk button), so the option is
+// always selectable — companion availability only affects the optional global
+// hotkey binding shown inside the PTT section.
 function updateSpeechModeFields() {
   const companionOk = state.companionAvailable;
-  if (els.speechMode) els.speechMode.setOptionDisabled('ptt', !companionOk);
-
-  // If the user is on PTT but the companion just went away, fall back to auto
-  // and sync the change through onSettingsChange so the active session learns.
-  if (!companionOk && els.speechMode && els.speechMode.value === 'ptt') {
-    els.speechMode.value = 'auto';
-    const session = activeSession();
-    if (session) {
-      session.config.pttMode = 'auto';
-      saveSessions();
-    }
-  }
+  if (els.speechMode) els.speechMode.setOptionDisabled('ptt', false);
 
   const mode = els.speechMode ? els.speechMode.value : 'auto';
   if (els.vadAutoFields) els.vadAutoFields.style.display = mode === 'ptt' ? 'none' : '';
@@ -1264,6 +1258,7 @@ function updateSpeechModeFields() {
     els.speechModeHint.textContent = HINTS.speechMode(mode, companionOk);
   }
   updatePttButton();
+  refreshPttButtonState();
 }
 
 function beginPttCapture() {
@@ -1495,6 +1490,13 @@ function onSettingsChange() {
   const nextConfig = readConfigFromUI();
   if (JSON.stringify(session.config) !== JSON.stringify(nextConfig)) {
     session.resumeHandle = null;
+  }
+  // Leaving PTT mode releases any sticky engaged state so a later toggle
+  // back to PTT starts from "not engaged" instead of an inherited true.
+  if (session.config && session.config.pttMode === 'ptt'
+      && nextConfig.pttMode !== 'ptt' && session.pttHeld) {
+    session.pttHeld = false;
+    if (session.client) { try { session.client.sendActivityEnd(); } catch (_) {} }
   }
   session.config = nextConfig;
   updateTabChip(session);
@@ -1958,21 +1960,12 @@ async function detectCompanionService({ silent = true } = {}) {
     state.companionAvailable = false;
     if (!silent) log('warn', 'Companion service unavailable: ' + (e && e.message ? e.message : e));
   }
-  // Companion dropped while we were depending on it. Every running PTT session
-  // was started with manualActivity:true; the GeminiLiveClient won't pick up
-  // a pttMode change until restart, so it sits there waiting for activityStart
-  // signals that will never arrive (no hotkey = mic effectively muted, but
-  // the chip kept reading "Hold KEY" / "Listening"). Stop those sessions and
-  // surface a clear error so the user knows to restart with auto VAD.
+  // Companion dropped while we were depending on it. PTT sessions used to be
+  // killed here (the global hotkey was the only input), but with the Talk
+  // button driving session.pttHeld directly we just lose the optional
+  // hotkey — the session keeps working. Companion-audio capture has no
+  // standalone fallback though, so those sessions still need to stop.
   if (wasAvailable && !state.companionAvailable) {
-    const stuckPtt = [...state.sessions.values()].filter(
-      (s) => s.running && s.config && s.config.pttMode === 'ptt');
-    if (stuckPtt.length > 0) {
-      log('error',
-        `Companion service disconnected — stopping ${stuckPtt.length} push-to-talk ` +
-        `session${stuckPtt.length === 1 ? '' : 's'} that can no longer receive the hotkey.`);
-      Promise.all(stuckPtt.map((s) => stopSession(s).catch(() => {})));
-    }
     const stuckCompanionAudio = [...state.sessions.values()].filter(
       (s) => s.running && (s.currentAudioMode === 'companion'));
     if (stuckCompanionAudio.length > 0) {
@@ -1982,6 +1975,7 @@ async function detectCompanionService({ silent = true } = {}) {
       Promise.all(stuckCompanionAudio.map((s) => stopSession(s).catch(() => {})));
     }
   }
+  document.body.classList.toggle('no-companion', !state.companionAvailable);
   updateAudioSourceAvailability();
   updateSpeechModeFields();
   if (state.companionAvailable && els.companionApp) {
@@ -3070,7 +3064,11 @@ const STATUS_DEF = {
   queued:       { cls: 'pill-queued',       label: () => 'Queued' },
   waiting:      { cls: 'pill-waiting',      label: () => {
     const b = state.pttBinding;
-    return b ? ('Hold ' + (b.label || keyLabelFromVk(b.vkCode))) : 'Hold to talk';
+    if (b) {
+      const key = b.label || keyLabelFromVk(b.vkCode);
+      return (b.mode === 'toggle') ? ('Tap ' + key) : ('Hold ' + key);
+    }
+    return 'Tap to talk';
   } },
 };
 
@@ -3383,6 +3381,7 @@ function applyControlButtonsForActiveSession() {
     els.btnPause.setAttribute('aria-pressed', 'false');
     setControlsLocked(false);
     if (state.pip) state.pip.setRunning(false, false, true);
+    refreshPttButtonState();
     return;
   }
   els.btnStart.disabled = session.running;
@@ -3400,6 +3399,64 @@ function applyControlButtonsForActiveSession() {
   // when togglePause runs from the main control bar, the PIP's pause label
   // flips on the same frame.
   if (state.pip) state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
+  refreshPttButtonState();
+}
+
+// ─── Push-to-talk button (standalone) ────────────────────────────────────────
+// The footer Talk button and the PIP popup Talk button are toggles for the
+// active session's PTT engagement. Both write through setPttEngaged below,
+// which flips session.pttHeld — the same flag sendAudioGated already uses to
+// decide whether to send real audio or silence.
+
+// Reflect the active session's PTT visibility + engagement state into both
+// the footer and the PIP buttons. Idempotent — safe to call after any state
+// change that could affect either.
+function refreshPttButtonState() {
+  const session = activeSession();
+  const isPtt = !!(session && session.config && session.config.pttMode === 'ptt');
+  const engaged = !!(session && session.pttHeld);
+  // The button stays clickable while the model speaks back so the user can
+  // disengage mid-response. Audio gating during TTS is handled by
+  // session.muteInput inside sendAudioGated — flipping pttHeld is harmless
+  // while the mic is silenced anyway.
+  const canEngage = isPtt && !!session && !!session.running && !session.paused;
+
+  if (els.btnPtt) {
+    els.btnPtt.classList.toggle('is-hidden', !isPtt);
+    els.btnPtt.disabled = !canEngage;
+    els.btnPtt.dataset.engaged = engaged ? 'true' : 'false';
+    els.btnPtt.setAttribute('aria-pressed', engaged ? 'true' : 'false');
+    els.btnPtt.title = engaged ? 'Tap to stop' : 'Push to talk — tap to start, tap to stop';
+    const tx = els.btnPtt.querySelector('.btn-tx');
+    if (tx) tx.textContent = engaged ? 'Translate' : 'Speak';
+  }
+  if (state.pip) {
+    state.pip.setPttVisible(isPtt);
+    state.pip.setPttEngaged(engaged);
+    state.pip.setPttDisabled(!canEngage);
+  }
+}
+
+function setPttEngaged(session, engaged) {
+  if (!session) return;
+  if (!session.running) return;
+  if (!session.config || session.config.pttMode !== 'ptt') return;
+  if (!!session.pttHeld === !!engaged) return;
+  session.pttHeld = !!engaged;
+  if (session.client) {
+    try {
+      if (engaged) session.client.sendActivityStart();
+      else session.client.sendActivityEnd();
+    } catch (_) {}
+  }
+  refreshSessionDisplay(session);
+  refreshPttButtonState();
+}
+
+function togglePtt() {
+  const session = activeSession();
+  if (!session) return;
+  setPttEngaged(session, !session.pttHeld);
 }
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
@@ -3507,27 +3564,28 @@ async function startSession(session) {
     onLog: log,
   });
 
-  // PTT integration: subscribe to global hotkey events. The PttHotkeyClient
-  // fans out down/up to all subscribed sessions; here we translate to
-  // activity signals + the pttHeld flag that gates audio streaming.
+  // PTT integration:
+  //   - The in-page Talk button (footer + popup) is the primary input and
+  //     drives session.pttHeld directly via setPttEngaged().
+  //   - When the companion app is reachable AND a hotkey is bound, we also
+  //     subscribe to its global key events so the same engaged state can be
+  //     driven from outside the browser. Both inputs share session.pttHeld,
+  //     so the two paths stay in sync as long as the user picks one at a
+  //     time. (Cross-talking — toggling via button mid-companion-toggle —
+  //     can briefly desync until the next user input.)
   if (isPtt && state.pttClient) {
-    if (!state.companionAvailable) {
-      log('warn', 'Push-to-talk needs the companion app to be running — the session will receive only silence until you switch to Auto VAD or start it.');
-    } else if (!state.pttBinding) {
-      log('warn', 'Push-to-talk enabled but no hotkey is bound — open Settings → Speech detection to bind a key.');
-    }
     state.pttClient.subscribe(session.id,
       () => {
         session.pttHeld = true;
         if (session.client) session.client.sendActivityStart();
-        // The chip status flips from "Hold KEY" → "Listening" on the same
-        // frame the key goes down, so the user sees an immediate response.
         refreshSessionDisplay(session);
+        refreshPttButtonState();
       },
       () => {
         session.pttHeld = false;
         if (session.client) session.client.sendActivityEnd();
         refreshSessionDisplay(session);
+        refreshPttButtonState();
       });
   }
 
@@ -4037,7 +4095,7 @@ const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
 
 class PipController {
   constructor({ onStart, onStop, onPause, onHush, onClear,
-                onCycleSession, onPttDown, onPttUp, onPrefsChange,
+                onCycleSession, onPttToggle, onPrefsChange,
                 onForceReset } = {}) {
     this.win = null;
     this.doc = null;
@@ -4055,11 +4113,11 @@ class PipController {
     // Cycle through running/idle sessions when more than one exists. Hidden
     // when the count is <= 1.
     this.onCycleSession = onCycleSession || (() => {});
-    // PTT button — press-and-hold. Placeholder for now: main page receives
-    // the down/up signals and decides whether to wire them through to the
-    // active session's GeminiLive client (manualActivity path) or just log.
-    this.onPttDown = onPttDown || (() => {});
-    this.onPttUp   = onPttUp   || (() => {});
+    // PTT button — tap to engage, tap to release. Standalone implementation:
+    // main page wires this to togglePtt(), which flips session.pttHeld and
+    // tells the GeminiLive client via activityStart/activityEnd. The button
+    // hides itself when the active session isn't in PTT mode (setPttVisible).
+    this.onPttToggle = onPttToggle || (() => {});
     this.onPrefsChange = onPrefsChange || (() => {});
     this.onForceReset = onForceReset || (() => {});
     this.onClose = () => {};
@@ -4438,9 +4496,9 @@ class PipController {
         <button class="pip-iconbtn pip-startstop" id="pipBtnStartStop"
                 type="button" data-running="false"
                 title="Start" aria-label="Start">▶</button>
-        <button class="pip-iconbtn pip-ptt" id="pipBtnPtt"
-                type="button" data-held="false"
-                title="Push to talk (placeholder)" aria-label="Push to talk">🎙</button>
+        <button class="pip-iconbtn pip-ptt is-hidden" id="pipBtnPtt"
+                type="button" data-held="false" aria-pressed="false"
+                title="Push to talk — tap to start, tap to stop" aria-label="Push to talk">🎙</button>
         <button class="pip-iconbtn pip-cycle is-hidden" id="pipBtnCycle"
                 type="button"
                 title="Switch session" aria-label="Switch session">⇆</button>
@@ -4545,32 +4603,10 @@ class PipController {
       else this.onStart();
     });
 
-    // PTT: press-and-hold. Both pointer + keyboard (Space/Enter) trigger the
-    // same down/up pair. Placeholder for now — main page can wire onPttDown/Up
-    // to the active session's activityStart/activityEnd later.
-    const pttDown = () => {
-      if (this._pttHeld) return;
-      this._pttHeld = true;
-      this.btnPttEl.dataset.held = 'true';
-      this.onPttDown();
-    };
-    const pttUp = () => {
-      if (!this._pttHeld) return;
-      this._pttHeld = false;
-      this.btnPttEl.dataset.held = 'false';
-      this.onPttUp();
-    };
-    this.btnPttEl.addEventListener('pointerdown', (ev) => { ev.preventDefault(); pttDown(); });
-    this.btnPttEl.addEventListener('pointerup', pttUp);
-    this.btnPttEl.addEventListener('pointerleave', pttUp);
-    this.btnPttEl.addEventListener('pointercancel', pttUp);
-    this.btnPttEl.addEventListener('keydown', (ev) => {
-      if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); pttDown(); }
-    });
-    this.btnPttEl.addEventListener('keyup', (ev) => {
-      if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); pttUp(); }
-    });
-    this.btnPttEl.addEventListener('blur', pttUp);  // safety: window loses focus mid-hold
+    // PTT: tap to engage, tap to release. The main page owns the engaged
+    // state (session.pttHeld) and writes it back via setPttEngaged() — so we
+    // never flip the visual on click; we just forward the toggle intent.
+    this.btnPttEl.addEventListener('click', () => this.onPttToggle());
 
     this.btnCycleEl.addEventListener('click', () => this.onCycleSession());
     this.btnForceResetEl.addEventListener('click', () => this.onForceReset());
@@ -4645,6 +4681,35 @@ class PipController {
     if (this.btnCycleEl) {
       this.btnCycleEl.classList.toggle('is-hidden', this._sessionCount <= 1);
     }
+  }
+
+  // PTT button visibility — driven by whether the active session is in PTT
+  // mode. Hidden buttons stay in the DOM (state survives toggles) but don't
+  // interrupt the header rhythm or steal a focus stop.
+  setPttVisible(visible) {
+    if (!this.btnPttEl) return;
+    this.btnPttEl.classList.toggle('is-hidden', !visible);
+  }
+
+  // PTT engaged state — written by the main page, never by the click handler.
+  // Keeping the engaged visual in lockstep with session.pttHeld means the
+  // footer Talk button, the popup Talk button, and an optional companion
+  // hotkey can all share one source of truth.
+  setPttEngaged(engaged) {
+    this._pttHeld = !!engaged;
+    if (!this.btnPttEl) return;
+    this.btnPttEl.dataset.held = engaged ? 'true' : 'false';
+    this.btnPttEl.setAttribute('aria-pressed', engaged ? 'true' : 'false');
+    this.btnPttEl.setAttribute('aria-label', engaged ? 'Stop talking' : 'Push to talk');
+  }
+
+  // Greyed-out state — driven from the main page's canEngage check (running,
+  // not paused, etc.). Kept separate from setPttEngaged so the engaged visual
+  // and the click-availability can change independently.
+  setPttDisabled(disabled) {
+    if (!this.btnPttEl) return;
+    this.btnPttEl.disabled = !!disabled;
+    this.btnPttEl.title = this._pttHeld ? 'Tap to stop' : 'Push to talk — tap to start';
   }
 
   setDisplayMode(mode, persist) {
@@ -4809,28 +4874,10 @@ async function togglePip() {
       const next = ids[(here + 1) % ids.length];
       setActiveSession(next);
     },
-    // PTT button is a placeholder. We forward press/release into the active
-    // session's GeminiLive client as activityStart/activityEnd so it does the
-    // right thing for sessions started with manualActivity:true (PTT mode).
-    // For auto-VAD sessions these are harmless no-ops on the server side.
-    // Real PTT lifecycle (gating the mic feed) still lives in the companion
-    // hotkey path — this button is intentionally lower-fidelity.
-    onPttDown: () => {
-      const session = activeSession();
-      if (session && session.client) {
-        session.pttHeld = true;
-        try { session.client.sendActivityStart(); } catch (_) {}
-        refreshSessionDisplay(session);
-      }
-    },
-    onPttUp: () => {
-      const session = activeSession();
-      if (session && session.client) {
-        session.pttHeld = false;
-        try { session.client.sendActivityEnd(); } catch (_) {}
-        refreshSessionDisplay(session);
-      }
-    },
+    // PTT toggle: tap to engage, tap to release. Shares session.pttHeld with
+    // the footer Talk button and the optional companion hotkey, so all three
+    // inputs stay in sync via setPttEngaged() called from refreshPttButtonState.
+    onPttToggle: togglePtt,
     onPrefsChange: (prefs) => {
       // Mirror PIP-side prefs (display mode + font size) into global prefs so
       // they stick across pop-out sessions and page reloads. The PIP class
@@ -4881,6 +4928,8 @@ async function togglePip() {
   // Seed the cycle-button visibility now that the PIP exists. Subsequent
   // session add/close/restore paths re-call this via refreshPipSessionCount.
   refreshPipSessionCount();
+  // Seed the popup's PTT visibility + engaged state from the active session.
+  refreshPttButtonState();
   log('info', PipController.isDocPipSupported() ? 'Pop-out window opened.' : 'Pop-out (popup fallback) opened.');
 }
 
@@ -4895,6 +4944,7 @@ function wireUI() {
   els.btnStart.addEventListener('click', startPipeline);
   els.btnStop.addEventListener('click', stopPipeline);
   els.btnPause.addEventListener('click', togglePause);
+  if (els.btnPtt) els.btnPtt.addEventListener('click', togglePtt);
   els.btnHush.addEventListener('click', () => {
     const session = activeSession();
     if (session) state.ttsCoordinator.hush(session);
@@ -4959,8 +5009,11 @@ function wireUI() {
     onSettingsChange();
   });
   els.speechMode.addEventListener('change', () => {
-    updateSpeechModeFields();
+    // Sync session.config first so the refresh below sees the new pttMode.
+    // Inverting these lines hides/shows the Talk button against stale config
+    // and the user has to click somewhere else before the visibility settles.
     onSettingsChange();
+    updateSpeechModeFields();
   });
   if (els.btnPttKey) {
     els.btnPttKey.addEventListener('click', beginPttCapture);
