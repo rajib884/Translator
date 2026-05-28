@@ -358,26 +358,32 @@
   </main>
 
   <footer class="controls">
-    <button id="btn-start" class="btn primary" type="button">
-      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg></span><span class="btn-tx">Start</span>
-    </button>
-    <button id="btn-pause" class="icon-btn" type="button" disabled
+    <!-- Start/Stop are two separate <button>s so all existing JS that toggles
+         .disabled / wires click handlers keeps working, but a wrapping div
+         with data-running flips which one is visible. Result: the user sees a
+         single button morphing between Start (green) and Stop (red). -->
+    <div class="start-stop" data-running="false">
+      <button id="btn-start" class="btn primary" type="button">
+        <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg></span><span class="btn-tx">Start</span>
+      </button>
+      <button id="btn-stop" class="btn danger" type="button" disabled>
+        <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>
+      </button>
+    </div>
+    <button id="btn-pause" class="icon-btn full-only" type="button" disabled
             title="Pause mic" aria-label="Pause mic" aria-pressed="false">
       <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
       <svg class="icon icon-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
     </button>
-    <button id="btn-hush" class="btn warn" type="button" disabled title="Stop current speech output">
+    <button id="btn-hush" class="btn warn full-only" type="button" disabled title="Stop current speech output">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></span><span class="btn-tx">Silence</span>
     </button>
-    <button id="btn-stop" class="btn danger" type="button" disabled>
-      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>
-    </button>
-    <button id="btn-force-reset" class="icon-btn full-only" type="button"
+    <button id="btn-force-reset" class="btn ghost advanced-only" type="button"
             title="Force reconnect: drop the WebSocket and clear the resume handle. Starts a fresh model context."
             aria-label="Force reconnect">
-      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></span><span class="btn-tx">Renew</span>
     </button>
-    <button id="btn-pip-quick" class="icon-btn quick" type="button"
+    <button id="btn-pip-quick" class="icon-btn quick advanced-only" type="button"
             title="Pop out current translation" aria-label="Pop out current translation">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><path d="M18 14v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5"/></svg>
     </button>
@@ -444,6 +450,27 @@
         </button>
       </div>
       <div id="log" class="log mono"></div>
+    </div>
+  </div>
+
+  <!-- Generic confirm dialog. Used in place of window.confirm() so the alert
+       matches the app theme. Content (title, message, button labels) is set
+       at call time by showConfirm() in app.js. -->
+  <div class="sheet sheet-alert" id="confirm-sheet">
+    <div class="sheet-backdrop" data-close="confirm-sheet"></div>
+    <div class="sheet-content confirm-content" role="alertdialog" aria-modal="true" tabindex="-1"
+         aria-labelledby="confirm-sheet-title" aria-describedby="confirm-sheet-message">
+      <div class="sheet-head">
+        <h2 id="confirm-sheet-title">Confirm</h2>
+        <button class="icon-btn close-btn" type="button" data-close="confirm-sheet" aria-label="Close">×</button>
+      </div>
+      <div class="sheet-body">
+        <p id="confirm-sheet-message" class="confirm-message"></p>
+        <div class="row-end">
+          <button id="btn-confirm-cancel" class="btn ghost" type="button">Cancel</button>
+          <button id="btn-confirm-ok" class="btn primary" type="button">Confirm</button>
+        </div>
+      </div>
     </div>
   </div>
 

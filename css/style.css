@@ -544,6 +544,13 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
   border-top: 1px solid var(--line-soft);
 }
 
+/* Start/Stop wrapper participates in the grid as if its children were direct
+   grid items — one of the two is always display:none, so the grid always sees
+   exactly one wide button in column 1. */
+.start-stop { display: contents; }
+.start-stop[data-running="true"]  #btn-start { display: none; }
+.start-stop[data-running="false"] #btn-stop  { display: none; }
+
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
   gap: 6px; min-height: 44px; padding: 0 14px;
@@ -594,8 +601,8 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
 
 /* Narrow phones: collapse secondary labels to icons */
 @media (max-width: 380px) {
-  .btn.warn .btn-tx, .btn.danger .btn-tx { display: none; }
-  .btn.warn, .btn.danger { padding: 0; width: 44px; }
+  .btn.warn .btn-tx, .btn.danger .btn-tx, #btn-force-reset .btn-tx { display: none; }
+  .btn.warn, .btn.danger, #btn-force-reset { padding: 0; width: 44px; }
 }
 
 /* ─── Sidebar / Sheet ─── */
@@ -703,6 +710,28 @@ body[data-ui-mode="simple"] .full-only { display: none !important; }
   display: flex; flex-direction: column;
   animation: slide-up 0.22s ease-out;
   padding-bottom: var(--safe-bottom);
+}
+
+/* Compact "alert" variant for confirm dialogs — centered, narrow, no handle. */
+.sheet-alert { align-items: center; padding: 16px; }
+.sheet-alert .sheet-content {
+  width: auto;
+  max-width: 440px;
+  border-radius: 14px;
+  border-bottom: 1px solid var(--line);
+  animation: alert-pop 0.18s ease-out;
+  padding-bottom: 0;
+}
+.sheet-alert .sheet-head { padding: 12px 14px; }
+.sheet-alert .confirm-message {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--fg-1);
+}
+@keyframes alert-pop {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: none; }
 }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

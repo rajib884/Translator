@@ -814,13 +814,50 @@ function resetAdvancedSettingsForBasic() {
   onSettingsChange();
 }
 
+// Full factory reset — used when the last session is closed so the auto-created
+// replacement starts fresh. Resets the visible language pair + voice in
+// addition to everything resetAdvancedSettingsForBasic touches. (API key, PTT
+// hotkey, and UI mode are credentials / global affordances and stay put.)
+function resetSettingsToFactoryDefaults() {
+  resetAdvancedSettingsForBasic();
+  els.langSource.value = 'en';
+  els.langTarget.value = 'zh';
+  els.voice.value = 'Zephyr';
+  onSettingsChange();
+}
+
 function resetFullSettingsForAdvanced() {
   resetFullOnlySettings();
   updateUIVisibility();
   onSettingsChange();
 }
 
-function requestUIModeChange(mode) {
+// True iff every Full-only field is already at its default — same fields
+// resetFullOnlySettings() would clobber. Lets us skip the confirm dialog when
+// the narrowing transition wouldn't actually change anything.
+function fullOnlySettingsAtDefault() {
+  return els.modeSelect.value === 'audio'
+      && els.dirSelect.value === 'bidir'
+      && state.systemPromptTemplate === null;
+}
+
+// True iff every field resetAdvancedSettingsForBasic() would touch is already
+// at its default. Mirrors that function so the two stay in lockstep — if a new
+// field is added there, add the matching check here.
+function basicResetIsNoOp() {
+  if (!fullOnlySettingsAtDefault()) return false;
+  if ((els.audioSource.value || 'mic') !== 'mic') return false;
+  if (els.audioInput.value !== '') return false;
+  if (els.speechMode.value !== 'auto') return false;
+  if (els.vadPreset.value !== DEFAULT_VAD_PRESET) return false;
+  const outIds = getSelectedOutputDeviceIds();
+  if (outIds.length !== 1 || outIds[0] !== '') return false;
+  if (getPassthroughDeviceIds().length !== 0) return false;
+  if (els.companionApp && els.companionApp.value !== '') return false;
+  return true;
+}
+
+async function requestUIModeChange(mode) {
   if (mode === state.uiMode) return;
   // Narrowing transitions (the new mode is to the left of the current one)
   // reset the now-hidden settings. Widening (e.g. simple → mid → full) is
@@ -830,28 +867,76 @@ function requestUIModeChange(mode) {
   const narrowing = toIdx >= 0 && fromIdx >= 0 && toIdx < fromIdx;
 
   if (narrowing) {
-    const session = activeSession();
-    if (session && session.running) {
-      log('warn', 'Stop the active session before narrowing the UI mode and resetting settings.');
-      return;
-    }
-    if (mode === 'simple') {
-      const ok = window.confirm(
-        'Switch to Basic mode and reset advanced settings for the active session? ' +
-        'This restores voice translation, microphone input, Auto Detect, default devices, and the default prompt.');
-      if (!ok) return;
-      resetAdvancedSettingsForBasic();
-    } else if (mode === 'mid') {
-      // Full → Advanced: only the Full-only fields disappear. Reset just
-      // those (mode, direction, system prompt) so the active session can't
-      // keep using a configuration the user can no longer see.
-      const ok = window.confirm(
-        'Switch to Advanced mode and reset translation mode, direction, and system prompt to defaults?');
-      if (!ok) return;
-      resetFullSettingsForAdvanced();
+    // Skip both the running-session guard and the confirm dialog when the
+    // reset is a no-op — there's nothing to disrupt and nothing to confirm.
+    const noOp = mode === 'simple' ? basicResetIsNoOp() : fullOnlySettingsAtDefault();
+    if (!noOp) {
+      const session = activeSession();
+      if (session && session.running) {
+        log('warn', 'Stop the active session before narrowing the UI mode and resetting settings.');
+        return;
+      }
+      if (mode === 'simple') {
+        const ok = await showConfirm({
+          title: 'Switch to Basic?',
+          message: 'This resets advanced settings for the active session: voice translation, microphone input, Auto Detect, default devices, and the default prompt.',
+          confirmLabel: 'Switch & reset',
+        });
+        if (!ok) return;
+        resetAdvancedSettingsForBasic();
+      } else if (mode === 'mid') {
+        // Full → Advanced: only the Full-only fields disappear. Reset just
+        // those (mode, direction, system prompt) so the active session can't
+        // keep using a configuration the user can no longer see.
+        const ok = await showConfirm({
+          title: 'Switch to Advanced?',
+          message: 'This resets translation mode, direction, and the system prompt to defaults.',
+          confirmLabel: 'Switch & reset',
+        });
+        if (!ok) return;
+        resetFullSettingsForAdvanced();
+      }
     }
   }
   setUIMode(mode);
+}
+
+// In-app replacement for window.confirm(). Returns a Promise<boolean> that
+// resolves true on confirm, false on cancel / backdrop / ESC. Only one dialog
+// can be open at a time; a second call settles the prior promise with false.
+let _confirmResolver = null;
+function showConfirm({ title = 'Confirm', message = '', confirmLabel = 'Confirm', confirmStyle = 'primary', cancelLabel = 'Cancel' } = {}) {
+  return new Promise((resolve) => {
+    const titleEl = $('confirm-sheet-title');
+    const msgEl = $('confirm-sheet-message');
+    const okBtn = $('btn-confirm-ok');
+    const cancelBtn = $('btn-confirm-cancel');
+    if (!titleEl || !msgEl || !okBtn || !cancelBtn) {
+      resolve(window.confirm(message));
+      return;
+    }
+    titleEl.textContent = title;
+    msgEl.textContent = message;
+    okBtn.textContent = confirmLabel;
+    okBtn.className = 'btn ' + confirmStyle;
+    cancelBtn.textContent = cancelLabel;
+
+    if (_confirmResolver) {
+      const prev = _confirmResolver;
+      _confirmResolver = null;
+      prev(false);
+    }
+    _confirmResolver = resolve;
+    openSheet('confirm-sheet');
+  });
+}
+
+function settleConfirm(value) {
+  if (!_confirmResolver) return;
+  const r = _confirmResolver;
+  _confirmResolver = null;
+  closeSheet('confirm-sheet');
+  r(value);
 }
 
 function activeSession() {
@@ -1492,7 +1577,10 @@ async function closeSession(session) {
       setActiveSession(next.id);
       focusTarget = next.tabEl;
     } else {
-      // No sessions left — create a fresh default from current UI state.
+      // No sessions left — reset every visible setting to factory defaults so
+      // the auto-created replacement isn't carrying over the closed session's
+      // configuration.
+      resetSettingsToFactoryDefaults();
       const created = createNewSession({ activate: true });
       focusTarget = created && created.tabEl;
     }
@@ -3273,11 +3361,20 @@ function setOutLevelFor(session, level) {
 }
 
 // ─── Control-bar state ───────────────────────────────────────────────────────
+// Flips the visible face of the combined Start/Stop control. The two <button>s
+// remain in the DOM (so existing .disabled wiring is untouched); CSS shows one
+// based on this attribute.
+function setStartStopRunning(running) {
+  const wrap = els.btnStart && els.btnStart.parentElement;
+  if (wrap) wrap.dataset.running = running ? 'true' : 'false';
+}
+
 function applyControlButtonsForActiveSession() {
   const session = activeSession();
   if (!session) {
     els.btnStart.disabled = true;
     els.btnStop.disabled = true;
+    setStartStopRunning(false);
     els.btnHush.disabled = true;
     els.btnPause.disabled = true;
     els.btnPause.classList.remove('is-paused');
@@ -3290,6 +3387,7 @@ function applyControlButtonsForActiveSession() {
   }
   els.btnStart.disabled = session.running;
   els.btnStop.disabled = !session.running;
+  setStartStopRunning(!!session.running);
   els.btnHush.disabled = !session.running || !session.isAudio;
   els.btnPause.disabled = !session.running;
   els.btnPause.classList.toggle('is-paused', !!session.paused);
@@ -3346,6 +3444,7 @@ async function startSession(session) {
   if (isActive(session)) {
     els.btnStart.disabled = true;
     els.btnStop.disabled = false;
+    setStartStopRunning(true);
     els.btnHush.disabled = !isAudio;
     setControlsLocked(true);
   }
@@ -5007,6 +5106,11 @@ function wireUI() {
   els.btnPip.addEventListener('click', togglePip);
   els.btnPipQuick.addEventListener('click', togglePip);
 
+  const okConfirm = $('btn-confirm-ok');
+  const cancelConfirm = $('btn-confirm-cancel');
+  if (okConfirm) okConfirm.addEventListener('click', () => settleConfirm(true));
+  if (cancelConfirm) cancelConfirm.addEventListener('click', () => settleConfirm(false));
+
   // Simple/Advanced toggle.
   if (els.modeSwitch) {
     els.modeSwitch.addEventListener('click', (ev) => {
@@ -5115,6 +5219,9 @@ function wireUI() {
     if (!tgt) return;
     const id = tgt.getAttribute('data-close');
     if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) return;
+    // Confirm dialog: dismissal (× / backdrop) is "cancel". settleConfirm
+    // closes the sheet, so don't double-close.
+    if (id === 'confirm-sheet') { settleConfirm(false); return; }
     closeSheet(id);
   });
   document.addEventListener('keydown', (ev) => {
@@ -5134,6 +5241,11 @@ function wireUI() {
     if (!id) return;
     if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) {
       ev.preventDefault();
+      return;
+    }
+    if (id === 'confirm-sheet') {
+      ev.preventDefault();
+      settleConfirm(false);
       return;
     }
     ev.preventDefault();
