@@ -372,7 +372,7 @@
     <button id="btn-stop" class="btn danger" type="button" disabled>
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16"/></svg></span><span class="btn-tx">Stop</span>
     </button>
-    <button id="btn-force-reset" class="icon-btn advanced-only" type="button"
+    <button id="btn-force-reset" class="icon-btn full-only" type="button"
             title="Force reconnect: drop the WebSocket and clear the resume handle. Starts a fresh model context."
             aria-label="Force reconnect">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -420,12 +420,16 @@
            troubleshooting. Buttons act on the active session's GeminiLive
            client; they're disabled when there's no connected session. -->
       <div class="log-toolbar" id="log-toolbar">
-        <span class="log-toolbar-label">Test:</span>
-        <button id="btn-test-goaway" class="btn ghost small" type="button"
+        <!-- Dev test buttons hidden outside Full mode — these are destructive
+             knobs for developers and power users, not something a Basic /
+             Advanced user should stumble onto. Export/Clear remain visible
+             so anyone troubleshooting can hand off a log file. -->
+        <span class="log-toolbar-label full-only">Test:</span>
+        <button id="btn-test-goaway" class="btn ghost small full-only" type="button"
                 title="Inject a synthetic GoAway message and let the client reconnect">
           Simulate GoAway
         </button>
-        <button id="btn-test-wsclose" class="btn ghost small" type="button"
+        <button id="btn-test-wsclose" class="btn ghost small full-only" type="button"
                 title="Force-close the WebSocket and let the reconnect ladder run">
           Force-close WS
         </button>
