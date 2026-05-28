@@ -79,6 +79,11 @@ void dlog(const char* fmt, ...) {
 
   OutputDebugStringA(line);
 
+#ifdef CONSOLE_BUILD
+  fputs(line, stdout);
+  fflush(stdout);
+#endif
+
   if (log_file) {
     std::lock_guard<std::mutex> lock(log_mutex);
     fputs(line, log_file);

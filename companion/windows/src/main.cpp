@@ -17,10 +17,16 @@ std::atomic<int> g_connection_count{0};
 
 }  // namespace
 
+#ifdef CONSOLE_BUILD
+int main() {
+#else
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+#endif
   using namespace companion;
 
+#ifndef CONSOLE_BUILD
   FreeConsole();
+#endif
   install_crash_handler();
   WSADATA wsa = {};
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;

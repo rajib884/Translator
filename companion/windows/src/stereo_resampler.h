@@ -34,7 +34,14 @@ struct StereoResampler {
       outR.push_back(aR[i] + (float)((aR[i + 1] - aR[i]) * frac));
       pos += ratio;
     }
-    pos -= static_cast<double>(inL.size());
+    // Carry `pos` over to the next call's coordinate space. The next call
+    // prepends `prev` (= aL.back()), so its aL[0] aligns with this call's
+    // aL[aL.size()-1]. Subtracting (aL.size()-1) lands the new pos in
+    // [0, ratio), avoiding the negative-pos → size_t cast that produced a
+    // huge index and out-of-bounds access at ratio<=1 (e.g. 48 kHz → 48 kHz
+    // loopback). Previously this used inL.size(), off-by-one on the first
+    // (has_prev=false) call.
+    pos -= static_cast<double>(aL.size() - 1);
     prevL = aL.back(); prevR = aR.back(); has_prev = true;
   }
 };

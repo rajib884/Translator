@@ -2,3 +2,5 @@
 .claude
 companion/windows/build/
 Documentation
+__pycache__
+build_tests
