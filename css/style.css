@@ -80,8 +80,6 @@ a:hover { text-decoration: underline; }
 .title .logo img { width: 100%; height: 100%; display: block; object-fit: contain; }
 .title .logo img { border-radius: 4px; }
 .title-text { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.status { display: flex; align-items: center; gap: 8px; }
-.age { font-size: 11px; color: var(--fg-1); background: var(--bg-3); padding: 4px 8px; border-radius: 6px; }
 
 /* Simple/Advanced toggle — compact, inline-fit version of .segmented */
 .mode-switch {
@@ -207,32 +205,6 @@ body.no-companion .companion-only { display: none !important; }
    for elements that need to disappear/reappear at runtime. */
 .is-hidden { display: none !important; }
 
-.pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 999px;
-  font-size: 11px; font-weight: 600;
-  background: var(--bg-3); white-space: nowrap;
-}
-.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-2); }
-.pill-idle .dot { background: var(--fg-2); }
-.pill-connecting .dot { background: var(--warn); animation: pulse 1.2s infinite; }
-.pill-listening .dot { background: var(--good); animation: pulse 1.6s infinite; }
-.pill-translating .dot { background: var(--accent); animation: pulse 0.8s infinite; }
-.pill-reconnecting .dot { background: var(--warn); animation: pulse 0.6s infinite; }
-.pill-switching { color: var(--warn); }
-.pill-switching .dot { background: var(--warn); animation: pulse 1.0s infinite; }
-.pill-paused { color: var(--warn); }
-.pill-paused .dot { background: var(--warn); }
-.pill-waiting { color: var(--warn); }
-.pill-waiting .dot { background: var(--warn); animation: pulse 1.2s infinite; }
-/* Queued: this session has a translation ready but is waiting its turn behind
-   another speaker. Same amber palette as waiting/paused so "model isn't
-   talking to you right now" reads consistently across all the gated states. */
-.pill-queued { color: var(--accent-2); }
-.pill-queued .dot { background: var(--accent-2); animation: pulse 0.8s infinite; }
-.pill-error { color: var(--bad); }
-.pill-error .dot { background: var(--bad); }
-
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* ─── Tab strip ─── */
@@ -292,6 +264,8 @@ body.no-companion .companion-only { display: none !important; }
   border-bottom-color: var(--bg-0);
   margin-bottom: -1px;
 }
+.tab-chip.is-switching { border-color: rgba(245, 158, 11, 0.42); }
+.tab-chip.is-active.is-switching { box-shadow: inset 0 3px 0 var(--warn); }
 .tab-chip.is-active .tab-label { color: var(--fg-0); }
 @keyframes tab-in {
   from { opacity: 0; transform: translateY(4px); }
@@ -337,9 +311,24 @@ body.no-companion .companion-only { display: none !important; }
 }
 .tab-age {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 10px; font-weight: 500;
+  font-size: 10px; font-weight: 600;
   color: var(--fg-2);
-  letter-spacing: 0.4px;
+  letter-spacing: 0.3px;
+  flex: 0 0 auto;
+  min-width: 42px;
+  text-align: right;
+  padding: 2px 0;
+  border-radius: 999px;
+}
+.tab-age.is-switching {
+  min-width: 68px;
+  padding: 2px 7px;
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.28);
+  font-weight: 800;
+  text-align: center;
+  animation: pulse 1.2s infinite;
 }
 
 .tab-meters {
@@ -1205,20 +1194,12 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   to   { opacity: 1; }
 }
 
-/* Status pill: better hover affordance for keyboard users (it's not clickable
-   but the dot's pulse can feel busy with too much else moving). */
-.pill { transition: background 0.12s ease; }
-
 /* Pause/Hush/Stop transitions match the rest. */
 .btn .icon, .icon-btn .icon { transition: color 0.12s ease; }
 
 /* Narrow phones: reclaim space in the topbar.
    - Below 480px, keep the mode-switch but tighten it.
-   - Below 380px, hide the age (already minimal real-estate).
    - Below 340px, drop the title text too (logo stays). */
-@media (max-width: 380px) {
-  .age { display: none; }
-}
 @media (max-width: 340px) {
   .title-text { display: none; }
   .topbar { gap: 6px; padding-left: 8px; padding-right: 8px; }

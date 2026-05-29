@@ -257,9 +257,6 @@ const els = {
   sidebar:       $('sidebar'),
   promptSheet:   $('prompt-sheet'),
   logSheet:      $('log-sheet'),
-  statusPill:    $('status-pill'),
-  statusText:    $('status-text'),
-  sessionAge:    $('session-age'),
   tabList:       $('tab-list'),
   btnNewSession: $('btn-new-session'),
   btnStartAll:   $('btn-start-all'),
@@ -1389,9 +1386,7 @@ function setActiveSession(id) {
   loadSessionConfigIntoUI(next);
   refreshSessionDisplay(next);
   applyControlButtonsForActiveSession();
-  els.sessionAge.textContent = next.startedAt
-    ? fmtDuration(Date.now() - next.startedAt)
-    : '00:00';
+  paintSessionAge(next);
   // Per-session meters live inside the chip and keep painting themselves on
   // every level callback; no global meter to reset here.
 
@@ -1415,7 +1410,7 @@ function setActiveSession(id) {
 
 function seedPipFromSession(session) {
   if (!state.pip) return;
-  state.pip.setStatus(els.statusText.textContent,
+  state.pip.setStatus((STATUS_DEF[effectiveStatus(session)] || STATUS_DEF.idle).label(),
     session.status === 'translating' || session.status === 'connected');
   state.pip.setLangs(langName(session.config.source), langName(session.config.target));
   if (session.liveTurn) {
@@ -3050,15 +3045,15 @@ async function changeAudioInput() {
 // derive two UI-only overlays:
 //   - paused:  user hit the pause button; mic is gated out
 //   - waiting: PTT mode is on, session is connected, but the key isn't held
-// effectiveStatus combines them. refreshSessionDisplay then paints the chip
-// (always) and the topbar pill (only when the session is the active one).
+// Switching is deliberately not part of effectiveStatus. It is a GoAway renewal
+// overlay shown in the age/timer slot, so the state text can keep tracking the
+// real connection/listening/speaking transition underneath.
 const STATUS_DEF = {
   idle:         { cls: 'pill-idle',         label: () => 'Idle' },
   connecting:   { cls: 'pill-connecting',   label: () => 'Connecting' },
   connected:    { cls: 'pill-listening',    label: () => 'Listening' },
   translating:  { cls: 'pill-translating',  label: () => 'Speaking' },
   reconnecting: { cls: 'pill-reconnecting', label: () => 'Reconnect' },
-  switching:    { cls: 'pill-switching',    label: () => 'Switching' },
   error:        { cls: 'pill-error',        label: () => 'Error' },
   paused:       { cls: 'pill-paused',       label: () => 'Paused' },
   queued:       { cls: 'pill-queued',       label: () => 'Queued' },
@@ -3087,12 +3082,6 @@ function effectiveStatus(session) {
       session.config && session.config.pttMode === 'ptt' && !session.pttHeld) {
     return 'waiting';
   }
-  // Switching: the server announced an imminent disconnect via GoAway and we
-  // are about to swap to a new WebSocket on the next resumable handle. Up to
-  // ~2s of mic audio may be lost during the swap — surface this so the user
-  // doesn't speak through the gap unaware. Sits below user-driven overlays
-  // (paused, waiting) but above the regular connection state.
-  if (session.switching) return 'switching';
   return session.status;
 }
 
@@ -3112,10 +3101,7 @@ function refreshSessionDisplay(session) {
   if (session.tabEl) session.tabEl.dataset.status = eff;
   if (session.tabStatusEl) session.tabStatusEl.textContent = text;
 
-  if (isActive(session)) {
-    els.statusPill.className = 'pill ' + def.cls;
-    els.statusText.textContent = text;
-  }
+  paintSessionAge(session);
   // PiP mirrors the followed session's status, not the active one — so the
   // popout stays consistent with the transcript it's showing. setEffectiveStatus
   // drives the background tint (calm listening, lit speaking, amber reconnect,
@@ -3135,6 +3121,23 @@ function fmtDuration(ms) {
   const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
   const ss = String(s % 60).padStart(2, '0');
   return hh > 0 ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function sessionAgeText(session) {
+  if (!session || !session.running) return '00:00';
+  if (session.switching) return 'Switching';
+  return session.startedAt ? fmtDuration(Date.now() - session.startedAt) : '00:00';
+}
+
+function paintSessionAge(session) {
+  if (!session) return;
+  const txt = sessionAgeText(session);
+  const isSwitching = !!session.switching;
+  if (session.tabEl) session.tabEl.classList.toggle('is-switching', isSwitching);
+  if (session.tabAgeEl) {
+    session.tabAgeEl.textContent = txt;
+    session.tabAgeEl.classList.toggle('is-switching', isSwitching);
+  }
 }
 
 function log(level, message) {
@@ -3453,6 +3456,8 @@ function setPttEngaged(session, engaged) {
   refreshPttButtonState();
 }
 
+// TODO: togglePtt always acts on the main window's activeSession(), which
+// may differ from the session the PiP window is currently following.
 function togglePtt() {
   const session = activeSession();
   if (!session) return;
@@ -3660,12 +3665,10 @@ async function startSession(session) {
   session.startedAt = Date.now();
   if (session.ageTimer) clearInterval(session.ageTimer);
   session.ageTimer = setInterval(() => {
-    const txt = fmtDuration(Date.now() - session.startedAt);
-    if (session.tabAgeEl) session.tabAgeEl.textContent = txt;
-    if (isActive(session)) els.sessionAge.textContent = txt;
+    paintSessionAge(session);
   }, 1000);
   // Paint once immediately so the chip doesn't read "00:00" for a full second.
-  if (session.tabAgeEl) session.tabAgeEl.textContent = '00:00';
+  paintSessionAge(session);
 
   const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
   const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
@@ -3726,10 +3729,10 @@ async function stopSession(session) {
   session.lastOutLevel = 0;
   paintMeterFill(session.tabMicFill, 0);
   paintMeterFill(session.tabOutFill, 0);
-  if (session.tabAgeEl) session.tabAgeEl.textContent = '00:00';
+  paintSessionAge(session);
   if (isActive(session)) {
     applyControlButtonsForActiveSession();
-    els.sessionAge.textContent = '00:00';
+    paintSessionAge(session);
   }
   refreshBulkActionButtons();
   refreshActiveDeviceIndicators();
@@ -4920,7 +4923,7 @@ async function togglePip() {
     refreshSessionDisplay(followSession);
   } else {
     state.pipFollowingSessionId = null;
-    pip.setStatus(els.statusText.textContent, false);
+    pip.setStatus('Idle', false);
     pip.setEffectiveStatus('idle');
     pip.setRunning(false, false, true);
     pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));

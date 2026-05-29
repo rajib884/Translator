@@ -44,17 +44,6 @@
       <button class="mode-opt" data-ui-mode="mid" type="button" aria-pressed="false">Advanced</button>
       <button class="mode-opt" data-ui-mode="full" type="button" aria-pressed="false">Full</button>
     </div>
-    <div class="status">
-      <span id="session-age" class="age mono" aria-label="Session age">00:00</span>
-      <!-- role=status + aria-live=polite + aria-atomic announces transitions
-           between Idle / Listening / Speaking / Reconnecting / Error to screen
-           readers without interrupting the user's current speech. -->
-      <span id="status-pill" class="pill pill-idle"
-            role="status" aria-live="polite" aria-atomic="true">
-        <span class="dot" aria-hidden="true"></span>
-        <span id="status-text">Idle</span>
-      </span>
-    </div>
   </header>
 
   <aside class="sidebar" id="sidebar">
@@ -437,16 +426,15 @@
            troubleshooting. Buttons act on the active session's GeminiLive
            client; they're disabled when there's no connected session. -->
       <div class="log-toolbar" id="log-toolbar">
-        <!-- Dev test buttons hidden outside Full mode — these are destructive
-             knobs for developers and power users, not something a Basic /
-             Advanced user should stumble onto. Export/Clear remain visible
+        <!-- Dev test buttons hidden in Basic mode — these are destructive
+             knobs for developers and power users. Export/Clear remain visible
              so anyone troubleshooting can hand off a log file. -->
-        <span class="log-toolbar-label full-only">Test:</span>
-        <button id="btn-test-goaway" class="btn ghost small full-only" type="button"
+        <span class="log-toolbar-label advanced-only">Test:</span>
+        <button id="btn-test-goaway" class="btn ghost small advanced-only" type="button"
                 title="Inject a synthetic GoAway message and let the client reconnect">
           Simulate GoAway
         </button>
-        <button id="btn-test-wsclose" class="btn ghost small full-only" type="button"
+        <button id="btn-test-wsclose" class="btn ghost small advanced-only" type="button"
                 title="Force-close the WebSocket and let the reconnect ladder run">
           Force-close WS
         </button>
