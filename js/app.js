@@ -1608,7 +1608,10 @@ function maybePromoteArchivedSession() {
   delete cfg.outputDeviceId;
   if (!Array.isArray(cfg.passthroughDeviceIds)) cfg.passthroughDeviceIds = [];
   const session = new Session({ id: entry.id || newSessionId(), config: cfg });
-  session.resumeHandle = entry.resumeHandle || null;
+  // Stored resume handles are never restored. Resurfacing an archived session
+  // is a user-visible fresh start; only automatic reconnects inside a running
+  // GeminiLiveClient may resume.
+  session.resumeHandle = null;
   state.sessions.set(session.id, session);
   createSessionDOM(session);
   log('info', `Restored an archived session (${state.archivedSessions.length} remaining).`);
@@ -1749,7 +1752,10 @@ function restoreSessionsFromStorage() {
       id: entry.id || newSessionId(),
       config: cfg,
     });
-    session.resumeHandle = entry.resumeHandle || null;
+    // Do not restore saved resume handles after a page reload. User-initiated
+    // starts should open a fresh Gemini Live session; only automatic reconnects
+    // within the same running client preserve resumption.
+    session.resumeHandle = null;
     if (Array.isArray(entry.history)) {
       // Defensive: only accept well-formed entries so a corrupted store can't
       // crash the renderer or the export downstream.

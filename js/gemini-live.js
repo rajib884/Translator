@@ -509,7 +509,7 @@ class GeminiLiveClient {
 
     if (!this.shouldRun) {
       // Clear the switching flag too: a stop() during an in-flight GoAway
-      // renewal would otherwise leave the UI stuck on the "Switching" pill
+      // renewal would otherwise leave the UI stuck on the "Switching" indicator
       // because the only paths that clear it (setupComplete, error/budget
       // branches below) never fire when we go straight to idle.
       this._setSwitching(false);
@@ -517,13 +517,14 @@ class GeminiLiveClient {
       return;
     }
 
-    // If the connection died before we got setupComplete and we were trying
-    // to resume, the handle is the most likely cause — handles are valid for
-    // ~2 hours after session termination, and stale ones never recover. Drop
-    // it once so the next attempt starts a fresh session instead of burning
-    // through MAX_RECONNECT_ATTEMPTS with the same dead handle.
-    if (closedBeforeSetup && this.resumeHandle && !FATAL_CLOSE_CODES.has(ev.code)) {
-      this.onLog('warn', 'Resume handle did not take — starting a fresh session.');
+    const isCleanRenewal = ev.code === 1000 &&
+      typeof ev.reason === 'string' && ev.reason.startsWith('goaway-renewal:');
+
+    // If a resume attempt dies before setupComplete outside a planned GoAway
+    // renewal, discard the handle before retrying. User-triggered fresh starts
+    // and stale stored handles should not poison the reconnect ladder.
+    if (closedBeforeSetup && this.resumeHandle && !isCleanRenewal) {
+      this.onLog('warn', `Resume handle invalid (close ${ev.code}) — clearing.`);
       this.resumeHandle = null;
       try { this.onResumeHandle(null); } catch (_) {}
     }
