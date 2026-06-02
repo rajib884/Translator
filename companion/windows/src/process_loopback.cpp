@@ -23,7 +23,9 @@ struct ProcLoopFormat {
 
 }  // namespace
 
-void capture_process_loopback_to_websocket(SOCKET s, DWORD pid, std::atomic<bool>& alive) {
+void capture_process_loopback(DWORD pid,
+                              std::atomic<bool>& alive,
+                              const ProcessLoopbackFrameSink& on_frame) {
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   dlog("process loopback pid=%lu: starting", pid);
 
@@ -247,8 +249,8 @@ void capture_process_loopback_to_websocket(SOCKET s, DWORD pid, std::atomic<bool
       pending.insert(pending.end(), out.begin(), out.end());
       while (pending.size() >= kMaxFrameSamples) {
         const size_t bytes = kMaxFrameSamples * sizeof(int16_t);
-        if (!send_ws_binary(s, reinterpret_cast<const uint8_t*>(pending.data()), bytes)) {
-          dlog("process loopback pid=%lu: send_ws_binary failed, closing", pid);
+        if (!on_frame(reinterpret_cast<const uint8_t*>(pending.data()), bytes)) {
+          dlog("process loopback pid=%lu: frame sink failed, closing", pid);
           alive = false;
           break;
         }
@@ -265,6 +267,12 @@ void capture_process_loopback_to_websocket(SOCKET s, DWORD pid, std::atomic<bool
   if (capture) capture->Release();
   CloseHandle(buffer_event);
   CoUninitialize();
+}
+
+void capture_process_loopback_to_websocket(SOCKET s, DWORD pid, std::atomic<bool>& alive) {
+  capture_process_loopback(pid, alive, [s](const uint8_t* data, size_t bytes) {
+    return send_ws_binary(s, data, bytes);
+  });
 }
 
 }  // namespace companion

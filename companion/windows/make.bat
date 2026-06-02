@@ -18,6 +18,7 @@
   src/activation_handler.cpp ^
   src/system_loopback.cpp ^
   src/process_loopback.cpp ^
+  src/process_loopback_hub.cpp ^
   src/audio_apps.cpp ^
   src/endpoints.cpp ^
   src/pt_ring.cpp ^
