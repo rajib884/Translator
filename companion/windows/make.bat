@@ -1,10 +1,11 @@
 @rem Pass "console" as the first arg to build a console-subsystem exe with dlog() mirrored to stdout.
 @if /I "%1"=="console" (
-@  set "_SUBSYS=-mconsole -DCONSOLE_BUILD"
-@) else (
-@  set "_SUBSYS=-mwindows"
-@)
-"C:\Users\user\Downloads\mingw64\bin\g++.exe" -std=c++17 -O2 %_SUBSYS% -static -o live_translator.exe ^
+  @set "_SUBSYS=-mconsole -DCONSOLE_BUILD"
+) else (
+  @set "_SUBSYS=-mwindows"
+)
+
+"C:\Users\user\Downloads\mingw64\bin\g++.exe" -std=c++17 -O2 %_SUBSYS% -static -Iinclude -o live_translator.exe ^
   src/main.cpp ^
   src/env.cpp ^
   src/logging.cpp ^

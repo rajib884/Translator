@@ -41,7 +41,7 @@ target_compile_definitions(live-translator-lib PUBLIC
   NOMINMAX
   _WIN32_WINNT=0x0A00
 )
-target_include_directories(live-translator-lib PUBLIC src)
+target_include_directories(live-translator-lib PUBLIC include)
 target_link_libraries(live-translator-lib PUBLIC
   ws2_32
   ole32
