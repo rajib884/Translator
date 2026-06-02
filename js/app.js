@@ -21,7 +21,7 @@ const LANGUAGES = [
   ['pt', 'Portuguese'],
 ];
 
-const MAX_TURNS = 50;
+const MAX_TURNS = 1000;
 const MAX_LOG = 200;
 // Multi-session is meant for the occasional power user juggling a couple of
 // translations. Past 3 the audio coordinator queues up too far behind real
@@ -1615,8 +1615,18 @@ function maybePromoteArchivedSession() {
   // is a user-visible fresh start; only automatic reconnects inside a running
   // GeminiLiveClient may resume.
   session.resumeHandle = null;
+  if (Array.isArray(entry.history)) {
+    session.history = entry.history
+      .filter((h) => h && typeof h === 'object')
+      .map((h) => ({
+        input: typeof h.input === 'string' ? h.input : '',
+        output: typeof h.output === 'string' ? h.output : '',
+        finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
+      }));
+  }
   state.sessions.set(session.id, session);
   createSessionDOM(session);
+  renderSessionHistory(session);
   log('info', `Restored an archived session (${state.archivedSessions.length} remaining).`);
 }
 
@@ -1671,11 +1681,10 @@ async function stopAllSessions() {
 }
 
 // ─── Persistence (sessions) ──────────────────────────────────────────────────
-// Cap how many history turns we persist per session. The DOM is already
-// trimmed to MAX_TURNS for perf; localStorage has a per-origin budget (~5MB
-// across all keys), and 500 turns × ~200 chars ≈ 100KB per session is plenty
-// of headroom while still surviving long sessions through a reload.
-const MAX_PERSISTED_HISTORY = 500;
+// Cap how many history turns we persist per session. This is intentionally
+// high enough for long meetings; localStorage still has a finite browser
+// quota, so very large transcripts may need IndexedDB later.
+const MAX_PERSISTED_HISTORY = 10000;
 function saveSessions() {
   try {
     const visible = [...state.sessions.values()].map((s) => ({
@@ -1772,6 +1781,7 @@ function restoreSessionsFromStorage() {
     }
     state.sessions.set(session.id, session);
     createSessionDOM(session);
+    renderSessionHistory(session);
   }
   refreshAddSessionButton();
   refreshBulkActionButtons();
@@ -3291,6 +3301,86 @@ function flushPending(session) {
   }
 }
 
+function formatTurnTimestamp(ts, { includeDate = false } = {}) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return '';
+  return includeDate ? d.toLocaleString() : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function isoTurnTimestamp(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
+function createTurnTimestampEl(ts) {
+  const el = document.createElement('time');
+  el.className = 'turn-time';
+  el.textContent = formatTurnTimestamp(ts);
+  const iso = isoTurnTimestamp(ts);
+  if (iso) {
+    el.dateTime = iso;
+    el.title = formatTurnTimestamp(ts, { includeDate: true });
+  }
+  return el;
+}
+
+function trimTranscriptDOM(host) {
+  while (host && host.children.length > MAX_TURNS) {
+    host.removeChild(host.firstChild);
+  }
+}
+
+function renderHistoryTurn(session, h) {
+  const host = session && session.transcriptEl;
+  if (!host) return;
+  removeSessionEmptyState(session);
+  const isTranscribe = session.config.mode === 'transcribe';
+  const root = document.createElement('div');
+  root.className = 'turn' + (isTranscribe ? ' turn-single' : '');
+
+  const time = createTurnTimestampEl(h.finalizedAt);
+  if (time.textContent) root.appendChild(time);
+
+  const inRow = document.createElement('div');
+  inRow.className = 'turn-row input';
+  const inLab = document.createElement('span');
+  inLab.className = 'turn-label';
+  inLab.textContent = '🎙 ' + langName(session.config.source);
+  const inText = document.createElement('span');
+  const input = h.input || '';
+  inText.className = 'turn-text' + (input ? '' : ' empty');
+  inText.textContent = input || '(silence)';
+  inRow.appendChild(inLab);
+  inRow.appendChild(inText);
+  root.appendChild(inRow);
+
+  if (!isTranscribe) {
+    const outRow = document.createElement('div');
+    outRow.className = 'turn-row output';
+    const outLab = document.createElement('span');
+    outLab.className = 'turn-label';
+    outLab.textContent = '→ ' + langName(session.config.target);
+    const outText = document.createElement('span');
+    const output = h.output || '';
+    outText.className = 'turn-text' + (output ? '' : ' empty');
+    outText.textContent = output || '(no translation)';
+    outRow.appendChild(outLab);
+    outRow.appendChild(outText);
+    root.appendChild(outRow);
+  }
+
+  host.appendChild(root);
+  trimTranscriptDOM(host);
+}
+
+function renderSessionHistory(session) {
+  if (!session || !session.transcriptEl || !Array.isArray(session.history) || session.history.length === 0) return;
+  for (const h of session.history.slice(-MAX_TURNS)) renderHistoryTurn(session, h);
+  session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+}
+
 function ensureLiveTurn(session) {
   if (session.liveTurn) return session.liveTurn;
   const host = session.transcriptEl;
@@ -3301,6 +3391,9 @@ function ensureLiveTurn(session) {
 
   const root = document.createElement('div');
   root.className = 'turn live' + (isTranscribe ? ' turn-single' : '');
+  const startedAt = Date.now();
+  const time = createTurnTimestampEl(startedAt);
+  if (time.textContent) root.appendChild(time);
 
   const inRow = document.createElement('div');
   inRow.className = 'turn-row input';
@@ -3345,12 +3438,12 @@ function ensureLiveTurn(session) {
 
   host.appendChild(root);
 
-  while (host.children.length > MAX_TURNS) {
-    host.removeChild(host.firstChild);
-  }
+  trimTranscriptDOM(host);
 
   session.liveTurn = {
     root,
+    timeEl: time,
+    startedAt,
     inputEl: inText,
     outputEl: outText,
     inputTextNode: inTextNode,
@@ -3389,7 +3482,16 @@ function finalizeTurn(session) {
   const inText = t.inputText.trim();
   const outText = t.outputEl ? t.outputText.trim() : '';
   if (inText || outText) {
-    session.history.push({ input: inText, output: outText, finalizedAt: Date.now() });
+    const finalizedAt = Date.now();
+    if (t.timeEl) {
+      t.timeEl.textContent = formatTurnTimestamp(finalizedAt);
+      const iso = isoTurnTimestamp(finalizedAt);
+      if (iso) {
+        t.timeEl.dateTime = iso;
+        t.timeEl.title = formatTurnTimestamp(finalizedAt, { includeDate: true });
+      }
+    }
+    session.history.push({ input: inText, output: outText, finalizedAt });
     saveSessions();
   }
   session.liveTurn = null;
@@ -4005,6 +4107,7 @@ function clearConversation() {
     renderSessionEmptyState(session);
   }
   if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
+  saveSessions();
 }
 
 function conversationTurns(session) {
@@ -4017,12 +4120,21 @@ function conversationTurns(session) {
     index: i + 1,
     input: h.input || '',
     output: h.output || '',
+    finalizedAt: isoTurnTimestamp(h.finalizedAt),
+    finalizedAtMs: h.finalizedAt || null,
   }));
   if (session.liveTurn) {
     const inText = (session.liveTurn.inputText || '').trim();
     const outText = (session.liveTurn.outputText || '').trim();
     if (inText || outText) {
-      out.push({ index: out.length + 1, input: inText, output: outText });
+      const ts = session.liveTurn.startedAt || Date.now();
+      out.push({
+        index: out.length + 1,
+        input: inText,
+        output: outText,
+        finalizedAt: isoTurnTimestamp(ts),
+        finalizedAtMs: ts,
+      });
     }
   }
   return out;
@@ -4090,7 +4202,7 @@ function exportConversation(format) {
       `Exported: ${new Date().toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}`,
         `${langName(session.config.source)}: ${t.input || '(empty)'}`,
         session.config.mode === 'transcribe' ? '' : `${langName(session.config.target)}: ${t.output || '(empty)'}`,
         '',
