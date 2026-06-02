@@ -268,6 +268,9 @@ const els = {
   btnTestWsclose:$('btn-test-wsclose'),
   btnLogExport:  $('btn-log-export'),
   btnLogClear:   $('btn-log-clear'),
+  btnOpenCompanion:      $('btn-open-companion'),
+  btnOpenCompanionLabel: $('btn-open-companion-label'),
+  companionLaunchNotice: $('companion-launch-notice'),
 };
 
 // ─── Session ─────────────────────────────────────────────────────────────────
@@ -1979,6 +1982,7 @@ async function detectCompanionService({ silent = true } = {}) {
   document.body.classList.toggle('no-companion', !state.companionAvailable);
   updateAudioSourceAvailability();
   updateSpeechModeFields();
+  updateCompanionLaunchButton();
   if (state.companionAvailable && els.companionApp) {
     refreshCompanionApps({ silent: true });
   }
@@ -1997,6 +2001,57 @@ async function detectCompanionService({ silent = true } = {}) {
     }
   }
   return state.companionAvailable;
+}
+
+// ─── Companion launch button ──────────────────────────────────────────────────
+
+// Update the "Open Companion App" button label and style based on whether the
+// companion HTTP service is currently reachable (state.companionAvailable).
+function updateCompanionLaunchButton() {
+  const btn = els.btnOpenCompanion;
+  const lbl = els.btnOpenCompanionLabel;
+  if (!btn || !lbl) return;
+  if (state.companionAvailable) {
+    lbl.textContent = 'Companion is already running';
+    btn.classList.add('is-companion-connected');
+    btn.disabled = true;
+  } else {
+    lbl.textContent = 'Open Companion App';
+    btn.classList.remove('is-companion-connected');
+    btn.disabled = false;
+  }
+}
+
+// Attempt to launch the companion via the translatorcompanion:// URL protocol.
+// If the protocol is not registered Chrome will silently do nothing, so we
+// use a short timer: if the page is still in focus after ~2 s we assume the
+// protocol fired no OS handler and show the install notice instead.
+function launchCompanion() {
+  if (state.companionAvailable) return; // guard: button should already be disabled
+
+  const notice = els.companionLaunchNotice;
+  if (notice) notice.hidden = true; // hide any previous notice
+
+  // Fire the custom protocol URL.
+  const iframe = document.createElement('iframe');
+  iframe.style.display = 'none';
+  document.body.appendChild(iframe);
+  iframe.src = 'translatorcompanion://launch';
+
+  // Fallback: if the page is still focused after the OS had time to hand off
+  // the protocol to a registered handler, assume the protocol is unregistered.
+  const TIMEOUT_MS = 2500;
+  let launched = false;
+  const onBlur = () => { launched = true; };
+  window.addEventListener('blur', onBlur, { once: true });
+  setTimeout(() => {
+    window.removeEventListener('blur', onBlur);
+    // Remove the helper iframe regardless.
+    try { document.body.removeChild(iframe); } catch (_) {}
+    if (!launched && notice) {
+      notice.hidden = false;
+    }
+  }, TIMEOUT_MS);
 }
 
 async function fetchCompanionApps() {
@@ -5343,6 +5398,9 @@ function wireUI() {
     if (state.pip) state.pip.close();
   });
   window.addEventListener('focus', () => detectCompanionService());
+  if (els.btnOpenCompanion) {
+    els.btnOpenCompanion.addEventListener('click', launchCompanion);
+  }
 
   // Browsers auto-suspend AudioContexts when the tab is hidden long enough.
   // Without an explicit resume, TTS output would stay silent and capture

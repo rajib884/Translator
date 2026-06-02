@@ -584,6 +584,31 @@ body.no-companion .companion-only { display: none !important; }
 .btn.ghost:hover { background: var(--bg-2); color: var(--fg-0); }
 .btn.full { width: 100%; }
 
+/* "Open Companion App" button — connected state */
+#btn-open-companion.is-companion-connected {
+  color: var(--good, #4ade80);
+  border-color: rgba(74, 222, 128, 0.3);
+  cursor: default;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+/* Notice shown when the translatorcompanion:// protocol is unregistered */
+.companion-launch-notice {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.07);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--fg-1);
+}
+.companion-launch-notice p { margin: 0 0 0.35rem; }
+.companion-launch-notice a { color: var(--accent); text-decoration: underline; }
+.companion-launch-notice a:hover { color: var(--fg-0); }
+
+
 .icon-btn {
   width: 40px; height: 40px;
   display: inline-flex; align-items: center; justify-content: center;

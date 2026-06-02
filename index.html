@@ -293,6 +293,19 @@
           </button>
         </section>
 
+        <!-- Open Companion App (always visible; JS drives the button state) -->
+        <section class="section">
+          <button id="btn-open-companion" class="btn ghost full" type="button">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <span id="btn-open-companion-label">Open Companion App</span>
+          </button>
+          <!-- Shown when the translatorcompanion:// protocol appears unregistered -->
+          <div id="companion-launch-notice" class="companion-launch-notice" hidden>
+            <p>Companion app is not installed or not registered. Please run the Windows companion once to register.</p>
+            <a href="https://github.com/rajib884/Translator/releases/latest" id="companion-download-link" target="_blank" rel="noopener">Download companion app</a>
+          </div>
+        </section>
+
         <section class="section actions">
           <button id="btn-pip" class="btn ghost" type="button">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>Pop out
