@@ -4178,39 +4178,87 @@ function downloadText(filename, text, type) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function exportableSessionEntries() {
+  return [...state.sessions.values()]
+    .map((session, i) => ({
+      index: i + 1,
+      session,
+      turns: conversationTurns(session),
+    }))
+    .filter((entry) => entry.turns.length > 0);
+}
+
+function exportTimeline(entries) {
+  let collected = 0;
+  return entries
+    .flatMap((entry) => entry.turns.map((turn) => ({
+      index: 0,
+      sessionIndex: entry.index,
+      sessionId: entry.session.id,
+      source: entry.session.config.source,
+      target: entry.session.config.target,
+      mode: entry.session.config.mode,
+      input: turn.input,
+      output: turn.output,
+      finalizedAt: turn.finalizedAt,
+      finalizedAtMs: turn.finalizedAtMs,
+      turnIndex: turn.index,
+      collectionIndex: collected++,
+    })))
+    .sort((a, b) => {
+      const at = Number.isFinite(a.finalizedAtMs) ? a.finalizedAtMs : Infinity;
+      const bt = Number.isFinite(b.finalizedAtMs) ? b.finalizedAtMs : Infinity;
+      if (at !== bt) return at - bt;
+      if (a.sessionIndex !== b.sessionIndex) return a.sessionIndex - b.sessionIndex;
+      if (a.turnIndex !== b.turnIndex) return a.turnIndex - b.turnIndex;
+      return a.collectionIndex - b.collectionIndex;
+    })
+    .map((turn, i) => {
+      const { collectionIndex, ...exported } = turn;
+      return Object.assign(exported, { index: i + 1 });
+    });
+}
+
 function exportConversation(format) {
-  const session = activeSession();
-  if (!session) return;
-  const turns = conversationTurns(session);
-  if (turns.length === 0) {
-    log('warn', 'Nothing to export for this session.');
+  const sessions = exportableSessionEntries();
+  if (sessions.length === 0) {
+    log('warn', 'Nothing to export for any session.');
     return;
   }
+  const turns = exportTimeline(sessions);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const base = `live-translator-${session.config.source}-${session.config.target}-${stamp}`;
+  const base = `live-translator-all-sessions-${stamp}`;
+  const exportedAt = new Date();
   if (format === 'json') {
     downloadText(base + '.json', JSON.stringify({
-      exportedAt: new Date().toISOString(),
-      sessionId: session.id,
-      config: session.config,
+      exportedAt: exportedAt.toISOString(),
+      sessionCount: sessions.length,
+      sessions: sessions.map((entry) => ({
+        index: entry.index,
+        sessionId: entry.session.id,
+        source: entry.session.config.source,
+        target: entry.session.config.target,
+        mode: entry.session.config.mode,
+        config: entry.session.config,
+      })),
       turns,
     }, null, 2), 'application/json');
   } else {
     const lines = [
       'Live Translator export',
-      `${langName(session.config.source)} -> ${langName(session.config.target)}`,
-      `Exported: ${new Date().toLocaleString()}`,
+      `Sessions: ${sessions.length}`,
+      `Exported: ${exportedAt.toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}`,
-        `${langName(session.config.source)}: ${t.input || '(empty)'}`,
-        session.config.mode === 'transcribe' ? '' : `${langName(session.config.target)}: ${t.output || '(empty)'}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''} - Session ${t.sessionIndex} - ${langName(t.source)} -> ${langName(t.target)}`,
+        `${langName(t.source)}: ${t.input || '(empty)'}`,
+        t.mode === 'transcribe' ? '' : `${langName(t.target)}: ${t.output || '(empty)'}`,
         '',
       ]),
     ];
     downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
   }
-  log('info', `Conversation exported as ${format.toUpperCase()}.`);
+  log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
