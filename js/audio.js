@@ -153,6 +153,10 @@ class AudioCapture {
     this.streams = [];
     this.sources = [];
     this.node = null;
+    // The deviceId the OS actually selected when we asked for "system default"
+    // (or whichever device the caller specified). Surfaced so the UI can show
+    // "System default (Realtek Microphone)" instead of a confusing bare label.
+    this.actualMicDeviceId = '';
     this._workletUrl = null;
     // Meter ticks while a worklet node exists; the moment capture is torn
     // down, isActive flips false and the tail (Infinity) lets the loop end on
@@ -192,6 +196,13 @@ class AudioCapture {
           s = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
         }
         this.streams.push({ kind: 'mic', stream: s });
+        // Record which physical mic actually got picked. `getSettings().deviceId`
+        // is the OS-resolved id even when we asked for the default.
+        const track = s.getAudioTracks()[0];
+        if (track && typeof track.getSettings === 'function') {
+          const settings = track.getSettings();
+          this.actualMicDeviceId = settings && settings.deviceId ? settings.deviceId : '';
+        }
       }
 
       if (wantDisplay) {
@@ -288,6 +299,36 @@ class AudioCapture {
     this.node = null;
     this.ctx = null;
     this._meter.stop();
+  }
+
+  // The deviceId actually attached to the live mic track. Differs from the
+  // user's pick when they chose "System default" — getSettings() resolves it
+  // to the concrete OS device the browser handed us.
+  getActiveMicId() {
+    const entry = this.streams.find((x) => x.kind === 'mic');
+    if (!entry) return null;
+    const tracks = entry.stream.getAudioTracks();
+    if (!tracks.length || tracks[0].readyState !== 'live') return null;
+    try {
+      const s = tracks[0].getSettings();
+      return s && s.deviceId ? s.deviceId : '';
+    } catch (_) { return null; }
+  }
+
+  // The raw display/tab audio MediaStream, if this capture is in display or
+  // both mode. Exposed so the passthrough can tap the original full-quality
+  // stream (pre-worklet downmix/downsample) and route it to virtual cables.
+  getDisplayStream() {
+    const entry = this.streams.find((x) => x.kind === 'display');
+    return entry ? entry.stream : null;
+  }
+
+  // The raw mic MediaStream, if this capture is in mic or both mode. Same
+  // purpose as getDisplayStream(): the passthrough taps the original full-
+  // rate mic stream rather than the worklet's 16 kHz downsampled output.
+  getMicStream() {
+    const entry = this.streams.find((x) => x.kind === 'mic');
+    return entry ? entry.stream : null;
   }
 }
 
@@ -629,6 +670,13 @@ class TTSPlayer {
     this.ctx = null;
   }
 
+  // Sink ids currently wired up and playing. Mirrors what setSinkId actually
+  // accepted, including '' fallbacks. UI uses this for live "active" badges.
+  getActiveSinkIds() {
+    if (!this.sinks.length) return [];
+    return this.sinks.map((s) => s.useDestination ? '' : (s.deviceId || ''));
+  }
+
   static canSelectOutputDevice() {
     return typeof HTMLMediaElement !== 'undefined' &&
            !!HTMLMediaElement.prototype &&
@@ -672,96 +720,321 @@ function canSelectOutputDevice() {
          TTSPlayer.canSelectOutputDevice();
 }
 
-// ─── Mic passthrough ─────────────────────────────────────────────────────────
-// Independently routes microphone audio to one or more output devices (e.g.
-// a virtual cable). Completely decoupled from translation sessions so the user
-// can stop/restart sessions without breaking their audio routing.
-class MicPassthrough {
-  constructor() {
+// ─── Audio passthrough ──────────────────────────────────────────────────────
+// One instance per Session. Thin client over a per-session WebSocket to the
+// companion's /passthrough endpoint — the companion does all WASAPI capture,
+// mixing, and render. This class owns the WS lifetime, mirrors the session's
+// audio source config (mic device label / loopback pid) into the configure
+// payload, and surfaces the companion's level events to the meter.
+//
+// Why offload: per-process WASAPI loopback + multi-sink WASAPI render +
+// resampling are expensive in JS land (multiple AudioContexts per session,
+// MediaStreamDestination per sink, autoplay quirks). The companion runs them
+// natively with proper MMCSS thread priorities and zero browser involvement.
+class CompanionPassthrough {
+  constructor({ onLevel, wsUrl = 'ws://127.0.0.1:52341/passthrough' } = {}) {
+    this.onLevel = onLevel || (() => {});
+    this.wsUrl = wsUrl;
+    this.ws = null;
     this.running = false;
-    this.ctx = null;
-    this.stream = null;
-    this.source = null;
-    this.sinks = []; // { deviceId, streamDest, audioEl }
-    // Diagnostic surface: warnings accumulate per start() and the caller
-    // (applyPassthrough in app.js) drains and logs them. Previously these
-    // errors were swallowed inside inner try/catches, so users had no idea
-    // why one of their selected speakers wasn't receiving the mic.
+    // Last config we actually told the companion to use. Used to skip no-op
+    // reconfigures and to re-send after a reconnect.
+    this._lastSent = null;
+    // Most recent companion-reported active sink id list — what we paint in
+    // the live-passthrough badges. May be a subset of the wanted set when the
+    // companion couldn't open one of the endpoints.
+    this.activeSinkIds = [];
+    // Warnings drained by app.js after every configure() call (same shape the
+    // old MicPassthrough used so caller-side code didn't change).
     this.warnings = [];
+    // Serialise concurrent configure() calls — without this, two rapid
+    // changes can race the open handshake and the second one wins before
+    // the first one's `ready` event arrives.
+    this._queue = Promise.resolve();
+    this._closingByUs = false;
   }
 
-  async start(micDeviceId, deviceIds) {
-    await this.stop();
+  // Apply a sink list + source descriptor. Idempotent against the last sent
+  // payload — repeated calls with identical args are cheap no-ops, which
+  // matters because applyPassthrough() runs after every device refresh.
+  configure(sinks, sources) {
+    const next = this._queue
+      .catch(() => {})
+      .then(() => this._doConfigure(sinks || [], sources || {}));
+    this._queue = next;
+    return next;
+  }
+
+  async _doConfigure(sinks, sources) {
+    const payload = {
+      action: 'configure',
+      sinks: sinks.slice(),
+      micId: sources.micId || '',
+      micLabel: sources.micLabel || '',
+      pid: sources.pid | 0,
+      loopback: !!sources.loopback,
+    };
+
+    const hasAnySource = !!(payload.micId || payload.micLabel ||
+                            payload.pid || payload.loopback);
+    if (sinks.length === 0 || !hasAnySource) {
+      // Nothing to route. Close the WS so the companion stops its render
+      // threads — keeping an idle WS open just for the silence ring isn't
+      // worth the file handle.
+      await this._closeWs();
+      this._lastSent = null;
+      this.activeSinkIds = [];
+      this.running = false;
+      this.warnings = [];
+      this.onLevel(0);
+      return;
+    }
+
+    if (this._lastSent &&
+        sameStrArr(this._lastSent.sinks, payload.sinks) &&
+        this._lastSent.micId === payload.micId &&
+        this._lastSent.micLabel === payload.micLabel &&
+        this._lastSent.pid === payload.pid &&
+        this._lastSent.loopback === payload.loopback &&
+        this.ws && this.ws.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    await this._ensureOpen();
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.warnings = [{ deviceId: '', reason: 'companion passthrough socket unavailable' }];
+      this.running = false;
+      this.activeSinkIds = [];
+      return;
+    }
+    this._lastSent = payload;
+    try {
+      this.ws.send(JSON.stringify(payload));
+    } catch (_) {
+      this.warnings = [{ deviceId: '', reason: 'companion passthrough send failed' }];
+    }
+  }
+
+  async stop({ keepAttachments = false } = {}) {
+    void keepAttachments;  // accepted for call-site parity with the prior API
+    await this._queue.catch(() => {});
+    await this._closeWs();
+    this._lastSent = null;
+    this.running = false;
+    this.activeSinkIds = [];
     this.warnings = [];
-    if (!deviceIds || deviceIds.length === 0) return;
+    this.onLevel(0);
+  }
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: micDeviceId ? { deviceId: { exact: micDeviceId } } : true,
-    });
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    this.source = this.ctx.createMediaStreamSource(this.stream);
+  // The old API exposed update(deviceIds). Preserved as a sugar that keeps
+  // the previously-supplied source descriptor — callers that only know the
+  // sink list (e.g. the device-refresh loop) can drive a sink-only update.
+  update(deviceIds) {
+    const sources = (this._lastSent && {
+      micId: this._lastSent.micId,
+      micLabel: this._lastSent.micLabel,
+      pid: this._lastSent.pid,
+      loopback: this._lastSent.loopback,
+    }) || {};
+    return this.configure(deviceIds || [], sources);
+  }
 
-    for (const id of deviceIds) {
-      const dest = this.ctx.createMediaStreamDestination();
-      this.source.connect(dest);
-      const el = new Audio();
-      el.autoplay = true;
-      el.playsInline = true;
-      el.srcObject = dest.stream;
-      let resolvedId = id;
-      let setSinkErr = null;
-      try {
-        await el.setSinkId(id || '');
-      } catch (e) {
-        setSinkErr = e;
-        // Fall back to the system default so something still plays, but record
-        // the failure so the user knows their pick didn't stick.
-        try { await el.setSinkId(''); resolvedId = ''; }
-        catch (e2) {
-          // Even default failed — drop this sink instead of silently keeping
-          // a disconnected audio element around.
-          try { this.source.disconnect(dest); } catch (_) {}
-          el.srcObject = null;
-          this.warnings.push({ deviceId: id, reason: (e2 && e2.message) || (setSinkErr && setSinkErr.message) || 'setSinkId failed' });
-          continue;
+  getActiveSinkIds() { return this.activeSinkIds.slice(); }
+
+  // Companion-side mic capture; the browser doesn't track which WASAPI mic
+  // it actually opened. Returning null keeps refreshActiveDeviceIndicators
+  // from mis-marking the browser-side mic dropdown.
+  getActiveMicId() { return null; }
+
+  async _ensureOpen() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, 3000);
+        const orig = this.ws.onopen;
+        this.ws.onopen = (e) => { clearTimeout(t); if (orig) orig(e); resolve(); };
+      });
+      return;
+    }
+    await new Promise((resolve) => {
+      let done = false;
+      const ws = new WebSocket(this.wsUrl);
+      this.ws = ws;
+      this._closingByUs = false;
+      ws.onopen = () => { if (!done) { done = true; resolve(); } };
+      ws.onerror = () => { if (!done) { done = true; resolve(); } };
+      ws.onclose = () => {
+        if (this.ws === ws) this.ws = null;
+        if (!this._closingByUs) {
+          this.running = false;
+          this.activeSinkIds = [];
+          this.onLevel(0);
         }
-        this.warnings.push({ deviceId: id, reason: `requested device unavailable (${(setSinkErr && setSinkErr.message) || 'setSinkId failed'}); fell back to system default` });
-      }
-      try { await el.play(); }
-      catch (e) {
-        this.warnings.push({ deviceId: resolvedId, reason: `autoplay blocked (${(e && e.message) || 'play() rejected'})` });
-      }
-      this.sinks.push({ deviceId: resolvedId, streamDest: dest, audioEl: el });
-    }
-    this.running = this.sinks.length > 0;
+        if (!done) { done = true; resolve(); }
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.event === 'level') this.onLevel(+msg.peak || 0);
+          else if (msg.event === 'ready') {
+            this.activeSinkIds = Array.isArray(msg.sinks) ? msg.sinks : [];
+            this.warnings = Array.isArray(msg.warnings) ? msg.warnings : [];
+            this.running = this.activeSinkIds.length > 0;
+          } else if (msg.event === 'error') {
+            this.warnings = [{ deviceId: '', reason: msg.message || 'companion passthrough error' }];
+          }
+        } catch (_) {}
+      };
+      setTimeout(() => { if (!done) { done = true; resolve(); } }, 4000);
+    });
   }
 
-  async stop() {
-    for (const s of this.sinks) {
-      try { s.audioEl.pause(); } catch (_) {}
-      s.audioEl.srcObject = null;
-      try { s.streamDest.disconnect(); } catch (_) {}
+  async _closeWs() {
+    if (!this.ws) return;
+    this._closingByUs = true;
+    try { this.ws.close(1000); } catch (_) {}
+    this.ws = null;
+  }
+}
+
+// Helper used by CompanionPassthrough to short-circuit identical-sink
+// reconfigures. Order-insensitive equality on a small string array.
+function sameStrArr(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  const sa = a.slice().sort();
+  const sb = b.slice().sort();
+  for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return false;
+  return true;
+}
+
+// Alias kept under the old class name for the LiveAudio export so a stale
+// reference (LiveAudio.MicPassthrough) keeps resolving to the same class.
+// All in-tree call sites use CompanionPassthrough directly.
+const MicPassthrough = CompanionPassthrough;
+
+// Ephemeral mic-preview meter for the settings panel. Opens a short-lived
+// getUserMedia stream (and own AudioContext), pushes levels to onLevel until
+// stop() or the auto-close timer fires. Decoupled from any session — when the
+// user starts an actual session the preview is torn down so the OS doesn't
+// keep two mic indicators alive.
+class InputPreview {
+  constructor({ onLevel, onAutoStop, autoStopMs = 10000 } = {}) {
+    this.onLevel = onLevel || (() => {});
+    this.onAutoStop = onAutoStop || (() => {});
+    this.autoStopMs = autoStopMs;
+    this.stream = null;
+    this.ctx = null;
+    this.src = null;
+    this.analyser = null;
+    this._buf = null;
+    this._rafId = 0;
+    this._stopTimer = 0;
+    this.running = false;
+    // Serialises start/stop against rapid dropdown changes. Without this, two
+    // concurrent start() calls can interleave: stream A from call 1 is still
+    // resolving when call 2 starts; call 2 overwrites this.stream/ctx/src
+    // before call 1 finishes, leaving stream A's MediaStream and AudioContext
+    // unreleased (OS mic indicator stays on, contexts leak). Same pattern
+    // TTSPlayer uses for _applyDevicesQueue.
+    this._queue = Promise.resolve();
+  }
+
+  start(micDeviceId) {
+    const next = this._queue
+      .catch(() => {})                     // a previous failure must not poison the chain
+      .then(() => this._doStart(micDeviceId));
+    this._queue = next;
+    return next;
+  }
+
+  stop() {
+    const next = this._queue
+      .catch(() => {})
+      .then(() => this._doStop());
+    this._queue = next;
+    return next;
+  }
+
+  async _doStart(micDeviceId) {
+    await this._doStop();
+    const baseAudio = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    };
+    try {
+      const audio = { ...baseAudio };
+      if (micDeviceId) audio.deviceId = { exact: micDeviceId };
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio });
+    } catch (e) {
+      // Fallback to default mic if the requested deviceId isn't available
+      // anymore (device unplugged between selection and preview).
+      if (!micDeviceId) throw e;
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
     }
-    this.sinks = [];
-    try { this.source && this.source.disconnect(); } catch (_) {}
-    this.source = null;
+
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    this.src = this.ctx.createMediaStreamSource(this.stream);
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.analyser.smoothingTimeConstant = 0;
+    this._buf = new Float32Array(this.analyser.fftSize);
+    this.src.connect(this.analyser);
+
+    this.running = true;
+    let level = 0;
+    let last = performance.now();
+    const tick = () => {
+      if (!this.running) return;
+      const now = performance.now();
+      const dt = Math.max(0, (now - last) / 1000);
+      last = now;
+      this.analyser.getFloatTimeDomainData(this._buf);
+      let peak = 0;
+      for (let i = 0; i < this._buf.length; i++) {
+        const a = this._buf[i] < 0 ? -this._buf[i] : this._buf[i];
+        if (a > peak) peak = a;
+      }
+      if (peak > level) level = peak;
+      else level *= Math.exp(-dt / 0.1);
+      this.onLevel(level);
+      this._rafId = requestAnimationFrame(tick);
+    };
+    this._rafId = requestAnimationFrame(tick);
+
+    // Auto-stop posts back onto the same queue so it can't interleave with an
+    // in-flight start() the user kicked off in the same window.
+    this._stopTimer = setTimeout(() => {
+      this._stopTimer = 0;
+      const wasRunning = this.running;
+      this.stop().then(() => {
+        if (wasRunning) this.onAutoStop();
+      });
+    }, this.autoStopMs);
+  }
+
+  async _doStop() {
+    const wasRunning = this.running;
+    this.running = false;
+    if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = 0; }
+    if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+    try { this.src && this.src.disconnect(); } catch (_) {}
+    this.src = null;
+    this.analyser = null;
+    this._buf = null;
     if (this.stream) {
       this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
       this.stream = null;
     }
-    try { this.ctx && this.ctx.close(); } catch (_) {}
-    this.ctx = null;
-    this.running = false;
-  }
-
-  // Restarts with new settings. Cheap no-op when deviceIds is empty.
-  async update(micDeviceId, deviceIds) {
-    if (!deviceIds || deviceIds.length === 0) {
-      if (this.running) await this.stop();
-      return;
+    if (this.ctx) {
+      try { await this.ctx.close(); } catch (_) {}
+      this.ctx = null;
     }
-    await this.start(micDeviceId, deviceIds);
+    if (wasRunning) this.onLevel(0);
   }
 }
 
-window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, abToBase64, normalizeOutputIds, canCaptureDisplayAudio, canSelectOutputDevice };
+window.LiveAudio = { AudioCapture, CompanionAudioCapture, TTSPlayer, MicPassthrough, CompanionPassthrough, InputPreview, abToBase64, normalizeOutputIds, canCaptureDisplayAudio, canSelectOutputDevice };

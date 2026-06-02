@@ -98,6 +98,15 @@ class GeminiLiveClient {
     // When true, Gemini's auto VAD is disabled; the client must signal turn
     // boundaries via sendActivityStart / sendActivityEnd. Used by push-to-talk.
     this.manualActivity = !!opts.manualActivity;
+    // Callback returning whether the parent currently considers the activity
+    // engaged (e.g. PTT key held). On every setupComplete (initial connect or
+    // post-reconnect) we re-emit activityStart if this returns true, so the
+    // bracket survives the WebSocket replacement. Without this, the next
+    // key-up sends activityEnd on a fresh WS with no matching start, which
+    // the server rejects with 1007 (Precondition check failed).
+    this.isManualActivityHeld = typeof opts.isManualActivityHeld === 'function'
+      ? opts.isManualActivityHeld
+      : null;
 
     this.onAudio = opts.onAudio || (() => {});
     this.onInputChunk = opts.onInputChunk || (() => {});
@@ -111,6 +120,12 @@ class GeminiLiveClient {
     this.shouldRun = false;
     this.resumeHandle = opts.resumeHandle || null;
     this.onResumeHandle = opts.onResumeHandle || (() => {});
+    // Switching: separate flag (not a state) raised the moment a GoAway lands
+    // and lowered when the new session reaches setupComplete. Sits *over* the
+    // regular state machine so the UI can surface a continuous "renewal in
+    // progress" hint across the GoAway → close → reconnect window.
+    this._switching = false;
+    this.onSwitching = opts.onSwitching || (() => {});
     this._reconnectTimer = null;
     this._goAwayTimer = null;
     this._setupComplete = false;
@@ -124,21 +139,60 @@ class GeminiLiveClient {
     // drains; we log the first drop and every 50th to surface persistent
     // congestion without flooding the log.
     this._droppedFrames = 0;
+    // GoAway renewal bookkeeping. When the server warns us a disconnect is
+    // coming we don't close immediately — we wait for the next fresh resumable
+    // handle (so the new connection resumes from the exact save-point with no
+    // audio replay) and only fall back to the hard deadline if no handle
+    // arrives in time.
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
+    // Set true the first time `turnComplete` fires after a GoAway lands.
+    // The handle-close trigger only fires after this arms (so we close at a
+    // clean turn boundary), unless the deadline is closing in (<5s left), in
+    // which case the next handle closes immediately regardless.
+    this._turnCompleteSinceGoAway = false;
   }
 
   _setState(s) {
     if (this.state === s) return;
+    const prev = this.state;
     this.state = s;
+    this.onLog('info', `state: ${prev} → ${s}`);
     this.onState(s);
+  }
+
+  _setSwitching(on) {
+    on = !!on;
+    if (this._switching === on) return;
+    this._switching = on;
+    this.onLog('info', `switching: ${on ? 'on' : 'off'}`);
+    try { this.onSwitching(on); } catch (_) {}
+  }
+
+  // Close the current socket as part of a planned GoAway renewal. The
+  // _onClose reconnect ladder handles re-opening with the saved resume
+  // handle; we only need to clear the renewal bookkeeping here and pick a
+  // close reason that names the trigger so the log is self-explanatory.
+  _renewNow(reason) {
+    if (!this._goAwayPending) return;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
+    if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
+    this.onLog('info', `Renewing now (reason=${reason})`);
+    if (this.ws) {
+      try { this.ws.close(1000, 'goaway-renewal:' + reason); } catch (_) {}
+    }
   }
 
   start() {
     if (this.shouldRun) return;
     this.shouldRun = true;
+    this.onLog('info', `start() model=${this.model} voice=${this.voice} manualVAD=${this.manualActivity} hasResumeHandle=${!!this.resumeHandle}`);
     this._connect();
   }
 
   stop() {
+    this.onLog('info', `stop() requested (state=${this.state}, hadWS=${!!this.ws}, setupComplete=${this._setupComplete})`);
     this.shouldRun = false;
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
@@ -148,6 +202,10 @@ class GeminiLiveClient {
     }
     this._setupComplete = false;
     this._reconnectAttempts = 0;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
+    this._turnCompleteSinceGoAway = false;
+    this._setSwitching(false);
     this._setState('idle');
   }
 
@@ -162,6 +220,14 @@ class GeminiLiveClient {
       return;
     }
     this._setupComplete = false;
+    // Re-arm resume handling on every fresh connect. forceCloseWebSocket
+    // disarms it briefly to swallow late-arriving updates from the closing
+    // session; the next connection is a clean slate.
+    this._resumeDisarmed = false;
+    const endpointHost = (() => {
+      try { return new URL(this.endpoint).host; } catch (_) { return this.endpoint; }
+    })();
+    this.onLog('info', `WS connecting to ${endpointHost} (attempt ${this._reconnectAttempts + 1})`);
     try {
       this.ws = new WebSocket(buildLiveUrl(this.endpoint, this.apiKey));
     } catch (e) {
@@ -177,11 +243,12 @@ class GeminiLiveClient {
     this._setState('connecting');
     this.ws.onopen = () => this._onOpen();
     this.ws.onmessage = (ev) => this._onMessage(ev);
-    this.ws.onerror = () => this.onLog('error', 'WebSocket error');
+    this.ws.onerror = () => this.onLog('error', `WebSocket error (readyState=${this.ws ? this.ws.readyState : 'n/a'})`);
     this.ws.onclose = (ev) => this._onClose(ev);
   }
 
   _onOpen() {
+    this.onLog('info', 'WS open — sending setup');
     // gemini-3.1-flash-live-preview (and all native audio models) only support
     // AUDIO response modality. TEXT modality is not supported. To get a text
     // representation of the model's response, use outputAudioTranscription.
@@ -243,17 +310,46 @@ class GeminiLiveClient {
 
     if (msg.setupComplete !== undefined) {
       this._setupComplete = true;
+      this._turnCompleteSinceGoAway = false;
       // Reaching setupComplete means the endpoint accepted our key and config.
       // Any future close is "happened after a working session", so the failure
       // budget resets and the next disconnect starts at the base backoff.
       this._reconnectAttempts = 0;
       this._setState('connected');
-      this.onLog('info', 'Connected to Gemini Live');
+      this._setSwitching(false);
+      this.onLog('info', `Connected to Gemini Live (resumed=${!!this.resumeHandle})`);
+      // If the parent says activity is still engaged across the reconnect
+      // (PTT key still physically held during a 1007/network drop or right
+      // after a force-reset), open the bracket on the new WS so the next
+      // activityEnd has a matching start. Otherwise the next key-up sends
+      // an orphan activityEnd and the server closes with 1007.
+      if (this.manualActivity && this.isManualActivityHeld) {
+        let held = false;
+        try { held = !!this.isManualActivityHeld(); } catch (_) {}
+        if (held) {
+          this.onLog('info', 'Re-opening manual activity bracket (held across reconnect).');
+          this.sendActivityStart();
+        }
+      }
       return;
     }
 
     const sc = msg && msg.serverContent;
     if (sc) {
+      if (sc.interrupted) {
+        this.onLog('info', 'serverContent.interrupted');
+      }
+      if (sc.generationComplete) {
+        this.onLog('info', 'serverContent.generationComplete');
+      }
+      if (sc.groundingMetadata) {
+        const chunks = sc.groundingMetadata.groundingChunks?.length ?? 0;
+        this.onLog('info', `serverContent.groundingMetadata (${chunks} chunk${chunks === 1 ? '' : 's'})`);
+      }
+      if (sc.urlContextMetadata) {
+        const urls = sc.urlContextMetadata.urlMetadata?.length ?? 0;
+        this.onLog('info', `serverContent.urlContextMetadata (${urls} url${urls === 1 ? '' : 's'})`);
+      }
       if (sc.inputTranscription && sc.inputTranscription.text) {
         this.onInputChunk(sc.inputTranscription.text);
       }
@@ -270,39 +366,167 @@ class GeminiLiveClient {
           }
         }
       }
-      if (sc.turnComplete) this.onTurnComplete();
+      if (sc.turnComplete) {
+        this.onLog('info', 'serverContent.turnComplete');
+        this.onTurnComplete();
+        if (this._goAwayPending) this._turnCompleteSinceGoAway = true;
+        // A completed turn is the strongest "this session is working"
+        // signal. Reset the reconnect ratchet so a long-lived session that
+        // weathered a handful of mid-life reconnects doesn't carry the
+        // accumulated count forward into the next blip. Without this,
+        // sessions that had a rough patch hours ago could still exhaust
+        // MAX_RECONNECT_ATTEMPTS later on what would otherwise be the
+        // first fresh failure.
+        this._reconnectAttempts = 0;
+      }
     }
 
     if (msg.sessionResumptionUpdate) {
       const u = msg.sessionResumptionUpdate;
-      if (u.resumable && u.newHandle) {
+      // Drop updates that arrive after a force-reset until the next fresh
+      // connection. Without this, a sessionResumptionUpdate in the server's
+      // send queue between forceCloseWebSocket and the actual TCP close
+      // would silently repopulate the handle the user just cleared.
+      if (this._resumeDisarmed) {
+        this.onLog('info', 'sessionResumptionUpdate: dropped (resume disarmed for this connection)');
+      } else if (u.resumable && u.newHandle) {
         this.resumeHandle = u.newHandle;
+        this.onLog('info', `Resume handle received: ${u.newHandle}`);
         try { this.onResumeHandle(u.newHandle); } catch (_) {}
+        // Renewal trigger. We can only close *at* a fresh resumable handle —
+        // the new connection resumes from the exact save-point captured by
+        // this handle, so closing elsewhere causes audio replay or a stuck
+        // turn. Two branches:
+        //   * Deadline is closing in (<5s left): the deadline timer will fire
+        //     imminently anyway, so close on this handle now to avoid the
+        //     server force-aborting us. We may close in a fragile mid-turn
+        //     state, but the alternative is worse.
+        //   * Plenty of time left (≥5s): wait until at least one turnComplete
+        //     has fired since the GoAway landed, then close on the next
+        //     handle. This places the cut at a clean turn boundary so the
+        //     server doesn't get stuck in a "between generationComplete and
+        //     turnComplete" state that it can't re-emit on resume.
+        if (this._goAwayPending) {
+          const remainingMs = this._goAwayDeadlineMs - Date.now();
+          if (remainingMs < 5000) {
+            this._renewNow('handle-urgent');
+          } else if (this._turnCompleteSinceGoAway) {
+            this._renewNow('handle-after-turn');
+          }
+          // else: wait for turnComplete to arm us, then the next handle closes.
+        }
+      } else {
+        // Resumption is not possible at certain points (mid-generation, tool
+        // execution). The server still sends an update — log it so a missing
+        // handle near a disconnect isn't a mystery.
+        this.onLog('info', `sessionResumptionUpdate: not resumable at this point`);
       }
     }
 
     if (msg.goAway) {
       const secs = parseDurationSecs(msg.goAway.timeLeft) || 5;
-      const delay = Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
-      this.onLog('warn', `GoAway received (${secs.toFixed(0)}s left), reconnecting in ${(delay / 1000).toFixed(0)}s`);
-      this._setState('reconnecting');
+      // Compute the absolute "must-close-by" wall-clock time. If a later
+      // GoAway arrives with more time, prefer the *later* deadline (the
+      // server is extending our grace period). Never shrink it.
+      const newDeadline = Date.now() + Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
+      const deadline = Math.max(this._goAwayDeadlineMs || 0, newDeadline);
+      this._goAwayDeadlineMs = deadline;
+      // Reset on each fresh GoAway: we want a turnComplete *after* this
+      // moment, not one that fired before the GoAway landed.
+      const wasPending = this._goAwayPending;
+      this._goAwayPending = true;
+      if (!wasPending) this._turnCompleteSinceGoAway = false;
+      const untilSecs = Math.max(0, (deadline - Date.now()) / 1000);
+      this.onLog('warn',
+        `GoAway received (${secs.toFixed(0)}s left). Renewing at next sweet spot (deadline in ${untilSecs.toFixed(0)}s).`);
+      // We intentionally do NOT call _setState('reconnecting'): the WS is
+      // still open and translating fine until we actually close it. Flipping
+      // the pill to "Reconnect" right now would be a lie. Instead, raise the
+      // _switching flag so the UI can show a continuous "Switching" indicator
+      // from now until setupComplete on the new socket — this warns the user
+      // that ~2 s of mic audio may be lost during the renewal.
+      this._setSwitching(true);
       if (this._goAwayTimer) clearTimeout(this._goAwayTimer);
       this._goAwayTimer = setTimeout(() => {
-        if (this.ws) { try { this.ws.close(1000, 'goaway'); } catch (_) {} }
-      }, delay);
+        if (this._goAwayPending) this._renewNow('deadline');
+      }, Math.max(0, deadline - Date.now()));
+    }
+
+    // Tool-calling isn't enabled in our setup, but if Google ever ships it on
+    // by default — or someone adds tools to the setup payload — surface it
+    // loudly. Silently ignoring would leave the model waiting for a response
+    // that never comes.
+    if (msg.toolCall) {
+      const n = msg.toolCall.functionCalls?.length ?? 0;
+      const names = (msg.toolCall.functionCalls || [])
+        .map((c) => c.name || '?').join(', ');
+      this.onLog('warn', `toolCall received (${n} call${n === 1 ? '' : 's'}: ${names}) — not handled by this client.`);
+    }
+    if (msg.toolCallCancellation) {
+      const ids = (msg.toolCallCancellation.ids || []).join(', ');
+      this.onLog('warn', `toolCallCancellation received (ids: ${ids})`);
+    }
+
+    if (msg.usageMetadata) {
+      const u = msg.usageMetadata;
+      const parts = [
+        `total=${u.totalTokenCount ?? '?'}`,
+        `prompt=${u.promptTokenCount ?? '?'}`,
+        `response=${u.responseTokenCount ?? '?'}`,
+      ];
+      if (u.cachedContentTokenCount) parts.push(`cached=${u.cachedContentTokenCount}`);
+      if (u.thoughtsTokenCount)      parts.push(`thoughts=${u.thoughtsTokenCount}`);
+      if (u.toolUsePromptTokenCount) parts.push(`toolUse=${u.toolUsePromptTokenCount}`);
+      this.onLog('info', `usage: ${parts.join(' ')}`);
+    }
+
+    // Spot unrecognized top-level message types. The Live API is in preview
+    // and may add new ones — silently dropping them is how you end up debugging
+    // "the model went quiet" for an hour. Excludes the fields we handle above
+    // plus the always-allowed usageMetadata sidecar.
+    const KNOWN_FIELDS = new Set([
+      'setupComplete', 'serverContent', 'toolCall', 'toolCallCancellation',
+      'goAway', 'sessionResumptionUpdate', 'usageMetadata',
+    ]);
+    const unknown = Object.keys(msg).filter((k) => !KNOWN_FIELDS.has(k));
+    if (unknown.length) {
+      this.onLog('warn', `Unhandled server message field(s): ${unknown.join(', ')}`);
     }
   }
 
   _onClose(ev) {
     this.ws = null;
+    // Capture whether setup ever completed BEFORE flipping the flag — used
+    // below to decide whether a saved resume handle is likely stale.
+    const closedBeforeSetup = !this._setupComplete;
     this._setupComplete = false;
+    this._goAwayPending = false;
+    this._goAwayDeadlineMs = 0;
+    this._turnCompleteSinceGoAway = false;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog(ev.code === 1000 ? 'info' : 'warn',
       `WebSocket closed (${ev.code}${ev.reason ? ': ' + ev.reason : ''})`);
 
     if (!this.shouldRun) {
+      // Clear the switching flag too: a stop() during an in-flight GoAway
+      // renewal would otherwise leave the UI stuck on the "Switching" indicator
+      // because the only paths that clear it (setupComplete, error/budget
+      // branches below) never fire when we go straight to idle.
+      this._setSwitching(false);
       this._setState('idle');
       return;
+    }
+
+    const isCleanRenewal = ev.code === 1000 &&
+      typeof ev.reason === 'string' && ev.reason.startsWith('goaway-renewal:');
+
+    // If a resume attempt dies before setupComplete outside a planned GoAway
+    // renewal, discard the handle before retrying. User-triggered fresh starts
+    // and stale stored handles should not poison the reconnect ladder.
+    if (closedBeforeSetup && this.resumeHandle && !isCleanRenewal) {
+      this.onLog('warn', `Resume handle invalid (close ${ev.code}) — clearing.`);
+      this.resumeHandle = null;
+      try { this.onResumeHandle(null); } catch (_) {}
     }
 
     // Fatal: server explicitly rejected us. Reconnecting won't help — the user
@@ -313,6 +537,7 @@ class GeminiLiveClient {
         `Connection rejected (${ev.code}${detail}). Check your API key and try again.`);
       this.shouldRun = false;
       this._reconnectAttempts = 0;
+      this._setSwitching(false);
       this._setState('error');
       return;
     }
@@ -327,6 +552,7 @@ class GeminiLiveClient {
           `Giving up after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts. Check your network and API key.`);
         this.shouldRun = false;
         this._reconnectAttempts = 0;
+        this._setSwitching(false);
         this._setState('error');
         return;
       }
@@ -345,6 +571,8 @@ class GeminiLiveClient {
       const jitter = exp * 0.2;
       delay = Math.max(250, exp - jitter + Math.random() * jitter * 2);
     }
+    this.onLog('info',
+      `Reconnect scheduled in ${(delay / 1000).toFixed(1)}s (attempt ${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}${isClean ? ', clean' : ''})`);
     this._reconnectTimer = setTimeout(() => this._connect(), delay);
   }
 
@@ -377,13 +605,57 @@ class GeminiLiveClient {
   sendActivityStart() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this._setupComplete) return;
+    this.onLog('info', 'activityStart →');
     this.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
   }
 
   sendActivityEnd() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this._setupComplete) return;
+    this.onLog('info', 'activityEnd →');
     this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+  }
+
+  // ─── Test hooks ─────────────────────────────────────────────────────────
+  // Inject a synthetic GoAway message and run it through the normal handler.
+  // Useful to exercise the reconnect + session-resumption path without
+  // waiting for the server to actually send one (which can take minutes).
+  // timeLeftSec controls the announced grace period; the existing handler
+  // schedules a clean close at (timeLeft * 1000 - GOAWAY_SAFETY_MS).
+  simulateGoAway(timeLeftSec = 3) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.onLog('warn', 'simulateGoAway ignored: WebSocket not open.');
+      return;
+    }
+    if (!this._setupComplete) {
+      this.onLog('warn', 'simulateGoAway ignored: setup not complete yet.');
+      return;
+    }
+    const fake = { goAway: { timeLeft: `${Math.max(1, timeLeftSec | 0)}s` } };
+    this.onLog('info', `[test] Injecting fake GoAway (${timeLeftSec}s).`);
+    // Synthesise an event-like object so _onMessage's existing JSON path runs
+    // unchanged — same code path the real server would hit.
+    this._onMessage({ data: JSON.stringify(fake) });
+  }
+
+  // Force-close the underlying WebSocket with a non-1000 code. shouldRun is
+  // unchanged, so the close triggers the normal reconnect ladder. Used both
+  // by the test toolbar and by the PiP "force reconnect" action — the reason
+  // string distinguishes them in the log.
+  forceCloseWebSocket(code = 4000, reason = 'force-close') {
+    if (!this.ws) {
+      this.onLog('warn', 'forceCloseWebSocket ignored: no active WebSocket.');
+      return;
+    }
+    // Disarm resume handling for the brief window between now and the actual
+    // close: any sessionResumptionUpdate already in-flight (or arriving from
+    // the server's send queue between this call and the TCP close) would
+    // otherwise repopulate resumeHandle that the caller is trying to clear.
+    this._resumeDisarmed = true;
+    this.onLog('info', `Force-closing WebSocket (${code} ${reason}).`);
+    try { this.ws.close(code, reason); } catch (e) {
+      this.onLog('warn', 'forceCloseWebSocket failed: ' + (e && e.message ? e.message : e));
+    }
   }
 }
 

@@ -80,8 +80,6 @@ a:hover { text-decoration: underline; }
 .title .logo img { width: 100%; height: 100%; display: block; object-fit: contain; }
 .title .logo img { border-radius: 4px; }
 .title-text { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.status { display: flex; align-items: center; gap: 8px; }
-.age { font-size: 11px; color: var(--fg-1); background: var(--bg-3); padding: 4px 8px; border-radius: 6px; }
 
 /* Simple/Advanced toggle — compact, inline-fit version of .segmented */
 .mode-switch {
@@ -184,32 +182,28 @@ body[data-ui-mode="simple"] .tab-chip {
 }
 /* Hide any non-active chip in simple mode — the user can only ever act on
    one session, and visually there should be just one "card" up there.
-   Switching to Advanced reveals the rest. */
+   Switching to Advanced or Full reveals the rest. */
 body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 
-.pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 999px;
-  font-size: 11px; font-weight: 600;
-  background: var(--bg-3); white-space: nowrap;
-}
-.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-2); }
-.pill-idle .dot { background: var(--fg-2); }
-.pill-connecting .dot { background: var(--warn); animation: pulse 1.2s infinite; }
-.pill-listening .dot { background: var(--good); animation: pulse 1.6s infinite; }
-.pill-translating .dot { background: var(--accent); animation: pulse 0.8s infinite; }
-.pill-reconnecting .dot { background: var(--warn); animation: pulse 0.6s infinite; }
-.pill-paused { color: var(--warn); }
-.pill-paused .dot { background: var(--warn); }
-.pill-waiting { color: var(--warn); }
-.pill-waiting .dot { background: var(--warn); animation: pulse 1.2s infinite; }
-/* Queued: this session has a translation ready but is waiting its turn behind
-   another speaker. Same amber palette as waiting/paused so "model isn't
-   talking to you right now" reads consistently across all the gated states. */
-.pill-queued { color: var(--accent-2); }
-.pill-queued .dot { background: var(--accent-2); animation: pulse 0.8s infinite; }
-.pill-error { color: var(--bad); }
-.pill-error .dot { background: var(--bad); }
+/* "Advanced" mode (data-ui-mode="mid") sits between Basic and Full. It
+   reveals the advanced-only chrome (audio source/output, speech detection,
+   bulk session actions) but still hides the .full-only sections — namely
+   the translation-mode/direction segmented controls and the system-prompt
+   editor — which would mostly only be useful to power users. */
+body[data-ui-mode="mid"] .full-only { display: none !important; }
+/* Simple also hides .full-only (.full-only is strictly more restrictive
+   than .advanced-only, so any element that's full-only should be hidden in
+   simple too, even when only one class is on it). */
+body[data-ui-mode="simple"] .full-only { display: none !important; }
+
+/* Companion-dependent UI — hidden whenever the local companion service isn't
+   reachable. JS toggles body.no-companion based on detectCompanionService(). */
+body.no-companion .companion-only { display: none !important; }
+
+/* Generic "hide" utility. The HTML [hidden] attribute is too easy to override
+   (the .btn class defaults to display: inline-flex), so JS toggles this class
+   for elements that need to disappear/reappear at runtime. */
+.is-hidden { display: none !important; }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -270,6 +264,8 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
   border-bottom-color: var(--bg-0);
   margin-bottom: -1px;
 }
+.tab-chip.is-switching { border-color: rgba(245, 158, 11, 0.42); }
+.tab-chip.is-active.is-switching { box-shadow: inset 0 3px 0 var(--warn); }
 .tab-chip.is-active .tab-label { color: var(--fg-0); }
 @keyframes tab-in {
   from { opacity: 0; transform: translateY(4px); }
@@ -315,9 +311,24 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 }
 .tab-age {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 10px; font-weight: 500;
+  font-size: 10px; font-weight: 600;
   color: var(--fg-2);
-  letter-spacing: 0.4px;
+  letter-spacing: 0.3px;
+  flex: 0 0 auto;
+  min-width: 42px;
+  text-align: right;
+  padding: 2px 0;
+  border-radius: 999px;
+}
+.tab-age.is-switching {
+  min-width: 68px;
+  padding: 2px 7px;
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.28);
+  font-weight: 800;
+  text-align: center;
+  animation: pulse 1.2s infinite;
 }
 
 .tab-meters {
@@ -523,13 +534,30 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 .controls {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: 1fr auto auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto auto;
   gap: 8px;
   padding: 10px 12px;
   padding-bottom: calc(10px + var(--safe-bottom));
   background: var(--bg-1);
   border-top: 1px solid var(--line-soft);
 }
+
+/* Start/Stop wrapper participates in the grid as if its children were direct
+   grid items — one of the two is always display:none, so the grid always sees
+   exactly one wide button in column 1. */
+.start-stop { display: contents; }
+.start-stop[data-running="true"]  #btn-start { display: none; }
+.start-stop[data-running="false"] #btn-stop  { display: none; }
+
+/* PTT toggle: idle = subtle outline, engaged = accent fill so the live state
+   is obvious at a glance from the meter row. */
+.btn.ptt { color: var(--fg-1); }
+.btn.ptt[data-engaged="true"] {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+}
+.btn.ptt[data-engaged="true"]:not(:disabled):hover { filter: brightness(1.08); }
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -556,6 +584,31 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 .btn.ghost:hover { background: var(--bg-2); color: var(--fg-0); }
 .btn.full { width: 100%; }
 
+/* "Open Companion App" button — connected state */
+#btn-open-companion.is-companion-connected {
+  color: var(--good, #4ade80);
+  border-color: rgba(74, 222, 128, 0.3);
+  cursor: default;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+/* Notice shown when the translatorcompanion:// protocol is unregistered */
+.companion-launch-notice {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.07);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--fg-1);
+}
+.companion-launch-notice p { margin: 0 0 0.35rem; }
+.companion-launch-notice a { color: var(--accent); text-decoration: underline; }
+.companion-launch-notice a:hover { color: var(--fg-0); }
+
+
 .icon-btn {
   width: 40px; height: 40px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -581,8 +634,8 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 
 /* Narrow phones: collapse secondary labels to icons */
 @media (max-width: 380px) {
-  .btn.warn .btn-tx, .btn.danger .btn-tx { display: none; }
-  .btn.warn, .btn.danger { padding: 0; width: 44px; }
+  .btn.warn .btn-tx, .btn.danger .btn-tx, #btn-force-reset .btn-tx, #btn-ptt .btn-tx { display: none; }
+  .btn.warn, .btn.danger, #btn-force-reset, #btn-ptt { padding: 0; width: 44px; }
 }
 
 /* ─── Sidebar / Sheet ─── */
@@ -633,6 +686,38 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
 .section { display: flex; flex-direction: column; gap: 10px; }
 .section.actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .section.actions .btn { flex: 1 1 0; min-width: 90px; padding: 0 10px; }
+.section.actions .export-wrap { flex: 1 1 0; min-width: 90px; position: relative; display: flex; }
+.section.actions .export-wrap .btn { flex: 1 1 auto; min-width: 0; }
+
+/* Export popup menu — anchored to the Export button, opens upward so the
+   menu doesn't collide with the footer. Closed by clicking outside or
+   pressing Escape (see wireUI). */
+.export-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0; right: 0;
+  z-index: 60;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: fade-in 0.12s ease-out;
+}
+.export-menu[hidden] { display: none; }
+.export-item {
+  background: none; border: 0; cursor: pointer;
+  color: var(--fg-0);
+  font-size: 13px;
+  padding: 10px 12px;
+  text-align: left;
+  display: flex; align-items: center;
+  width: 100%;
+}
+.export-item:hover, .export-item:focus-visible { background: var(--bg-3); outline: none; }
+.export-item + .export-item { border-top: 1px solid var(--line); }
+
 .footer-hint { margin: 8px 0 0; font-size: 11px; color: var(--fg-2); text-align: center; }
 
 /* Generic sheets (prompt, log) */
@@ -658,6 +743,28 @@ body[data-ui-mode="simple"] .tab-chip:not(.is-active) { display: none; }
   display: flex; flex-direction: column;
   animation: slide-up 0.22s ease-out;
   padding-bottom: var(--safe-bottom);
+}
+
+/* Compact "alert" variant for confirm dialogs — centered, narrow, no handle. */
+.sheet-alert { align-items: center; padding: 16px; }
+.sheet-alert .sheet-content {
+  width: auto;
+  max-width: 440px;
+  border-radius: 14px;
+  border-bottom: 1px solid var(--line);
+  animation: alert-pop 0.18s ease-out;
+  padding-bottom: 0;
+}
+.sheet-alert .sheet-head { padding: 12px 14px; }
+.sheet-alert .confirm-message {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--fg-1);
+}
+@keyframes alert-pop {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: none; }
 }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -697,6 +804,15 @@ textarea {
 }
 code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--bg-3); padding: 1px 5px; border-radius: 4px; }
 .hint { margin: 0; font-size: 11px; color: var(--fg-2); }
+.hint-inline { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: 10px; color: var(--fg-2); margin-left: 4px; }
+.checkbox-row {
+  display: inline-flex; align-items: center; gap: 8px;
+  cursor: pointer; font-size: 12px; font-weight: 500;
+  text-transform: none; letter-spacing: normal; color: var(--fg-0);
+}
+.checkbox-row input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; }
+.checkbox-row:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.checkbox-row:has(input:disabled) input { cursor: not-allowed; }
 
 /* ─── Multi-device checkbox list ─── */
 .device-list {
@@ -711,44 +827,185 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   display: flex; align-items: stretch;
   font-size: 14px; color: var(--fg-0);
   user-select: none;
+  min-height: 48px;                  /* WCAG 2.5.5 target size on touch */
 }
 .device-option:not(:last-child) { border-bottom: 1px solid var(--line); }
+.device-option.is-live-tts { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
-/* Left: TTS output checkbox + device name */
+/* Left: TTS output checkbox + device name + live badge */
 .device-tts-label {
-  flex: 1; display: flex; align-items: center; gap: 10px;
-  padding: 9px 12px;
+  flex: 1; display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
   cursor: pointer; min-width: 0;
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.device-tts-label:hover { background: var(--bg-2); }
+.device-tts-label:hover,
+.device-tts-label:active { background: var(--bg-2); }
 .device-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Right: mic passthrough toggle (decoupled from sessions) */
+.live-badge {
+  display: none; align-items: center; gap: 4px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--accent);
+  flex-shrink: 0;
+}
+.device-option.is-live-tts .live-badge { display: inline-flex; }
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: live-pulse 1.6s ease-out infinite;
+}
+@keyframes live-pulse {
+  0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--accent) 60%, transparent); }
+  70%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%,  transparent); }
+  100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--accent) 0%,  transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot { animation: none; }
+}
+
+/* Inline "Live: <device>" line shown under the input <select>. */
+.live-line {
+  margin: 4px 0 0; font-size: 11.5px; color: var(--accent);
+  display: none; align-items: center; gap: 6px;
+}
+.live-line.is-visible { display: inline-flex; }
+.live-line::before {
+  content: ''; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex-shrink: 0;
+  animation: live-pulse 1.6s ease-out infinite;
+}
+
+/* Mic preview meter + toggle button. The meter only takes layout when the
+   user clicks "Preview" — otherwise it stays display:none and the panel
+   doesn't reserve vertical space for it. */
+.mic-preview-meter {
+  display: none;
+  margin: 6px 0 0;
+  height: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.mic-preview-meter.is-active { display: block; }
+.mic-preview-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg,
+    var(--accent) 0%,
+    var(--accent) 65%,
+    var(--warn)  85%,
+    var(--bad)   100%);
+  transition: width 0.06s linear;
+  will-change: width;
+}
+#btn-mic-preview { flex-shrink: 0; }
+#btn-mic-preview.is-active {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-2));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+#btn-mic-preview.is-active .icon { animation: live-pulse 1.6s ease-out infinite; }
+
+/* Right: per-row passthrough toggle (each device row in the output list) */
 .passthrough-toggle {
   display: flex; align-items: center; justify-content: center;
-  padding: 9px 12px;
+  padding: 10px 14px;
   border-left: 1px solid var(--line);
   cursor: pointer; flex-shrink: 0;
   color: var(--fg-2);
   transition: color 0.15s, background 0.15s;
+  min-width: 44px;                   /* touch target */
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.passthrough-toggle:hover { background: var(--bg-2); }
+.passthrough-toggle:hover,
+.passthrough-toggle:active { background: var(--bg-2); }
 .passthrough-toggle input[type=checkbox] { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
 .passthrough-toggle:has(input:checked) { color: var(--accent); }
-.pt-icon svg { width: 16px; height: 16px; display: block; }
+.device-option.is-live-passthrough .passthrough-toggle { color: var(--accent); }
+.device-option.is-live-passthrough .passthrough-toggle::after {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-left: 4px;
+  animation: live-pulse 1.6s ease-out infinite;
+}
+/* Live mic-level bar at the bottom of every row currently routing the mic.
+   Width is driven by the --pt-level CSS variable set from JS at rAF rate so
+   the user sees real audio flowing — solves "is it actually routing?". The
+   bar is rendered via a thin overlay on .device-option so it doesn't shift
+   layout when it appears/disappears. */
+.device-option { position: relative; }
+.device-option.is-live-passthrough::after {
+  content: '';
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 3px;
+  background: linear-gradient(to right,
+    var(--accent) 0%,
+    var(--accent) calc(var(--pt-level, 0%) - 1px),
+    transparent calc(var(--pt-level, 0%)),
+    transparent 100%);
+  transition: background 0.04s linear;
+  pointer-events: none;
+}
+.pt-icon svg { width: 18px; height: 18px; display: block; }
 .device-test {
   display: flex; align-items: center; justify-content: center;
-  padding: 9px 12px;
+  padding: 10px 14px;
   border-left: 1px solid var(--line);
   color: var(--fg-2);
   flex-shrink: 0;
+  min-width: 44px;                   /* touch target */
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
-.device-test:hover:not(:disabled) { background: var(--bg-2); color: var(--accent); }
-.device-test svg { width: 16px; height: 16px; display: block; }
+.device-test:hover:not(:disabled),
+.device-test:active:not(:disabled) { background: var(--bg-2); color: var(--accent); }
+.device-test svg { width: 18px; height: 18px; display: block; }
+
+/* Speaker test "playing" state. Three signals so the user can't miss that the
+   test is actually firing:
+     1. The button background is tinted accent so the busy state is visible
+        even with the speaker icon's tiny silhouette.
+     2. The icon scales up and down on a soft pulse (matches the cadence of
+        the three-note arpeggio testOutputDevice plays).
+     3. An expanding ring radiates outward, the same "tap ripple" idiom users
+        already associate with audio actively emitting. */
+.device-test.is-playing {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+  position: relative; overflow: visible;
+  opacity: 1 !important;          /* override the :disabled dim */
+}
+.device-test.is-playing svg {
+  animation: speaker-pulse 0.5s ease-in-out infinite alternate;
+}
+.device-test.is-playing::after {
+  content: '';
+  position: absolute; inset: -2px;
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+  opacity: 0;
+  animation: speaker-ring 1.0s ease-out infinite;
+  pointer-events: none;
+}
+@keyframes speaker-pulse {
+  from { transform: scale(1);    }
+  to   { transform: scale(1.18); }
+}
+@keyframes speaker-ring {
+  0%   { transform: scale(0.85); opacity: 0.85; }
+  100% { transform: scale(1.45); opacity: 0;    }
+}
+@media (prefers-reduced-motion: reduce) {
+  .device-test.is-playing svg { animation: none; }
+  .device-test.is-playing::after { animation: none; opacity: 0.6; }
+}
 
 /* Shared checkbox overrides (undo the blanket input[type=text/password/number] rule) */
 .device-tts-label input[type=checkbox] {
-  width: 15px; height: 15px; flex-shrink: 0;
+  width: 18px; height: 18px; flex-shrink: 0;
   accent-color: var(--accent);
   cursor: pointer; padding: 0;
 }
@@ -767,6 +1024,20 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .row-end { display: flex; gap: 8px; justify-content: flex-end; }
 
 /* ─── Log ─── */
+.log-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-1);
+}
+.log-toolbar-label {
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg-2);
+}
+.log-toolbar .btn.small {
+  min-height: 30px; padding: 4px 10px; font-size: 12px;
+}
+.log-toolbar-spacer { flex: 1 1 auto; }
 .log {
   padding: 10px 14px;
   font-size: 11.5px; line-height: 1.55;
@@ -948,20 +1219,12 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   to   { opacity: 1; }
 }
 
-/* Status pill: better hover affordance for keyboard users (it's not clickable
-   but the dot's pulse can feel busy with too much else moving). */
-.pill { transition: background 0.12s ease; }
-
 /* Pause/Hush/Stop transitions match the rest. */
 .btn .icon, .icon-btn .icon { transition: color 0.12s ease; }
 
 /* Narrow phones: reclaim space in the topbar.
    - Below 480px, keep the mode-switch but tighten it.
-   - Below 380px, hide the age (already minimal real-estate).
    - Below 340px, drop the title text too (logo stays). */
-@media (max-width: 380px) {
-  .age { display: none; }
-}
 @media (max-width: 340px) {
   .title-text { display: none; }
   .topbar { gap: 6px; padding-left: 8px; padding-right: 8px; }
