@@ -75,6 +75,7 @@
         </section>
 
         <section class="section">
+          <h3 class="section-title">Languages</h3>
           <div class="field-grid">
             <div class="field">
               <label for="lang-source">You speak</label>
@@ -95,6 +96,7 @@
         </section>
 
         <section class="section advanced-only full-only">
+          <h3 class="section-title">Translation</h3>
           <div class="field">
             <label>Mode</label>
             <div class="segmented" id="mode-segmented" role="radiogroup" aria-label="Translate mode">
@@ -114,9 +116,27 @@
           </div>
         </section>
 
-        <section class="section advanced-only">
+        <section class="section" id="voice-section">
+          <h3 class="section-title">Voice</h3>
           <div class="field">
-            <label>Speech detection</label>
+            <label for="voice">Voice</label>
+            <select id="voice">
+              <option value="Zephyr">Zephyr</option>
+              <option value="Puck">Puck</option>
+              <option value="Charon">Charon</option>
+              <option value="Kore">Kore</option>
+              <option value="Fenrir">Fenrir</option>
+              <option value="Aoede">Aoede</option>
+              <option value="Leda">Leda</option>
+              <option value="Orus">Orus</option>
+            </select>
+            <p class="hint">Voice Gemini uses to speak the translation.</p>
+          </div>
+        </section>
+
+        <section class="section advanced-only">
+          <h3 class="section-title">Speech detection</h3>
+          <div class="field">
             <div class="segmented" id="speech-mode-segmented" role="radiogroup" aria-label="Speech detection">
               <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto Detect</button>
               <button class="seg-opt"           data-value="ptt"  type="button" role="radio" aria-checked="false">Push to talk</button>
@@ -124,7 +144,7 @@
             <p class="hint" id="speech-mode-hint">Gemini detects when you start and stop talking.</p>
           </div>
 
-          <div id="vad-auto-fields">
+          <div class="subgroup" id="vad-auto-fields">
             <div class="field">
               <label for="vad-preset">Detection sensitivity</label>
               <select id="vad-preset">
@@ -161,7 +181,7 @@
             </div>
           </div>
 
-          <div id="vad-ptt-fields" style="display:none">
+          <div class="subgroup" id="vad-ptt-fields" style="display:none">
             <div class="field companion-only">
               <label>Hotkey <span class="hint-inline">(needs companion)</span></label>
               <div class="input-row">
@@ -190,24 +210,8 @@
           </div>
         </section>
 
-        <section class="section" id="voice-section">
-          <div class="field">
-            <label for="voice">Voice</label>
-            <select id="voice">
-              <option value="Zephyr">Zephyr</option>
-              <option value="Puck">Puck</option>
-              <option value="Charon">Charon</option>
-              <option value="Kore">Kore</option>
-              <option value="Fenrir">Fenrir</option>
-              <option value="Aoede">Aoede</option>
-              <option value="Leda">Leda</option>
-              <option value="Orus">Orus</option>
-            </select>
-            <p class="hint">Voice Gemini uses to speak the translation.</p>
-          </div>
-        </section>
-
         <section class="section advanced-only">
+          <h3 class="section-title">Audio</h3>
           <div class="field">
             <label>Audio source</label>
             <div class="segmented seg-wrap" id="audio-source-segmented" role="radiogroup" aria-label="Audio source">
@@ -218,73 +222,75 @@
             </div>
             <p class="hint" id="audio-source-hint">Pick mic, browser tab, or — with the companion — a specific app.</p>
           </div>
-          <div class="field" id="mic-section">
-            <label for="audio-input">Microphone</label>
-            <div class="input-row">
-              <select id="audio-input">
-                <option value="">System default</option>
-              </select>
-              <button id="btn-detect-devices" class="icon-btn small" type="button" aria-label="Detect device names" title="Show device names (grants mic access)">
-                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-              </button>
-              <button id="btn-mic-preview" class="icon-btn small" type="button"
-                      aria-label="Preview microphone level"
-                      aria-pressed="false"
-                      title="Preview mic level for 10s">
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <use href="#icon-mic"/>
-                </svg>
-              </button>
-            </div>
-            <div class="mic-preview-meter" id="mic-preview-meter" aria-hidden="true">
-              <div class="mic-preview-fill" id="mic-preview-fill"></div>
-            </div>
-            <p class="live-line" id="audio-input-live" aria-live="polite"></p>
-            <p class="hint" id="audio-input-hint">Microphone used for speech input.</p>
-          </div>
-          <div class="field" id="companion-app-field" style="display:none">
-            <label for="companion-app">App to capture</label>
-            <div class="input-row">
-              <select id="companion-app">
-                <option value="">All system audio</option>
-              </select>
-              <button id="btn-refresh-apps" class="icon-btn small" type="button" aria-label="Refresh app list" title="Refresh app list">
-                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-              </button>
-            </div>
-            <p class="hint" id="companion-app-hint">Only apps currently playing sound appear. Start playback, then refresh ↻.</p>
-          </div>
-        </section>
-
-        <section class="section advanced-only" id="audio-output-section">
-          <div class="field">
-            <label id="audio-output-label">Audio output</label>
-            <div id="audio-output" class="device-list" role="group" aria-labelledby="audio-output-label">
-              <!-- Placeholder row used until refreshAudioOutputDevices() rebuilds
-                   the list. Mirrors the structure buildDeviceOption() emits so
-                   the device-id query selectors and "live" indicator find a
-                   well-formed System-default row even on the very first paint. -->
-              <div class="device-option" data-device-id="">
-                <label class="device-tts-label">
-                  <input type="checkbox" class="dev-tts" value="" checked />
-                  <span class="device-name">System default</span>
-                </label>
+          <div class="subgroup" id="mic-section">
+            <div class="field">
+              <label for="audio-input">Microphone</label>
+              <div class="input-row">
+                <select id="audio-input">
+                  <option value="">System default</option>
+                </select>
+                <button id="btn-detect-devices" class="icon-btn small" type="button" aria-label="Detect device names" title="Show device names (grants mic access)">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                </button>
+                <button id="btn-mic-preview" class="icon-btn small" type="button"
+                        aria-label="Preview microphone level"
+                        aria-pressed="false"
+                        title="Preview mic level for 10s">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <use href="#icon-mic"/>
+                  </svg>
+                </button>
               </div>
+              <div class="mic-preview-meter" id="mic-preview-meter" aria-hidden="true">
+                <div class="mic-preview-fill" id="mic-preview-fill"></div>
+              </div>
+              <p class="live-line" id="audio-input-live" aria-live="polite"></p>
+              <p class="hint" id="audio-input-hint">Microphone used for speech input.</p>
             </div>
-            <p class="hint" id="audio-output-hint">Translated speech plays on every ticked device.</p>
           </div>
-        </section>
-
-        <section class="section advanced-only" id="passthrough-output-section" style="display:none;">
-          <div class="field">
-            <label id="passthrough-output-label">Passthrough output</label>
-            <div id="passthrough-output" class="device-list" role="group" aria-labelledby="passthrough-output-label">
-              <!-- Populated by refreshPassthroughOutputDevices() from the
-                   companion's /outputs endpoint. Hidden until the companion is
-                   detected; uses WASAPI endpoint ids (distinct from the
-                   browser-side deviceIds the TTS section above uses). -->
+          <div class="subgroup" id="companion-app-field" style="display:none">
+            <div class="field">
+              <label for="companion-app">App to capture</label>
+              <div class="input-row">
+                <select id="companion-app">
+                  <option value="">All system audio</option>
+                </select>
+                <button id="btn-refresh-apps" class="icon-btn small" type="button" aria-label="Refresh app list" title="Refresh app list">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                </button>
+              </div>
+              <p class="hint" id="companion-app-hint">Only apps currently playing sound appear. Start playback, then refresh ↻.</p>
             </div>
-            <p class="hint" id="passthrough-output-hint">Sends your source audio to a virtual cable or extra speaker — handy for piping into meetings.</p>
+          </div>
+          <div class="subgroup" id="audio-output-section">
+            <div class="field">
+              <label id="audio-output-label">Audio output</label>
+              <div id="audio-output" class="device-list" role="group" aria-labelledby="audio-output-label">
+                <!-- Placeholder row used until refreshAudioOutputDevices() rebuilds
+                     the list. Mirrors the structure buildDeviceOption() emits so
+                     the device-id query selectors and "live" indicator find a
+                     well-formed System-default row even on the very first paint. -->
+                <div class="device-option" data-device-id="">
+                  <label class="device-tts-label">
+                    <input type="checkbox" class="dev-tts" value="" checked />
+                    <span class="device-name">System default</span>
+                  </label>
+                </div>
+              </div>
+              <p class="hint" id="audio-output-hint">Translated speech plays on every ticked device.</p>
+            </div>
+          </div>
+          <div class="subgroup" id="passthrough-output-section" style="display:none;">
+            <div class="field">
+              <label id="passthrough-output-label">Passthrough output</label>
+              <div id="passthrough-output" class="device-list" role="group" aria-labelledby="passthrough-output-label">
+                <!-- Populated by refreshPassthroughOutputDevices() from the
+                     companion's /outputs endpoint. Hidden until the companion is
+                     detected; uses WASAPI endpoint ids (distinct from the
+                     browser-side deviceIds the TTS section above uses). -->
+              </div>
+              <p class="hint" id="passthrough-output-hint">Sends your source audio to a virtual cable or extra speaker — handy for piping into meetings.</p>
+            </div>
           </div>
         </section>
 
@@ -308,6 +314,7 @@
         </section>
 
         <section class="section actions">
+          <h3 class="section-title actions-title">Actions</h3>
           <button id="btn-pip" class="btn ghost" type="button" title="Open a floating window for this session">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>Pop out
           </button>

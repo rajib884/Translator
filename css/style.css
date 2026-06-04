@@ -692,7 +692,20 @@ body.no-companion .companion-only { display: none !important; }
   flex: 1 1 auto; min-height: 0;
 }
 .section { display: flex; flex-direction: column; gap: 10px; }
+.section-title {
+  margin: 0 0 2px;
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--fg-2);
+}
+.subgroup {
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line-soft);
+  display: flex; flex-direction: column; gap: 10px;
+}
 .section.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.section.actions .actions-title { flex-basis: 100%; margin: 0; }
 .section.actions .btn { flex: 1 1 0; min-width: 90px; padding: 0 10px; }
 .section.actions .export-wrap { flex: 1 1 0; min-width: 90px; position: relative; display: flex; }
 .section.actions .export-wrap .btn { flex: 1 1 auto; min-width: 0; }
@@ -1211,10 +1224,16 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 }
 
 /* Subtle dividers between sidebar sections — gives the panel rhythm without
-   shouting. Skip the first and any hidden section so the spacing stays clean. */
+   shouting. Skip the first and any hidden section so the spacing stays clean.
+   Sections that have their own .section-title heading don't get the hairline:
+   the heading already provides the visual break. */
 .sheet-body > .section + .section:not(.actions) {
   border-top: 1px solid var(--line-soft);
   padding-top: 14px;
+}
+.sheet-body > .section + .section:has(> .section-title) {
+  border-top: none;
+  padding-top: 6px;
 }
 .sheet-body > .section.actions { margin-top: 4px; }
 
