@@ -6,6 +6,7 @@
 #include "http_util.h"
 #include "passthrough_loop.h"
 #include "process_loopback.h"
+#include "process_loopback_hub.h"
 #include "socket_guard.h"
 #include "system_loopback.h"
 #include "ws_util.h"
@@ -123,17 +124,20 @@ void handle_client(SOCKET accepted) {
       catch (...) { pid = 0; }
     }
 
-    std::atomic<bool> alive{true};
-    std::thread capture([&] {
-      if (pid != 0) capture_process_loopback_to_websocket(client.s, pid, alive);
-      else          capture_system_loopback_to_websocket(client.s, alive);
-    });
-    while (alive) {
-      char tmp[2] = {};
-      int r = recv(client.s, tmp, sizeof(tmp), 0);
-      if (r <= 0) alive = false;
+    if (pid != 0) {
+      process_loopback_hub_session(client.s, pid);
+    } else {
+      std::atomic<bool> alive{true};
+      std::thread capture([&] {
+        capture_system_loopback_to_websocket(client.s, alive);
+      });
+      while (alive) {
+        char tmp[2] = {};
+        int r = recv(client.s, tmp, sizeof(tmp), 0);
+        if (r <= 0) alive = false;
+      }
+      if (capture.joinable()) capture.join();
     }
-    if (capture.joinable()) capture.join();
     return;
   }
 

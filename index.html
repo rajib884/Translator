@@ -40,9 +40,9 @@
       <span class="title-text">Translator</span>
     </div>
     <div class="mode-switch" id="mode-switch" role="group" aria-label="Interface mode">
-      <button class="mode-opt is-active" data-ui-mode="simple" type="button" aria-pressed="true">Basic</button>
-      <button class="mode-opt" data-ui-mode="mid" type="button" aria-pressed="false">Advanced</button>
-      <button class="mode-opt" data-ui-mode="full" type="button" aria-pressed="false">Full</button>
+      <button class="mode-opt is-active" data-ui-mode="simple" type="button" aria-pressed="true" title="Hide advanced settings">Basic</button>
+      <button class="mode-opt" data-ui-mode="mid" type="button" aria-pressed="false" title="Show common advanced settings">Advanced</button>
+      <button class="mode-opt" data-ui-mode="full" type="button" aria-pressed="false" title="Show every setting, including dev tools">Full</button>
     </div>
   </header>
 
@@ -70,7 +70,7 @@
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
               </button>
             </div>
-            <p class="hint">From <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Stored only in this browser.</p>
+            <p class="hint">Get one at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Stays on this device — never sent anywhere except Google.</p>
           </div>
         </section>
 
@@ -91,6 +91,7 @@
               <select id="lang-target"></select>
             </div>
           </div>
+          <p class="hint">"You speak" is the language you'll say things in; "Translate to" is what Gemini speaks back. Tap the swap button to flip them.</p>
         </section>
 
         <section class="section advanced-only full-only">
@@ -101,7 +102,7 @@
               <button class="seg-opt"           data-value="text"       type="button" role="radio" aria-checked="false">Translate (Text)</button>
               <button class="seg-opt"           data-value="transcribe" type="button" role="radio" aria-checked="false">Transcribe</button>
             </div>
-            <p class="hint" id="mode-hint">Translates speech into both text and spoken audio.</p>
+            <p class="hint" id="mode-hint">Translates speech to text, then speaks it back.</p>
           </div>
           <div class="field" id="dir-field">
             <label>Direction</label>
@@ -109,7 +110,7 @@
               <button class="seg-opt is-active" data-value="bidir"  type="button" role="radio" aria-checked="true">Bidirectional</button>
               <button class="seg-opt"           data-value="oneway" type="button" role="radio" aria-checked="false">Unidirectional</button>
             </div>
-            <p class="hint" id="dir-hint">Translates both your speech and the other person's speech.</p>
+            <p class="hint" id="dir-hint">Both speakers are translated, each into the other's language.</p>
           </div>
         </section>
 
@@ -120,7 +121,7 @@
               <button class="seg-opt is-active" data-value="auto" type="button" role="radio" aria-checked="true">Auto Detect</button>
               <button class="seg-opt"           data-value="ptt"  type="button" role="radio" aria-checked="false">Push to talk</button>
             </div>
-            <p class="hint" id="speech-mode-hint">Auto Detect: model decides when you start/stop speaking. Push to talk: tap the Talk button to engage the mic, tap again to release.</p>
+            <p class="hint" id="speech-mode-hint">Gemini detects when you start and stop talking.</p>
           </div>
 
           <div id="vad-auto-fields">
@@ -132,7 +133,7 @@
                 <option value="patient">Patient — wait for me to finish</option>
                 <option value="custom">Custom</option>
               </select>
-              <p class="hint">If the model jumps in too early, pick <strong>Patient</strong>.</p>
+              <p class="hint">Pick <strong>Patient</strong> if Gemini interrupts you; <strong>Quick</strong> replies sooner.</p>
             </div>
             <div id="vad-custom-fields" class="field-grid vad-grid">
               <div class="field">
@@ -162,14 +163,14 @@
 
           <div id="vad-ptt-fields" style="display:none">
             <div class="field companion-only">
-              <label>Hotkey <span class="hint-inline">(optional, needs companion)</span></label>
+              <label>Hotkey <span class="hint-inline">(needs companion)</span></label>
               <div class="input-row">
                 <button class="btn ghost ptt-key-btn" id="btn-ptt-key" type="button">
                   <span id="ptt-key-label">Not set — click to bind</span>
                 </button>
                 <button class="icon-btn small" id="btn-ptt-clear" type="button" title="Clear hotkey" aria-label="Clear hotkey">×</button>
               </div>
-              <p class="hint" id="ptt-hint">Optional: install the companion app to bind a system-wide hotkey. The Talk button works without it.</p>
+              <p class="hint" id="ptt-hint">Install the companion to bind a system-wide hotkey. The Speak button works without it.</p>
             </div>
             <div class="field companion-only">
               <label>Mode</label>
@@ -177,14 +178,14 @@
                 <button class="seg-opt is-active" data-value="hold"   type="button" role="radio" aria-checked="true">Hold to talk</button>
                 <button class="seg-opt"           data-value="toggle" type="button" role="radio" aria-checked="false">Tap to toggle</button>
               </div>
-              <p class="hint" id="ptt-mode-hint">Hold: speak while the key is pressed. Toggle: tap once to start, tap again to stop.</p>
+              <p class="hint" id="ptt-mode-hint">Hold: talk while the key is pressed. Toggle: tap once to start, tap again to stop.</p>
             </div>
             <div class="field companion-only">
               <label class="checkbox-row">
                 <input type="checkbox" id="ptt-exclusive" />
                 <span>Capture key exclusively (block other apps)</span>
               </label>
-              <p class="hint">When on, the bound key is consumed by the companion and not passed to any other app. Modifier keys (Ctrl/Shift/Alt/Win) always pass through. Turn off if you want the key to also reach other apps.</p>
+              <p class="hint">On: other apps don't see the bound key (Ctrl/Shift/Alt/Win still pass through). Off: the key works everywhere.</p>
             </div>
           </div>
         </section>
@@ -202,7 +203,7 @@
               <option value="Leda">Leda</option>
               <option value="Orus">Orus</option>
             </select>
-            <p class="hint">Used for the spoken translation. Hidden in text-only and transcribe modes.</p>
+            <p class="hint">Voice Gemini uses to speak the translation.</p>
           </div>
         </section>
 
@@ -215,7 +216,7 @@
               <button class="seg-opt"           data-value="companion" type="button" role="radio" aria-checked="false">Companion</button>
               <button class="seg-opt"           data-value="both"      type="button" role="radio" aria-checked="false">Mic + Tab</button>
             </div>
-            <p class="hint" id="audio-source-hint">Default microphone. Use "Tab" to translate a tab or window. Browser support varies.</p>
+            <p class="hint" id="audio-source-hint">Pick mic, browser tab, or — with the companion — a specific app.</p>
           </div>
           <div class="field" id="mic-section">
             <label for="audio-input">Microphone</label>
@@ -223,13 +224,13 @@
               <select id="audio-input">
                 <option value="">System default</option>
               </select>
-              <button id="btn-detect-devices" class="icon-btn small" type="button" aria-label="Detect device names" title="Detect device names (grants mic permission)">
+              <button id="btn-detect-devices" class="icon-btn small" type="button" aria-label="Detect device names" title="Show device names (grants mic access)">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
               </button>
               <button id="btn-mic-preview" class="icon-btn small" type="button"
                       aria-label="Preview microphone level"
                       aria-pressed="false"
-                      title="Preview microphone level (10s)">
+                      title="Preview mic level for 10s">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                   <use href="#icon-mic"/>
                 </svg>
@@ -239,7 +240,7 @@
               <div class="mic-preview-fill" id="mic-preview-fill"></div>
             </div>
             <p class="live-line" id="audio-input-live" aria-live="polite"></p>
-            <p class="hint" id="audio-input-hint">Choose the microphone used for speech input. Device names may appear after permission.</p>
+            <p class="hint" id="audio-input-hint">Microphone used for speech input.</p>
           </div>
           <div class="field" id="companion-app-field" style="display:none">
             <label for="companion-app">App to capture</label>
@@ -251,7 +252,7 @@
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
               </button>
             </div>
-            <p class="hint" id="companion-app-hint">Only apps currently making sound appear. Start playback in the app, then refresh.</p>
+            <p class="hint" id="companion-app-hint">Only apps currently playing sound appear. Start playback, then refresh ↻.</p>
           </div>
         </section>
 
@@ -270,7 +271,7 @@
                 </label>
               </div>
             </div>
-            <p class="hint" id="audio-output-hint">Tick one or more speakers; translated speech plays on every checked device. Device names may appear after microphone permission.</p>
+            <p class="hint" id="audio-output-hint">Translated speech plays on every ticked device.</p>
           </div>
         </section>
 
@@ -283,39 +284,39 @@
                    detected; uses WASAPI endpoint ids (distinct from the
                    browser-side deviceIds the TTS section above uses). -->
             </div>
-            <p class="hint" id="passthrough-output-hint">Routes this session’s source audio to a virtual cable. Mic and per-app capture run on the companion service.</p>
+            <p class="hint" id="passthrough-output-hint">Sends your source audio to a virtual cable or extra speaker — handy for piping into meetings.</p>
           </div>
         </section>
 
         <section class="section advanced-only full-only">
-          <button id="btn-edit-prompt" class="btn ghost full" type="button">
+          <button id="btn-edit-prompt" class="btn ghost full" type="button" title="Edit the system prompt sent to Gemini">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>Customise system prompt
           </button>
         </section>
 
         <!-- Open Companion App (always visible; JS drives the button state) -->
         <section class="section">
-          <button id="btn-open-companion" class="btn ghost full" type="button">
+          <button id="btn-open-companion" class="btn ghost full" type="button" title="Launch the Windows companion service">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
             <span id="btn-open-companion-label">Open Companion App</span>
           </button>
           <!-- Shown when the translatorcompanion:// protocol appears unregistered -->
           <div id="companion-launch-notice" class="companion-launch-notice" hidden>
-            <p>Companion app is not installed or not registered. Please run the Windows companion once to register.</p>
-            <a href="https://github.com/rajib884/Translator/releases/latest" id="companion-download-link" target="_blank" rel="noopener">Download companion app</a>
+            <p>Companion app isn't installed (or its <code>translatorcompanion://</code> handler isn't registered). Run it once to register.</p>
+            <a href="https://github.com/rajib884/Translator/releases/latest" id="companion-download-link" target="_blank" rel="noopener">Download companion</a>
           </div>
         </section>
 
         <section class="section actions">
-          <button id="btn-pip" class="btn ghost" type="button">
+          <button id="btn-pip" class="btn ghost" type="button" title="Open a floating window for this session">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>Pop out
           </button>
-          <button id="btn-log" class="btn ghost advanced-only" type="button">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Log
+          <button id="btn-log" class="btn ghost advanced-only" type="button" title="Open the debug log">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Debug Log
           </button>
           <div class="export-wrap">
-            <button id="btn-export" class="btn ghost" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="export-menu">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Export
+            <button id="btn-export" class="btn ghost" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="export-menu" title="Export chat history">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Export Chat
             </button>
             <div id="export-menu" class="export-menu" role="menu" aria-labelledby="btn-export" hidden>
               <button id="btn-export-json" class="export-item" type="button" role="menuitem">
@@ -326,12 +327,12 @@
               </button>
             </div>
           </div>
-          <button id="btn-clear" class="btn ghost" type="button">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>Clear
+          <button id="btn-clear" class="btn ghost" type="button" title="Clear chat history">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>Clear Chat
           </button>
         </section>
 
-        <p class="footer-hint">Audio &amp; data go directly from this browser to Google. No server in between.</p>
+        <p class="footer-hint">Your audio goes straight from this browser to Google. No middleman.</p>
       </div>
     </div>
   </aside>
@@ -339,10 +340,10 @@
   <nav class="tabs" id="tabs" aria-label="Sessions">
     <div class="tab-list" id="tab-list" role="tablist"></div>
     <div class="tab-actions advanced-only">
-      <button id="btn-start-all" class="tab-action" type="button" title="Start every idle session" aria-label="Start all">
+      <button id="btn-start-all" class="tab-action" type="button" title="Start all idle sessions" aria-label="Start all">
         <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="4 3 14 12 4 21 4 3"/><rect x="16" y="3" width="3" height="18"/></svg>
       </button>
-      <button id="btn-stop-all" class="tab-action" type="button" title="Stop every running session" aria-label="Stop all">
+      <button id="btn-stop-all" class="tab-action" type="button" title="Stop all running sessions" aria-label="Stop all">
         <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="10" height="16"/><rect x="17" y="4" width="3" height="16"/></svg>
       </button>
     </div>
@@ -379,7 +380,7 @@
          doesn't override it. -->
     <button id="btn-ptt" class="btn ptt advanced-only is-hidden" type="button" disabled
             data-engaged="false" aria-pressed="false"
-            title="Push to talk — tap to start, tap to stop"
+            title="Tap to talk"
             aria-label="Push to talk">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span><span class="btn-tx">Speak</span>
     </button>
@@ -388,16 +389,16 @@
       <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
       <svg class="icon icon-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
     </button>
-    <button id="btn-hush" class="btn warn full-only" type="button" disabled title="Stop current speech output">
+    <button id="btn-hush" class="btn warn full-only" type="button" disabled title="Silence the current reply">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></span><span class="btn-tx">Silence</span>
     </button>
     <button id="btn-force-reset" class="btn ghost advanced-only" type="button"
-            title="Force reconnect: drop the WebSocket and clear the resume handle. Starts a fresh model context."
+            title="Reconnect with a fresh context"
             aria-label="Force reconnect">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></span><span class="btn-tx">Renew</span>
     </button>
     <button id="btn-pip-quick" class="icon-btn quick advanced-only" type="button"
-            title="Pop out current translation" aria-label="Pop out current translation">
+            title="Pop out" aria-label="Pop out current translation">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>
     </button>
   </footer>
@@ -413,7 +414,7 @@
         <button class="icon-btn close-btn" type="button" data-close="prompt-sheet" aria-label="Close">×</button>
       </div>
       <div class="sheet-body">
-        <p class="hint">Sent to Gemini at the start of every session. <code>{source}</code> / <code>{target}</code> are replaced with the selected languages. The default depends on Mode + Direction — <em>Reset</em> loads the current default.</p>
+        <p class="hint">Sent to Gemini at the start of every session. <code>{source}</code> and <code>{target}</code> become the languages you picked. The default changes with Mode + Direction; <em>Reset</em> reloads it.</p>
         <p class="hint">Current default: <strong id="prompt-mode-label">—</strong></p>
         <textarea id="prompt-text" rows="14" spellcheck="false"></textarea>
         <div class="row-end">
@@ -444,20 +445,20 @@
              so anyone troubleshooting can hand off a log file. -->
         <span class="log-toolbar-label advanced-only">Test:</span>
         <button id="btn-test-goaway" class="btn ghost small advanced-only" type="button"
-                title="Inject a synthetic GoAway message and let the client reconnect">
+                title="Simulate a server GoAway">
           Simulate GoAway
         </button>
         <button id="btn-test-wsclose" class="btn ghost small advanced-only" type="button"
-                title="Force-close the WebSocket and let the reconnect ladder run">
+                title="Force WebSocket close (tests reconnect)">
           Force-close WS
         </button>
         <span class="log-toolbar-spacer" aria-hidden="true"></span>
         <button id="btn-log-export" class="btn ghost small" type="button"
-                title="Download the visible log lines as a .txt file">
+                title="Download log as .txt">
           Export
         </button>
         <button id="btn-log-clear" class="btn ghost small" type="button"
-                title="Clear the log panel">
+                title="Clear the log">
           Clear
         </button>
       </div>

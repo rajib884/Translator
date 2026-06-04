@@ -21,7 +21,7 @@ const LANGUAGES = [
   ['pt', 'Portuguese'],
 ];
 
-const MAX_TURNS = 50;
+const MAX_TURNS = 1000;
 const MAX_LOG = 200;
 // Multi-session is meant for the occasional power user juggling a couple of
 // translations. Past 3 the audio coordinator queues up too far behind real
@@ -49,27 +49,27 @@ const COMPANION_PTT_URL = 'ws://127.0.0.1:52341/hotkey';
 // take those inputs and return a string.
 const HINTS = {
   mode: {
-    audio:      'Translates speech into both text and spoken audio.',
-    text:       'Translates speech into text only (spoken audio discarded).',
-    transcribe: 'Transcribes speech into text in the same language (no translation).',
+    audio:      'Translates speech to text, then speaks it back.',
+    text:       'Translates to text only — no spoken reply.',
+    transcribe: 'Transcribes what you say in the same language.',
   },
   dir: {
-    bidir:  'Translates both your speech and the other person\'s speech.',
-    oneway: 'Translates only your speech (useful for broadcasts).',
+    bidir:  'Both speakers are translated, each into the other\'s language.',
+    oneway: 'Only your speech is translated. Useful for broadcasts.',
   },
   speechMode(mode, companionOk) {
     if (mode === 'ptt') {
       return companionOk
-        ? 'Tap the Talk button to start speaking; tap again to stop. Optionally bind a system-wide hotkey via the companion app.'
-        : 'Tap the Talk button to start speaking; tap again to stop.';
+        ? 'Tap Speak to start; tap again to stop. Or bind a system-wide hotkey below.'
+        : 'Tap Speak to start; tap again to stop.';
     }
-    return 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
+    return 'Gemini detects when you start and stop talking.';
   },
   audioSource(canDisplay, companionOk) {
-    if (!canDisplay && !companionOk) return 'App audio capture is unavailable. Start the companion service or use Chrome/Edge tab audio.';
-    if (companionOk)                  return 'Companion app detected. Use it for background app audio without screen sharing.';
-    if (!canDisplay)                  return 'Browser app audio capture is unsupported here. Start the companion service to use app audio.';
-    return 'Default microphone. Use app/tab audio in Chrome/Edge, or Companion app audio when the local service is running.';
+    if (!canDisplay && !companionOk) return 'Tab audio needs Chrome or Edge. Install the companion for app audio.';
+    if (companionOk)                  return 'Companion detected — capture app audio without sharing your screen.';
+    if (!canDisplay)                  return 'Tab audio needs Chrome or Edge. Install the companion for app audio.';
+    return 'Pick mic, browser tab, or — with the companion — a specific app.';
   },
 };
 
@@ -883,7 +883,7 @@ async function requestUIModeChange(mode) {
       if (mode === 'simple') {
         const ok = await showConfirm({
           title: 'Switch to Basic?',
-          message: 'This resets advanced settings for the active session: voice translation, microphone input, Auto Detect, default devices, and the default prompt.',
+          message: 'Resets this session\'s advanced settings — voice, mic, VAD, devices, and prompt.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -894,7 +894,7 @@ async function requestUIModeChange(mode) {
         // keep using a configuration the user can no longer see.
         const ok = await showConfirm({
           title: 'Switch to Advanced?',
-          message: 'This resets translation mode, direction, and the system prompt to defaults.',
+          message: 'Resets mode, direction, and the system prompt to defaults.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -1233,11 +1233,11 @@ function updatePttButton() {
   }
   if (els.pttHint) {
     if (!state.companionAvailable) {
-      els.pttHint.textContent = 'Optional: install the companion app to bind a system-wide hotkey. The Talk button below works without it.';
+      els.pttHint.textContent = 'Install the companion to bind a system-wide hotkey. The Speak button works without it.';
     } else if (!state.pttBinding) {
-      els.pttHint.textContent = 'Optional global hotkey. Click "Not set" and press a key (or key combo) to bind.';
+      els.pttHint.textContent = 'Click "Not set" and press a key (or combo) to bind a hotkey.';
     } else {
-      els.pttHint.textContent = 'Hotkey works system-wide via the companion app — even when this page is in the background.';
+      els.pttHint.textContent = 'Hotkey works system-wide — even when this page isn\'t focused.';
     }
   }
 }
@@ -1615,8 +1615,18 @@ function maybePromoteArchivedSession() {
   // is a user-visible fresh start; only automatic reconnects inside a running
   // GeminiLiveClient may resume.
   session.resumeHandle = null;
+  if (Array.isArray(entry.history)) {
+    session.history = entry.history
+      .filter((h) => h && typeof h === 'object')
+      .map((h) => ({
+        input: typeof h.input === 'string' ? h.input : '',
+        output: typeof h.output === 'string' ? h.output : '',
+        finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
+      }));
+  }
   state.sessions.set(session.id, session);
   createSessionDOM(session);
+  renderSessionHistory(session);
   log('info', `Restored an archived session (${state.archivedSessions.length} remaining).`);
 }
 
@@ -1671,11 +1681,10 @@ async function stopAllSessions() {
 }
 
 // ─── Persistence (sessions) ──────────────────────────────────────────────────
-// Cap how many history turns we persist per session. The DOM is already
-// trimmed to MAX_TURNS for perf; localStorage has a per-origin budget (~5MB
-// across all keys), and 500 turns × ~200 chars ≈ 100KB per session is plenty
-// of headroom while still surviving long sessions through a reload.
-const MAX_PERSISTED_HISTORY = 500;
+// Cap how many history turns we persist per session. This is intentionally
+// high enough for long meetings; localStorage still has a finite browser
+// quota, so very large transcripts may need IndexedDB later.
+const MAX_PERSISTED_HISTORY = 10000;
 function saveSessions() {
   try {
     const visible = [...state.sessions.values()].map((s) => ({
@@ -1772,6 +1781,7 @@ function restoreSessionsFromStorage() {
     }
     state.sessions.set(session.id, session);
     createSessionDOM(session);
+    renderSessionHistory(session);
   }
   refreshAddSessionButton();
   refreshBulkActionButtons();
@@ -2099,14 +2109,14 @@ async function refreshCompanionApps({ silent = true } = {}) {
 
     if (els.companionAppHint) {
       els.companionAppHint.textContent = apps.length
-        ? 'Pick an app. Refresh ↻ after starting playback in a new app.'
-        : 'No app is making sound right now. Start playback, then refresh ↻.';
+        ? 'Pick an app. Refresh ↻ after starting playback in a new one.'
+        : 'No app is playing sound. Start playback, then refresh ↻.';
     }
     if (!silent) log('info', `Companion: found ${apps.length} app${apps.length === 1 ? '' : 's'} with active audio.`);
   } catch (e) {
     if (!silent) log('warn', 'Could not list companion apps: ' + (e && e.message ? e.message : e));
     if (els.companionAppHint) {
-      els.companionAppHint.textContent = 'Could not reach the companion service.';
+      els.companionAppHint.textContent = 'Couldn\'t reach the companion service.';
     }
   }
 }
@@ -2215,7 +2225,7 @@ function updateAudioInputSupport() {
                        navigator.mediaDevices.enumerateDevices);
   els.audioInput.disabled = !supported;
   if (!supported) {
-    els.audioInputHint.textContent = 'This browser does not allow web apps to choose a microphone.';
+    els.audioInputHint.textContent = 'Browser doesn\'t support picking a microphone.';
   }
 }
 
@@ -2226,7 +2236,7 @@ function updateAudioOutputSupport() {
   const supported = canSelect && canList;
   setOutputDeviceListDisabled(!supported);
   if (!supported) {
-    els.audioOutputHint.textContent = 'This browser does not allow web apps to choose a speaker.';
+    els.audioOutputHint.textContent = 'Browser doesn\'t support picking a speaker.';
   }
 }
 
@@ -2333,8 +2343,8 @@ async function refreshPassthroughOutputDevices() {
 
   if (els.passthroughOutputHint) {
     els.passthroughOutputHint.textContent = endpoints.length
-      ? 'Tick a virtual cable or speaker to route this session’s source audio there.'
-      : 'No render endpoints reported by the companion.';
+      ? 'Tick any device to route this session\'s source audio there.'
+      : 'Companion reported no render endpoints.';
   }
   setPassthroughSectionVisible(true);
   refreshActiveDeviceIndicators();
@@ -2639,15 +2649,15 @@ async function refreshAudioInputDevices() {
     if (inputs.length) {
       const hasLabels = inputs.some((d) => d.label);
       els.audioInputHint.textContent = hasLabels
-        ? 'Changes apply immediately; Mic + app audio asks you to pick app audio again.'
-        : 'Device names may appear after microphone permission — click Start once to grant it.';
+        ? 'Switching applies immediately. Mic + Tab asks you to repick the tab.'
+        : 'Tap Start once to grant mic access — names appear after.';
     } else {
-      els.audioInputHint.textContent = 'No microphones were reported by this browser.';
+      els.audioInputHint.textContent = 'No microphones found.';
     }
     savePrefs();
   } catch (e) {
     els.audioInput.disabled = true;
-    els.audioInputHint.textContent = 'Could not read microphone devices.';
+    els.audioInputHint.textContent = 'Couldn\'t read your microphones.';
     log('warn', 'Microphone devices unavailable: ' + (e && e.message ? e.message : e));
   }
 }
@@ -2704,16 +2714,16 @@ async function refreshAudioOutputDevices() {
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
       els.audioOutputHint.textContent = hasLabels
-        ? 'Tick speakers for translated audio.'
-        : 'Device names may appear after microphone permission.';
+        ? 'Translated speech plays on every ticked device.'
+        : 'Names appear after granting mic access.';
     } else {
-      els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
+      els.audioOutputHint.textContent = 'No speakers found.';
     }
     savePrefs();
     refreshActiveDeviceIndicators();
   } catch (e) {
     setOutputDeviceListDisabled(true);
-    els.audioOutputHint.textContent = 'Could not read audio output devices.';
+    els.audioOutputHint.textContent = 'Couldn\'t read your speakers.';
     log('warn', 'Audio output devices unavailable: ' + (e && e.message ? e.message : e));
   }
 }
@@ -3291,6 +3301,86 @@ function flushPending(session) {
   }
 }
 
+function formatTurnTimestamp(ts, { includeDate = false } = {}) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return '';
+  return includeDate ? d.toLocaleString() : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function isoTurnTimestamp(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
+function createTurnTimestampEl(ts) {
+  const el = document.createElement('time');
+  el.className = 'turn-time';
+  el.textContent = formatTurnTimestamp(ts);
+  const iso = isoTurnTimestamp(ts);
+  if (iso) {
+    el.dateTime = iso;
+    el.title = formatTurnTimestamp(ts, { includeDate: true });
+  }
+  return el;
+}
+
+function trimTranscriptDOM(host) {
+  while (host && host.children.length > MAX_TURNS) {
+    host.removeChild(host.firstChild);
+  }
+}
+
+function renderHistoryTurn(session, h) {
+  const host = session && session.transcriptEl;
+  if (!host) return;
+  removeSessionEmptyState(session);
+  const isTranscribe = session.config.mode === 'transcribe';
+  const root = document.createElement('div');
+  root.className = 'turn' + (isTranscribe ? ' turn-single' : '');
+
+  const time = createTurnTimestampEl(h.finalizedAt);
+  if (time.textContent) root.appendChild(time);
+
+  const inRow = document.createElement('div');
+  inRow.className = 'turn-row input';
+  const inLab = document.createElement('span');
+  inLab.className = 'turn-label';
+  inLab.textContent = '🎙 ' + langName(session.config.source);
+  const inText = document.createElement('span');
+  const input = h.input || '';
+  inText.className = 'turn-text' + (input ? '' : ' empty');
+  inText.textContent = input || '(silence)';
+  inRow.appendChild(inLab);
+  inRow.appendChild(inText);
+  root.appendChild(inRow);
+
+  if (!isTranscribe) {
+    const outRow = document.createElement('div');
+    outRow.className = 'turn-row output';
+    const outLab = document.createElement('span');
+    outLab.className = 'turn-label';
+    outLab.textContent = '→ ' + langName(session.config.target);
+    const outText = document.createElement('span');
+    const output = h.output || '';
+    outText.className = 'turn-text' + (output ? '' : ' empty');
+    outText.textContent = output || '(no translation)';
+    outRow.appendChild(outLab);
+    outRow.appendChild(outText);
+    root.appendChild(outRow);
+  }
+
+  host.appendChild(root);
+  trimTranscriptDOM(host);
+}
+
+function renderSessionHistory(session) {
+  if (!session || !session.transcriptEl || !Array.isArray(session.history) || session.history.length === 0) return;
+  for (const h of session.history.slice(-MAX_TURNS)) renderHistoryTurn(session, h);
+  session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+}
+
 function ensureLiveTurn(session) {
   if (session.liveTurn) return session.liveTurn;
   const host = session.transcriptEl;
@@ -3301,6 +3391,9 @@ function ensureLiveTurn(session) {
 
   const root = document.createElement('div');
   root.className = 'turn live' + (isTranscribe ? ' turn-single' : '');
+  const startedAt = Date.now();
+  const time = createTurnTimestampEl(startedAt);
+  if (time.textContent) root.appendChild(time);
 
   const inRow = document.createElement('div');
   inRow.className = 'turn-row input';
@@ -3345,12 +3438,12 @@ function ensureLiveTurn(session) {
 
   host.appendChild(root);
 
-  while (host.children.length > MAX_TURNS) {
-    host.removeChild(host.firstChild);
-  }
+  trimTranscriptDOM(host);
 
   session.liveTurn = {
     root,
+    timeEl: time,
+    startedAt,
     inputEl: inText,
     outputEl: outText,
     inputTextNode: inTextNode,
@@ -3389,7 +3482,16 @@ function finalizeTurn(session) {
   const inText = t.inputText.trim();
   const outText = t.outputEl ? t.outputText.trim() : '';
   if (inText || outText) {
-    session.history.push({ input: inText, output: outText, finalizedAt: Date.now() });
+    const finalizedAt = Date.now();
+    if (t.timeEl) {
+      t.timeEl.textContent = formatTurnTimestamp(finalizedAt);
+      const iso = isoTurnTimestamp(finalizedAt);
+      if (iso) {
+        t.timeEl.dateTime = iso;
+        t.timeEl.title = formatTurnTimestamp(finalizedAt, { includeDate: true });
+      }
+    }
+    session.history.push({ input: inText, output: outText, finalizedAt });
     saveSessions();
   }
   session.liveTurn = null;
@@ -4005,6 +4107,7 @@ function clearConversation() {
     renderSessionEmptyState(session);
   }
   if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
+  saveSessions();
 }
 
 function conversationTurns(session) {
@@ -4017,12 +4120,21 @@ function conversationTurns(session) {
     index: i + 1,
     input: h.input || '',
     output: h.output || '',
+    finalizedAt: isoTurnTimestamp(h.finalizedAt),
+    finalizedAtMs: h.finalizedAt || null,
   }));
   if (session.liveTurn) {
     const inText = (session.liveTurn.inputText || '').trim();
     const outText = (session.liveTurn.outputText || '').trim();
     if (inText || outText) {
-      out.push({ index: out.length + 1, input: inText, output: outText });
+      const ts = session.liveTurn.startedAt || Date.now();
+      out.push({
+        index: out.length + 1,
+        input: inText,
+        output: outText,
+        finalizedAt: isoTurnTimestamp(ts),
+        finalizedAtMs: ts,
+      });
     }
   }
   return out;
@@ -4066,39 +4178,87 @@ function downloadText(filename, text, type) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function exportableSessionEntries() {
+  return [...state.sessions.values()]
+    .map((session, i) => ({
+      index: i + 1,
+      session,
+      turns: conversationTurns(session),
+    }))
+    .filter((entry) => entry.turns.length > 0);
+}
+
+function exportTimeline(entries) {
+  let collected = 0;
+  return entries
+    .flatMap((entry) => entry.turns.map((turn) => ({
+      index: 0,
+      sessionIndex: entry.index,
+      sessionId: entry.session.id,
+      source: entry.session.config.source,
+      target: entry.session.config.target,
+      mode: entry.session.config.mode,
+      input: turn.input,
+      output: turn.output,
+      finalizedAt: turn.finalizedAt,
+      finalizedAtMs: turn.finalizedAtMs,
+      turnIndex: turn.index,
+      collectionIndex: collected++,
+    })))
+    .sort((a, b) => {
+      const at = Number.isFinite(a.finalizedAtMs) ? a.finalizedAtMs : Infinity;
+      const bt = Number.isFinite(b.finalizedAtMs) ? b.finalizedAtMs : Infinity;
+      if (at !== bt) return at - bt;
+      if (a.sessionIndex !== b.sessionIndex) return a.sessionIndex - b.sessionIndex;
+      if (a.turnIndex !== b.turnIndex) return a.turnIndex - b.turnIndex;
+      return a.collectionIndex - b.collectionIndex;
+    })
+    .map((turn, i) => {
+      const { collectionIndex, ...exported } = turn;
+      return Object.assign(exported, { index: i + 1 });
+    });
+}
+
 function exportConversation(format) {
-  const session = activeSession();
-  if (!session) return;
-  const turns = conversationTurns(session);
-  if (turns.length === 0) {
-    log('warn', 'Nothing to export for this session.');
+  const sessions = exportableSessionEntries();
+  if (sessions.length === 0) {
+    log('warn', 'Nothing to export for any session.');
     return;
   }
+  const turns = exportTimeline(sessions);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const base = `live-translator-${session.config.source}-${session.config.target}-${stamp}`;
+  const base = `live-translator-all-sessions-${stamp}`;
+  const exportedAt = new Date();
   if (format === 'json') {
     downloadText(base + '.json', JSON.stringify({
-      exportedAt: new Date().toISOString(),
-      sessionId: session.id,
-      config: session.config,
+      exportedAt: exportedAt.toISOString(),
+      sessionCount: sessions.length,
+      sessions: sessions.map((entry) => ({
+        index: entry.index,
+        sessionId: entry.session.id,
+        source: entry.session.config.source,
+        target: entry.session.config.target,
+        mode: entry.session.config.mode,
+        config: entry.session.config,
+      })),
       turns,
     }, null, 2), 'application/json');
   } else {
     const lines = [
       'Live Translator export',
-      `${langName(session.config.source)} -> ${langName(session.config.target)}`,
-      `Exported: ${new Date().toLocaleString()}`,
+      `Sessions: ${sessions.length}`,
+      `Exported: ${exportedAt.toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}`,
-        `${langName(session.config.source)}: ${t.input || '(empty)'}`,
-        session.config.mode === 'transcribe' ? '' : `${langName(session.config.target)}: ${t.output || '(empty)'}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''} - Session ${t.sessionIndex} - ${langName(t.source)} -> ${langName(t.target)}`,
+        `${langName(t.source)}: ${t.input || '(empty)'}`,
+        t.mode === 'transcribe' ? '' : `${langName(t.target)}: ${t.output || '(empty)'}`,
         '',
       ]),
     ];
     downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
   }
-  log('info', `Conversation exported as ${format.toUpperCase()}.`);
+  log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
@@ -4261,6 +4421,12 @@ class PipController {
     const doc = this.win.document;
     this.doc = doc;
     doc.documentElement.lang = 'en';
+    // Without this, mobile browsers fall back to a 980px virtual viewport and
+    // render the PiP content shrunk to a fraction of the real window width.
+    const viewport = doc.createElement('meta');
+    viewport.name = 'viewport';
+    viewport.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
+    doc.head.appendChild(viewport);
     // Container queries (below) need a known container. Body is the natural
     // root and `inline-size` lets buttons hide based on PIP width without JS.
     doc.documentElement.style.height = '100%';
