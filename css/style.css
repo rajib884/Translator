@@ -21,6 +21,7 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-top: env(safe-area-inset-top, 0px);
   --sidebar-w: 380px;
+  --ctrl-h: 44px;
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -119,7 +120,7 @@ a:hover { text-decoration: underline; }
   padding: 2px;
   gap: 0;
   width: 100%;
-  min-height: 40px;
+  min-height: var(--ctrl-h);
 }
 .segmented.seg-wrap { flex-wrap: wrap; row-gap: 4px; border-radius: var(--radius-sm); }
 .seg-opt {
@@ -568,7 +569,7 @@ body.no-companion .companion-only { display: none !important; }
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
-  gap: 6px; min-height: 44px; padding: 0 14px;
+  gap: 6px; min-height: var(--ctrl-h); padding: 0 14px;
   border-radius: var(--radius-sm);
   background: var(--bg-3); color: var(--fg-0);
   font-weight: 600; font-size: 14px;
@@ -617,7 +618,7 @@ body.no-companion .companion-only { display: none !important; }
 
 
 .icon-btn {
-  width: 40px; height: 40px;
+  width: var(--ctrl-h); height: var(--ctrl-h);
   display: inline-flex; align-items: center; justify-content: center;
   border-radius: var(--radius-sm);
   background: var(--bg-2); color: var(--fg-1);
@@ -626,7 +627,7 @@ body.no-companion .companion-only { display: none !important; }
 }
 .icon-btn:hover { background: var(--bg-3); color: var(--fg-0); }
 .icon-btn:active { background: var(--bg-3); }
-.icon-btn.small { width: 36px; height: 36px; font-size: 14px; }
+.icon-btn.small { width: var(--ctrl-h); height: var(--ctrl-h); font-size: 14px; }
 
 /* Pause button toggle states */
 #btn-pause .icon-mic-off { display: none; }
@@ -790,11 +791,14 @@ input[type="text"], input[type="password"], input[type="number"], select, textar
   background: var(--bg-3);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  padding: 11px 12px;
+  padding: 0 12px;
   font-size: 15px;
   width: 100%; outline: none;
   -webkit-appearance: none; appearance: none;
   color: var(--fg-0);
+}
+input[type="text"], input[type="password"], input[type="number"], select {
+  min-height: var(--ctrl-h);
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 select {
@@ -806,6 +810,7 @@ select {
 }
 textarea {
   resize: vertical; min-height: 200px;
+  padding: 10px 12px;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12.5px; line-height: 1.55;
 }

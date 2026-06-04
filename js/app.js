@@ -49,27 +49,27 @@ const COMPANION_PTT_URL = 'ws://127.0.0.1:52341/hotkey';
 // take those inputs and return a string.
 const HINTS = {
   mode: {
-    audio:      'Translates speech into both text and spoken audio.',
-    text:       'Translates speech into text only (spoken audio discarded).',
-    transcribe: 'Transcribes speech into text in the same language (no translation).',
+    audio:      'Translates speech to text, then speaks it back.',
+    text:       'Translates to text only — no spoken reply.',
+    transcribe: 'Transcribes what you say in the same language.',
   },
   dir: {
-    bidir:  'Translates both your speech and the other person\'s speech.',
-    oneway: 'Translates only your speech (useful for broadcasts).',
+    bidir:  'Both speakers are translated, each into the other\'s language.',
+    oneway: 'Only your speech is translated. Useful for broadcasts.',
   },
   speechMode(mode, companionOk) {
     if (mode === 'ptt') {
       return companionOk
-        ? 'Tap the Talk button to start speaking; tap again to stop. Optionally bind a system-wide hotkey via the companion app.'
-        : 'Tap the Talk button to start speaking; tap again to stop.';
+        ? 'Tap Speak to start; tap again to stop. Or bind a system-wide hotkey below.'
+        : 'Tap Speak to start; tap again to stop.';
     }
-    return 'Auto VAD: model decides when you start/stop speaking based on silence detection.';
+    return 'Gemini detects when you start and stop talking.';
   },
   audioSource(canDisplay, companionOk) {
-    if (!canDisplay && !companionOk) return 'App audio capture is unavailable. Start the companion service or use Chrome/Edge tab audio.';
-    if (companionOk)                  return 'Companion app detected. Use it for background app audio without screen sharing.';
-    if (!canDisplay)                  return 'Browser app audio capture is unsupported here. Start the companion service to use app audio.';
-    return 'Default microphone. Use app/tab audio in Chrome/Edge, or Companion app audio when the local service is running.';
+    if (!canDisplay && !companionOk) return 'Tab audio needs Chrome or Edge. Install the companion for app audio.';
+    if (companionOk)                  return 'Companion detected — capture app audio without sharing your screen.';
+    if (!canDisplay)                  return 'Tab audio needs Chrome or Edge. Install the companion for app audio.';
+    return 'Pick mic, browser tab, or — with the companion — a specific app.';
   },
 };
 
@@ -883,7 +883,7 @@ async function requestUIModeChange(mode) {
       if (mode === 'simple') {
         const ok = await showConfirm({
           title: 'Switch to Basic?',
-          message: 'This resets advanced settings for the active session: voice translation, microphone input, Auto Detect, default devices, and the default prompt.',
+          message: 'Resets this session\'s advanced settings — voice, mic, VAD, devices, and prompt.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -894,7 +894,7 @@ async function requestUIModeChange(mode) {
         // keep using a configuration the user can no longer see.
         const ok = await showConfirm({
           title: 'Switch to Advanced?',
-          message: 'This resets translation mode, direction, and the system prompt to defaults.',
+          message: 'Resets mode, direction, and the system prompt to defaults.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -1233,11 +1233,11 @@ function updatePttButton() {
   }
   if (els.pttHint) {
     if (!state.companionAvailable) {
-      els.pttHint.textContent = 'Optional: install the companion app to bind a system-wide hotkey. The Talk button below works without it.';
+      els.pttHint.textContent = 'Install the companion to bind a system-wide hotkey. The Speak button works without it.';
     } else if (!state.pttBinding) {
-      els.pttHint.textContent = 'Optional global hotkey. Click "Not set" and press a key (or key combo) to bind.';
+      els.pttHint.textContent = 'Click "Not set" and press a key (or combo) to bind a hotkey.';
     } else {
-      els.pttHint.textContent = 'Hotkey works system-wide via the companion app — even when this page is in the background.';
+      els.pttHint.textContent = 'Hotkey works system-wide — even when this page isn\'t focused.';
     }
   }
 }
@@ -2109,14 +2109,14 @@ async function refreshCompanionApps({ silent = true } = {}) {
 
     if (els.companionAppHint) {
       els.companionAppHint.textContent = apps.length
-        ? 'Pick an app. Refresh ↻ after starting playback in a new app.'
-        : 'No app is making sound right now. Start playback, then refresh ↻.';
+        ? 'Pick an app. Refresh ↻ after starting playback in a new one.'
+        : 'No app is playing sound. Start playback, then refresh ↻.';
     }
     if (!silent) log('info', `Companion: found ${apps.length} app${apps.length === 1 ? '' : 's'} with active audio.`);
   } catch (e) {
     if (!silent) log('warn', 'Could not list companion apps: ' + (e && e.message ? e.message : e));
     if (els.companionAppHint) {
-      els.companionAppHint.textContent = 'Could not reach the companion service.';
+      els.companionAppHint.textContent = 'Couldn\'t reach the companion service.';
     }
   }
 }
@@ -2225,7 +2225,7 @@ function updateAudioInputSupport() {
                        navigator.mediaDevices.enumerateDevices);
   els.audioInput.disabled = !supported;
   if (!supported) {
-    els.audioInputHint.textContent = 'This browser does not allow web apps to choose a microphone.';
+    els.audioInputHint.textContent = 'Browser doesn\'t support picking a microphone.';
   }
 }
 
@@ -2236,7 +2236,7 @@ function updateAudioOutputSupport() {
   const supported = canSelect && canList;
   setOutputDeviceListDisabled(!supported);
   if (!supported) {
-    els.audioOutputHint.textContent = 'This browser does not allow web apps to choose a speaker.';
+    els.audioOutputHint.textContent = 'Browser doesn\'t support picking a speaker.';
   }
 }
 
@@ -2343,8 +2343,8 @@ async function refreshPassthroughOutputDevices() {
 
   if (els.passthroughOutputHint) {
     els.passthroughOutputHint.textContent = endpoints.length
-      ? 'Tick a virtual cable or speaker to route this session’s source audio there.'
-      : 'No render endpoints reported by the companion.';
+      ? 'Tick any device to route this session\'s source audio there.'
+      : 'Companion reported no render endpoints.';
   }
   setPassthroughSectionVisible(true);
   refreshActiveDeviceIndicators();
@@ -2649,15 +2649,15 @@ async function refreshAudioInputDevices() {
     if (inputs.length) {
       const hasLabels = inputs.some((d) => d.label);
       els.audioInputHint.textContent = hasLabels
-        ? 'Changes apply immediately; Mic + app audio asks you to pick app audio again.'
-        : 'Device names may appear after microphone permission — click Start once to grant it.';
+        ? 'Switching applies immediately. Mic + Tab asks you to repick the tab.'
+        : 'Tap Start once to grant mic access — names appear after.';
     } else {
-      els.audioInputHint.textContent = 'No microphones were reported by this browser.';
+      els.audioInputHint.textContent = 'No microphones found.';
     }
     savePrefs();
   } catch (e) {
     els.audioInput.disabled = true;
-    els.audioInputHint.textContent = 'Could not read microphone devices.';
+    els.audioInputHint.textContent = 'Couldn\'t read your microphones.';
     log('warn', 'Microphone devices unavailable: ' + (e && e.message ? e.message : e));
   }
 }
@@ -2714,16 +2714,16 @@ async function refreshAudioOutputDevices() {
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
       els.audioOutputHint.textContent = hasLabels
-        ? 'Tick speakers for translated audio.'
-        : 'Device names may appear after microphone permission.';
+        ? 'Translated speech plays on every ticked device.'
+        : 'Names appear after granting mic access.';
     } else {
-      els.audioOutputHint.textContent = 'No speaker devices were reported by this browser.';
+      els.audioOutputHint.textContent = 'No speakers found.';
     }
     savePrefs();
     refreshActiveDeviceIndicators();
   } catch (e) {
     setOutputDeviceListDisabled(true);
-    els.audioOutputHint.textContent = 'Could not read audio output devices.';
+    els.audioOutputHint.textContent = 'Couldn\'t read your speakers.';
     log('warn', 'Audio output devices unavailable: ' + (e && e.message ? e.message : e));
   }
 }
@@ -4421,6 +4421,12 @@ class PipController {
     const doc = this.win.document;
     this.doc = doc;
     doc.documentElement.lang = 'en';
+    // Without this, mobile browsers fall back to a 980px virtual viewport and
+    // render the PiP content shrunk to a fraction of the real window width.
+    const viewport = doc.createElement('meta');
+    viewport.name = 'viewport';
+    viewport.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
+    doc.head.appendChild(viewport);
     // Container queries (below) need a known container. Body is the natural
     // root and `inline-size` lets buttons hide based on PIP width without JS.
     doc.documentElement.style.height = '100%';
