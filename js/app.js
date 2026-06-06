@@ -233,11 +233,8 @@ const els = {
   btnHush:       $('btn-hush'),
   btnPause:      $('btn-pause'),
   btnPtt:        $('btn-ptt'),
-  btnClear:      $('btn-clear'),
-  btnExport:     $('btn-export'),
-  exportMenu:    $('export-menu'),
-  btnExportJson: $('btn-export-json'),
-  btnExportText: $('btn-export-text'),
+  // Per-session Clear / Export live in each session header strip (built in
+  // createSessionDOM). No global els.* lookups for those buttons.
   btnMenu:       $('btn-menu'),
   btnLog:        $('btn-log'),
   btnForceReset: $('btn-force-reset'),
@@ -1015,6 +1012,17 @@ function createSessionDOM(session) {
       '<span class="tab-status-text">Idle</span>' +
       '<span class="tab-age mono">00:00</span>' +
     '</div>' +
+    '<div class="tab-chip-devices" aria-hidden="true">' +
+      '<span class="tab-dev tab-dev-in">' +
+        '<span class="tab-dev-ico"></span>' +
+        '<span class="tab-dev-name"></span>' +
+      '</span>' +
+      '<span class="tab-dev-sep">→</span>' +
+      '<span class="tab-dev tab-dev-out">' +
+        '<span class="tab-dev-ico"></span>' +
+        '<span class="tab-dev-name"></span>' +
+      '</span>' +
+    '</div>' +
     '<div class="tab-meters" aria-hidden="true">' +
       '<div class="tab-meter mic"><div class="tab-meter-fill"></div></div>' +
       '<div class="tab-meter out"><div class="tab-meter-fill"></div></div>' +
@@ -1026,8 +1034,79 @@ function createSessionDOM(session) {
   session.tabAgeEl    = chip.querySelector('.tab-age');
   session.tabMicFill  = chip.querySelector('.tab-meter.mic .tab-meter-fill');
   session.tabOutFill  = chip.querySelector('.tab-meter.out .tab-meter-fill');
+  session.tabDevicesEl = chip.querySelector('.tab-chip-devices');
+  session.tabDevIn    = chip.querySelector('.tab-dev-in');
+  session.tabDevOut   = chip.querySelector('.tab-dev-out');
   updateTabChip(session);
   refreshSessionDisplay(session);
+
+  // Per-session header strip: sits above the transcript and hosts the
+  // session's title + turn count, Clear, and Export (with this-session /
+  // all-sessions scopes). Visibility mirrors the transcript panel —
+  // .is-active is added/removed by setActiveSession.
+  const header = document.createElement('div');
+  header.className = 'session-header';
+  header.dataset.sessionId = session.id;
+  header.innerHTML =
+    '<div class="session-header-meta">' +
+      '<span class="session-header-title"></span>' +
+      '<span class="session-header-sub"></span>' +
+    '</div>' +
+    '<div class="session-header-actions">' +
+      '<button class="btn ghost session-clear" type="button" title="Clear this session\'s conversation" aria-label="Clear chat">' +
+        '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>' +
+        '<span class="btn-tx">Clear</span>' +
+      '</button>' +
+      '<div class="export-wrap session-export-wrap">' +
+        '<button class="btn ghost session-export" type="button" aria-haspopup="menu" aria-expanded="false" title="Export chat">' +
+          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+          '<span class="btn-tx">Export</span>' +
+          '<span class="dropdown-caret" aria-hidden="true">▾</span>' +
+        '</button>' +
+        '<div class="export-menu" role="menu" hidden>' +
+          '<div class="export-menu-group">' +
+            '<div class="export-menu-label">This session</div>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="session" data-format="json">JSON</button>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="session" data-format="text">Text</button>' +
+          '</div>' +
+          '<div class="export-menu-sep" role="separator"></div>' +
+          '<div class="export-menu-group">' +
+            '<div class="export-menu-label">All sessions</div>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="all" data-format="json">JSON</button>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="all" data-format="text">Text</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  // Each session owns a vertical panel: header strip on top, transcript
+  // below. Only the active panel is shown — display:none otherwise.
+  const panel = document.createElement('div');
+  panel.className = 'session-panel';
+  panel.dataset.sessionId = session.id;
+  panel.appendChild(header);
+  els.turnsHost.appendChild(panel);
+  session.panelEl         = panel;
+  session.headerEl        = header;
+  session.headerTitleEl   = header.querySelector('.session-header-title');
+  session.headerSubEl     = header.querySelector('.session-header-sub');
+  session.headerClearBtn  = header.querySelector('.session-clear');
+  session.headerExportBtn = header.querySelector('.session-export');
+  session.headerExportMenu = header.querySelector('.export-menu');
+
+  session.headerClearBtn.addEventListener('click', () => clearConversation(session));
+  session.headerExportBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleExportMenu(session.headerExportMenu, session.headerExportBtn);
+  });
+  session.headerExportMenu.addEventListener('click', (ev) => {
+    const item = ev.target.closest('.export-item');
+    ev.stopPropagation();
+    if (!item) return;
+    closeExportMenu(session.headerExportMenu, session.headerExportBtn);
+    const scope = item.dataset.scope === 'all' ? 'all' : 'session';
+    const format = item.dataset.format === 'text' ? 'text' : 'json';
+    exportConversation(format, { scope, session });
+  });
 
   const turns = document.createElement('div');
   turns.className = 'session-turns';
@@ -1039,9 +1118,10 @@ function createSessionDOM(session) {
   turns.setAttribute('role', 'tabpanel');
   turns.setAttribute('aria-labelledby', tabId);
   turns.setAttribute('tabindex', '0');
-  els.turnsHost.appendChild(turns);
+  panel.appendChild(turns);
   session.transcriptEl = turns;
   renderSessionEmptyState(session);
+  refreshSessionHeader(session);
 }
 
 function updateTabChip(session) {
@@ -1052,6 +1132,118 @@ function updateTabChip(session) {
   if (session.tabLabelEl) session.tabLabelEl.textContent = label;
   session.tabEl.dataset.audio = session.isAudio ? 'true' : 'false';
   session.tabEl.title = `${langName(cfg.source)} → ${langName(cfg.target)}`;
+  paintTabChipDevices(session);
+  refreshSessionHeader(session);
+}
+
+// Pure formatters: turn a session's config into a short label + full title.
+// Called from updateTabChip; cheap, so they can run on every refresh trigger.
+function describeSessionInput(session) {
+  const cfg = session.config || {};
+  if (cfg.mode === 'text') {
+    return { icon: '⌨', short: 'Text input', full: 'Text-only session (no audio input)' };
+  }
+  const src = cfg.audioSource || 'mic';
+  if (src === 'display') {
+    return { icon: '🖥', short: 'Tab audio', full: 'Browser tab / display capture' };
+  }
+  if (src === 'companion') {
+    const exe = cfg.companionApp || '';
+    if (!exe) return { icon: '🎧', short: 'All system audio', full: 'Companion: all system audio' };
+    const match = state && state.companionApps && state.companionApps.find((a) => a.name === exe);
+    const display = match && match.displayName && match.displayName !== exe
+      ? `${match.displayName} (${exe})` : exe;
+    return { icon: '🎧', short: display, full: 'Companion app: ' + display };
+  }
+  // 'mic' or 'both'
+  const micLabel = micLabelFor(cfg.micDeviceId);
+  if (src === 'both') {
+    return { icon: '🎤', short: micLabel + ' + tab', full: 'Mic (' + micLabel + ') + browser tab audio' };
+  }
+  return { icon: '🎤', short: micLabel, full: 'Mic: ' + micLabel };
+}
+
+function describeSessionOutput(session) {
+  const cfg = session.config || {};
+  if (cfg.mode === 'transcribe' || cfg.mode === 'text') {
+    return { icon: '📝', short: 'Transcript only', full: 'No translated speech — transcript only' };
+  }
+  const ids = Array.isArray(cfg.outputDeviceIds) ? cfg.outputDeviceIds : [];
+  let primary = 'System default';
+  let extras = 0;
+  if (ids.length === 0) {
+    primary = 'System default';
+  } else {
+    primary = deviceLabelForId(ids[0], 'output') || 'System default';
+    extras = Math.max(0, ids.length - 1);
+  }
+  const labelShort = extras > 0 ? `${primary} (+${extras})` : primary;
+  let labelFull = ids.length === 0
+    ? 'System default'
+    : ids.map((id) => deviceLabelForId(id, 'output') || 'System default').join(', ');
+  const ptIds = Array.isArray(cfg.passthroughDeviceIds) ? cfg.passthroughDeviceIds : [];
+  if (ptIds.length > 0) {
+    labelFull += '  ·  Passthrough: ' + ptIds.length + ' sink' + (ptIds.length === 1 ? '' : 's');
+  }
+  return { icon: '🔊', short: labelShort, full: labelFull };
+}
+
+// Look up a mic device's human label from the (already-populated) input
+// dropdown. Returns "System default" for empty id, "Microphone" when labels
+// haven't been granted yet.
+function micLabelFor(id) {
+  if (!els.audioInput) return id ? 'Microphone' : 'System default';
+  const opt = Array.from(els.audioInput.options).find((o) => o.value === (id || ''));
+  if (opt && opt.textContent && opt.textContent.trim()) return opt.textContent.trim();
+  return id ? 'Microphone' : 'System default';
+}
+
+function paintTabChipDevices(session) {
+  if (!session.tabDevicesEl) return;
+  const cfg = session.config || {};
+  const inputInfo = describeSessionInput(session);
+  const outputInfo = describeSessionOutput(session);
+  const hideOutput = cfg.mode === 'transcribe' || cfg.mode === 'text';
+  session.tabDevicesEl.dataset.mode = cfg.mode || 'audio';
+  if (session.tabDevIn) {
+    const ico = session.tabDevIn.querySelector('.tab-dev-ico');
+    const name = session.tabDevIn.querySelector('.tab-dev-name');
+    if (ico) ico.textContent = inputInfo.icon;
+    if (name) name.textContent = inputInfo.short;
+    session.tabDevIn.title = inputInfo.full;
+  }
+  if (session.tabDevOut) {
+    const ico = session.tabDevOut.querySelector('.tab-dev-ico');
+    const name = session.tabDevOut.querySelector('.tab-dev-name');
+    if (ico) ico.textContent = outputInfo.icon;
+    if (name) name.textContent = outputInfo.short;
+    session.tabDevOut.title = outputInfo.full;
+    session.tabDevOut.style.display = hideOutput ? 'none' : '';
+  }
+  const sep = session.tabDevicesEl.querySelector('.tab-dev-sep');
+  if (sep) sep.style.display = hideOutput ? 'none' : '';
+}
+
+// Sync the session header strip (title + turn count). Lives separately from
+// the chip so the strip is decoupled from the tablist's responsibilities.
+function refreshSessionHeader(session) {
+  if (!session.headerEl) return;
+  const cfg = session.config || {};
+  const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
+  const title = `${langName(cfg.source)} ${sym} ${langName(cfg.target)}`;
+  if (session.headerTitleEl) session.headerTitleEl.textContent = title;
+  if (session.headerSubEl) {
+    const liveActive = !!(session.liveTurn &&
+      ((session.liveTurn.inputText && session.liveTurn.inputText.trim()) ||
+       (session.liveTurn.outputText && session.liveTurn.outputText.trim())));
+    const n = (session.history ? session.history.length : 0) + (liveActive ? 1 : 0);
+    session.headerSubEl.textContent = n === 0 ? 'No turns yet' : `${n} turn${n === 1 ? '' : 's'}`;
+  }
+}
+
+function refreshAllTabChipDevices() {
+  if (!state || !state.sessions) return;
+  for (const session of state.sessions.values()) paintTabChipDevices(session);
 }
 
 function renderSessionEmptyState(session) {
@@ -1369,6 +1561,8 @@ function setActiveSession(id) {
       prev.transcriptEl.removeAttribute('aria-live');
       prev.transcriptEl.removeAttribute('aria-relevant');
     }
+    if (prev.panelEl) prev.panelEl.classList.remove('is-active');
+    if (prev.headerExportMenu) closeExportMenu(prev.headerExportMenu, prev.headerExportBtn);
   }
   state.activeSessionId = id;
   const next = state.sessions.get(id);
@@ -1384,6 +1578,8 @@ function setActiveSession(id) {
     next.transcriptEl.setAttribute('aria-live', 'polite');
     next.transcriptEl.setAttribute('aria-relevant', 'additions');
   }
+  if (next.panelEl) next.panelEl.classList.add('is-active');
+  refreshSessionHeader(next);
 
   loadSessionConfigIntoUI(next);
   refreshSessionDisplay(next);
@@ -1540,7 +1736,7 @@ async function closeSession(session) {
     session.micPassthrough = null;
   }
   if (session.tabEl) session.tabEl.remove();
-  if (session.transcriptEl) session.transcriptEl.remove();
+  if (session.panelEl) session.panelEl.remove();
   state.sessions.delete(session.id);
   // Closing a session opens a visible slot — surface the next archived
   // session if there is one. They're FIFO: the first archived entry is the
@@ -2133,6 +2329,7 @@ async function refreshCompanionApps({ silent = true } = {}) {
         : 'No app is playing sound. Start playback, then refresh ↻.';
     }
     if (!silent) log('info', `Companion: found ${apps.length} app${apps.length === 1 ? '' : 's'} with active audio.`);
+    refreshAllTabChipDevices();
   } catch (e) {
     if (!silent) log('warn', 'Could not list companion apps: ' + (e && e.message ? e.message : e));
     if (els.companionAppHint) {
@@ -2681,6 +2878,7 @@ async function refreshAudioInputDevices() {
       els.audioInputHint.textContent = 'No microphones found.';
     }
     savePrefs();
+    refreshAllTabChipDevices();
   } catch (e) {
     els.audioInput.disabled = true;
     els.audioInputHint.textContent = 'Couldn\'t read your microphones.';
@@ -2747,6 +2945,7 @@ async function refreshAudioOutputDevices() {
     }
     savePrefs();
     refreshActiveDeviceIndicators();
+    refreshAllTabChipDevices();
   } catch (e) {
     setOutputDeviceListDisabled(true);
     els.audioOutputHint.textContent = 'Couldn\'t read your speakers.';
@@ -3549,6 +3748,7 @@ function finalizeTurn(session) {
     scheduleSaveSessions();
   }
   session.liveTurn = null;
+  refreshSessionHeader(session);
 }
 
 // Per-session level → meter-fill width. Same sqrt curve as before, just
@@ -4148,8 +4348,8 @@ function topmostOpenSheet() {
   return last;
 }
 
-function clearConversation() {
-  const session = activeSession();
+function clearConversation(session) {
+  if (!session) session = activeSession();
   if (!session) return;
   // No confirmation when there's nothing to lose — empty state is the only
   // child, so clearing is a visual no-op anyway.
@@ -4166,7 +4366,8 @@ function clearConversation() {
     session.transcriptEl.innerHTML = '';
     renderSessionEmptyState(session);
   }
-  if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
+  if (state.pip && isActive(session)) { state.pip.setInput(''); state.pip.setOutput(''); }
+  refreshSessionHeader(session);
   saveSessions();
 }
 
@@ -4200,30 +4401,52 @@ function conversationTurns(session) {
   return out;
 }
 
-// Export popup menu controls. The two format buttons (JSON / Text) used to
-// sit side-by-side eating real estate in the actions row; collapsing them
-// behind one Export button keeps the row scannable. The menu is dismissed
-// by outside-click (document-level listener installed in wireUI) and by
-// pressing Escape (global keydown handler in wireUI).
-function isExportMenuOpen() {
-  return !!(els.exportMenu && !els.exportMenu.hasAttribute('hidden'));
+// Export popup menus live per-session in the session header strip. The
+// menu groups "this session" and "all sessions" exports. Each menu is keyed
+// off its own (menu, trigger) pair so multiple chips can co-exist without
+// clobbering each other's open state. Outside-click and Escape close any
+// open menu (handlers in wireUI).
+function isExportMenuOpen(menuEl) {
+  return !!(menuEl && !menuEl.hasAttribute('hidden'));
 }
-function openExportMenu() {
-  if (!els.exportMenu || !els.btnExport) return;
-  els.exportMenu.removeAttribute('hidden');
-  els.btnExport.setAttribute('aria-expanded', 'true');
-  // Move focus to the first menu item so keyboard users land somewhere usable.
-  const firstItem = els.exportMenu.querySelector('.export-item');
+function openExportMenu(menuEl, triggerEl) {
+  if (!menuEl) return;
+  closeAllExportMenus(menuEl);
+  menuEl.removeAttribute('hidden');
+  if (triggerEl) triggerEl.setAttribute('aria-expanded', 'true');
+  const firstItem = menuEl.querySelector('.export-item');
   if (firstItem) firstItem.focus();
 }
-function closeExportMenu() {
-  if (!els.exportMenu || !els.btnExport) return;
-  if (!isExportMenuOpen()) return;
-  els.exportMenu.setAttribute('hidden', '');
-  els.btnExport.setAttribute('aria-expanded', 'false');
+function closeExportMenu(menuEl, triggerEl) {
+  if (!menuEl) return;
+  if (!isExportMenuOpen(menuEl)) return;
+  menuEl.setAttribute('hidden', '');
+  if (triggerEl) triggerEl.setAttribute('aria-expanded', 'false');
 }
-function toggleExportMenu() {
-  if (isExportMenuOpen()) closeExportMenu(); else openExportMenu();
+function toggleExportMenu(menuEl, triggerEl) {
+  if (isExportMenuOpen(menuEl)) closeExportMenu(menuEl, triggerEl);
+  else openExportMenu(menuEl, triggerEl);
+}
+function closeAllExportMenus(exceptEl) {
+  if (!state || !state.sessions) return;
+  for (const s of state.sessions.values()) {
+    if (!s.headerExportMenu || s.headerExportMenu === exceptEl) continue;
+    closeExportMenu(s.headerExportMenu, s.headerExportBtn);
+  }
+}
+function anyExportMenuOpen() {
+  if (!state || !state.sessions) return false;
+  for (const s of state.sessions.values()) {
+    if (isExportMenuOpen(s.headerExportMenu)) return true;
+  }
+  return false;
+}
+function findOpenExportMenu() {
+  if (!state || !state.sessions) return null;
+  for (const s of state.sessions.values()) {
+    if (isExportMenuOpen(s.headerExportMenu)) return s;
+  }
+  return null;
 }
 
 function downloadText(filename, text, type) {
@@ -4279,19 +4502,43 @@ function exportTimeline(entries) {
     });
 }
 
-function exportConversation(format) {
-  const sessions = exportableSessionEntries();
-  if (sessions.length === 0) {
-    log('warn', 'Nothing to export for any session.');
-    return;
+function exportConversation(format, opts) {
+  const scope = (opts && opts.scope === 'all') ? 'all' : 'session';
+  let sessions;
+  if (scope === 'session') {
+    const targetSession = (opts && opts.session) || activeSession();
+    if (!targetSession) {
+      log('warn', 'No session selected to export.');
+      return;
+    }
+    const turns = conversationTurns(targetSession);
+    if (turns.length === 0) {
+      log('warn', 'Nothing to export for this session.');
+      return;
+    }
+    sessions = [{ index: 1, session: targetSession, turns }];
+  } else {
+    sessions = exportableSessionEntries();
+    if (sessions.length === 0) {
+      log('warn', 'Nothing to export for any session.');
+      return;
+    }
   }
   const turns = exportTimeline(sessions);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const base = `live-translator-all-sessions-${stamp}`;
+  let base;
+  if (scope === 'session') {
+    const cfg = sessions[0].session.config || {};
+    const pair = `${(cfg.source || '').toLowerCase()}-${(cfg.target || '').toLowerCase()}`;
+    base = `live-translator-${pair}-${stamp}`;
+  } else {
+    base = `live-translator-all-sessions-${stamp}`;
+  }
   const exportedAt = new Date();
   if (format === 'json') {
     downloadText(base + '.json', JSON.stringify({
       exportedAt: exportedAt.toISOString(),
+      scope,
       sessionCount: sessions.length,
       sessions: sessions.map((entry) => ({
         index: entry.index,
@@ -4306,11 +4553,12 @@ function exportConversation(format) {
   } else {
     const lines = [
       'Live Translator export',
+      `Scope: ${scope === 'session' ? 'single session' : 'all sessions'}`,
       `Sessions: ${sessions.length}`,
       `Exported: ${exportedAt.toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''} - Session ${t.sessionIndex} - ${langName(t.source)} -> ${langName(t.target)}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}${scope === 'all' ? ` - Session ${t.sessionIndex}` : ''} - ${langName(t.source)} -> ${langName(t.target)}`,
         `${langName(t.source)}: ${t.input || '(empty)'}`,
         t.mode === 'transcribe' ? '' : `${langName(t.target)}: ${t.output || '(empty)'}`,
         '',
@@ -4318,7 +4566,11 @@ function exportConversation(format) {
     ];
     downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
   }
-  log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
+  if (scope === 'session') {
+    log('info', `Exported session as ${format.toUpperCase()}.`);
+  } else {
+    log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
+  }
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
@@ -4497,24 +4749,9 @@ function wireUI() {
     if (session) state.ttsCoordinator.hush(session);
     log('info', 'Playback silenced');
   });
-  els.btnClear.addEventListener('click', clearConversation);
-  // Export now goes through a single button with a popup menu. The Export
-  // button toggles the menu; the menu items run the export AND close the
-  // menu. Outside-click + Escape (handled in the global keydown listener
-  // below) dismiss without exporting.
-  if (els.btnExport && els.exportMenu) {
-    els.btnExport.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      toggleExportMenu();
-    });
-    els.exportMenu.addEventListener('click', (ev) => {
-      // Stop propagation so the document-level close listener doesn't
-      // immediately dismiss the menu after a menuitem click.
-      ev.stopPropagation();
-    });
-  }
-  els.btnExportJson.addEventListener('click', () => { closeExportMenu(); exportConversation('json'); });
-  els.btnExportText.addEventListener('click', () => { closeExportMenu(); exportConversation('text'); });
+  // Per-session Clear / Export live in each session header strip and are
+  // wired in createSessionDOM. The previous sidebar Actions buttons were
+  // removed in favour of those — see CLAUDE.md plan note.
   els.btnSwap.addEventListener('click', () => {
     const a = els.langSource.value;
     els.langSource.value = els.langTarget.value;
@@ -4814,13 +5051,13 @@ function wireUI() {
   // Generic sheet close handlers. Prompt-sheet additionally guards against
   // discarding unsaved edits — see confirmDiscardPromptEdits.
   document.addEventListener('click', (ev) => {
-    // Any click outside the export-menu / its trigger dismisses it. The
-    // menu's own click handler stopPropagation()s to avoid this firing on
-    // menuitem clicks (we want those to run the export AND close).
-    if (isExportMenuOpen()) {
-      const insideMenu = els.exportMenu && els.exportMenu.contains(ev.target);
-      const onTrigger = els.btnExport && els.btnExport.contains(ev.target);
-      if (!insideMenu && !onTrigger) closeExportMenu();
+    // Any click outside an open per-session export menu / its trigger
+    // dismisses it. Each menu's own click handler stopPropagation()s to
+    // avoid this firing on menuitem clicks (we want those to run the export
+    // AND close).
+    if (anyExportMenuOpen()) {
+      const inWrap = ev.target.closest && ev.target.closest('.session-export-wrap');
+      if (!inWrap) closeAllExportMenus();
     }
     const tgt = ev.target.closest('[data-close]');
     if (!tgt) return;
@@ -4836,10 +5073,11 @@ function wireUI() {
     // Export menu wins over sheets when both are open — it's the most
     // recently-opened transient UI and closing it first matches user intent
     // (and matches how native menus stack with dialogs).
-    if (isExportMenuOpen()) {
+    const openOwner = findOpenExportMenu();
+    if (openOwner) {
       ev.preventDefault();
-      closeExportMenu();
-      if (els.btnExport) els.btnExport.focus();
+      closeExportMenu(openOwner.headerExportMenu, openOwner.headerExportBtn);
+      if (openOwner.headerExportBtn) openOwner.headerExportBtn.focus();
       return;
     }
     // Close only the topmost open modal so layered sheets (e.g. Log opened
