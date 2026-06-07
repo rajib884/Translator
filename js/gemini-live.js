@@ -145,7 +145,7 @@ class GeminiLiveClient {
     // audio replay) and only fall back to the hard deadline if no handle
     // arrives in time.
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     // Set true the first time `turnComplete` fires after a GoAway lands.
     // The handle-close trigger only fires after this arms (so we close at a
     // clean turn boundary), unless the deadline is closing in (<5s left), in
@@ -176,7 +176,7 @@ class GeminiLiveClient {
   _renewNow(reason) {
     if (!this._goAwayPending) return;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog('info', `Renewing now (reason=${reason})`);
     if (this.ws) {
@@ -203,7 +203,7 @@ class GeminiLiveClient {
     this._setupComplete = false;
     this._reconnectAttempts = 0;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     this._turnCompleteSinceGoAway = false;
     this._setSwitching(false);
     this._setState('idle');
@@ -407,7 +407,7 @@ class GeminiLiveClient {
         //     server doesn't get stuck in a "between generationComplete and
         //     turnComplete" state that it can't re-emit on resume.
         if (this._goAwayPending) {
-          const remainingMs = this._goAwayDeadlineMs - Date.now();
+          const remainingMs = this.goAwayDeadlineMs - Date.now();
           if (remainingMs < 5000) {
             this._renewNow('handle-urgent');
           } else if (this._turnCompleteSinceGoAway) {
@@ -429,8 +429,8 @@ class GeminiLiveClient {
       // GoAway arrives with more time, prefer the *later* deadline (the
       // server is extending our grace period). Never shrink it.
       const newDeadline = Date.now() + Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
-      const deadline = Math.max(this._goAwayDeadlineMs || 0, newDeadline);
-      this._goAwayDeadlineMs = deadline;
+      const deadline = Math.max(this.goAwayDeadlineMs || 0, newDeadline);
+      this.goAwayDeadlineMs = deadline;
       // Reset on each fresh GoAway: we want a turnComplete *after* this
       // moment, not one that fired before the GoAway landed.
       const wasPending = this._goAwayPending;
@@ -501,7 +501,7 @@ class GeminiLiveClient {
     const closedBeforeSetup = !this._setupComplete;
     this._setupComplete = false;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     this._turnCompleteSinceGoAway = false;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog(ev.code === 1000 ? 'info' : 'warn',

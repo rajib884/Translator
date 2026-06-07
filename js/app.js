@@ -301,6 +301,15 @@ class Session {
     // Full finalized turn history kept in memory so the export captures
     // everything — the DOM only retains MAX_TURNS for performance.
     this.history = []; // [{ input, output, finalizedAt }]
+    // Last value of history.length at the time of a successful per-session
+    // (or "all sessions") export. Used by closeSession to warn when the user
+    // is about to throw away turns that were never downloaded.
+    this.exportedTurnCount = 0;
+    // Scroll-to-bottom lock. When true, every appended chunk forces scrollTop
+    // to the bottom (see flushPending). Scrolling away from the bottom in the
+    // transcript flips this off; scrolling back flips it on. Persisted per
+    // session so the user's choice survives reloads.
+    this.followLatest = true;
 
     // DOM owned by this session.
     this.tabEl = null;             // .tab-chip
@@ -947,6 +956,44 @@ function isActive(session) {
   return !!session && session.id === state.activeSessionId;
 }
 
+// Single point of truth for the follow-latest lock. Flips session.followLatest,
+// repaints the header button (class + title + aria-pressed), optionally snaps
+// the transcript to the bottom (skip with opts.skipScroll when we're already
+// there — eg. auto-relock from the scroll listener), and persists. Caller is
+// free to invoke it with the current value as a no-op refresh of the visuals.
+function setFollowLatest(session, on, opts = {}) {
+  if (!session) return;
+  on = !!on;
+  const changed = session.followLatest !== on;
+  session.followLatest = on;
+  if (session.headerLockBtn) {
+    session.headerLockBtn.classList.toggle('is-following', on);
+    session.headerLockBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    session.headerLockBtn.title = on
+      ? 'Following latest (click to pause)'
+      : 'Paused — not following (click to resume)';
+  }
+  if (on && !opts.skipScroll && session.transcriptEl) {
+    session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+  }
+  if (changed) saveSessions();
+}
+
+// True iff the session has finalized turns past the last export point, or an
+// in-progress live turn with text. Used by closeSession to warn before
+// throwing away content that was never downloaded.
+function sessionHasUnsavedTranscript(session) {
+  if (!session) return false;
+  const histCount = session.history ? session.history.length : 0;
+  const lt = session.liveTurn;
+  const liveText = !!(lt && (
+    (lt.inputText && lt.inputText.trim()) ||
+    (lt.outputText && lt.outputText.trim())
+  ));
+  if (histCount === 0 && !liveText) return false;
+  return histCount > (session.exportedTurnCount || 0) || liveText;
+}
+
 function readConfigFromUI() {
   return {
     source: els.langSource.value,
@@ -1051,8 +1098,23 @@ function createSessionDOM(session) {
     '<div class="session-header-meta">' +
       '<span class="session-header-title"></span>' +
       '<span class="session-header-sub"></span>' +
+      '<div class="session-header-devices" aria-hidden="true">' +
+        '<span class="hdr-dev hdr-dev-in">' +
+          '<span class="hdr-dev-ico"></span>' +
+          '<span class="hdr-dev-name"></span>' +
+        '</span>' +
+        '<span class="hdr-dev-sep">→</span>' +
+        '<span class="hdr-dev hdr-dev-out">' +
+          '<span class="hdr-dev-ico"></span>' +
+          '<span class="hdr-dev-name"></span>' +
+        '</span>' +
+      '</div>' +
     '</div>' +
     '<div class="session-header-actions">' +
+      '<button class="btn ghost session-lock" type="button" aria-pressed="true" aria-label="Toggle follow latest" title="Following latest (click to pause)">' +
+        '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>' +
+        '<span class="btn-tx">Follow</span>' +
+      '</button>' +
       '<button class="btn ghost session-clear" type="button" title="Clear this session\'s conversation" aria-label="Clear chat">' +
         '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>' +
         '<span class="btn-tx">Clear</span>' +
@@ -1092,6 +1154,14 @@ function createSessionDOM(session) {
   session.headerClearBtn  = header.querySelector('.session-clear');
   session.headerExportBtn = header.querySelector('.session-export');
   session.headerExportMenu = header.querySelector('.export-menu');
+  session.headerDevicesEl = header.querySelector('.session-header-devices');
+  session.headerDevIn     = header.querySelector('.hdr-dev-in');
+  session.headerDevOut    = header.querySelector('.hdr-dev-out');
+  session.headerLockBtn   = header.querySelector('.session-lock');
+
+  session.headerLockBtn.addEventListener('click', () => {
+    setFollowLatest(session, !session.followLatest);
+  });
 
   session.headerClearBtn.addEventListener('click', () => clearConversation(session));
   session.headerExportBtn.addEventListener('click', (ev) => {
@@ -1120,6 +1190,44 @@ function createSessionDOM(session) {
   turns.setAttribute('tabindex', '0');
   panel.appendChild(turns);
   session.transcriptEl = turns;
+
+  // Floating "jump to latest" button — only visible when the user has
+  // scrolled away from the bottom of this session's transcript. Clicking
+  // re-engages the implicit auto-scroll (flushPending re-evaluates the
+  // at-bottom threshold on every chunk, so scrolling to bottom is enough).
+  const scrollBtn = document.createElement('button');
+  scrollBtn.className = 'scroll-bottom-btn';
+  scrollBtn.type = 'button';
+  scrollBtn.title = 'Scroll to latest';
+  scrollBtn.setAttribute('aria-label', 'Scroll to latest');
+  scrollBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+  scrollBtn.addEventListener('click', () => { turns.scrollTop = turns.scrollHeight; });
+  panel.appendChild(scrollBtn);
+  session.scrollBottomBtn = scrollBtn;
+
+  // One scroll handler drives three things:
+  //   1. Floating "↓" pill visibility (delta >= 64).
+  //   2. Auto-unlock the follow-latest lock when the user scrolls away
+  //      (delta >= 24). Tolerance is intentionally tighter than the pill
+  //      threshold so even small reads-backward pause the autoscroll.
+  //   3. Auto-relock when the user returns to the bottom (delta < 8). The
+  //      gap between 8 and 24 prevents thrash at the boundary.
+  const refreshScrollStuck = () => {
+    const delta = turns.scrollHeight - turns.scrollTop - turns.clientHeight;
+    panel.dataset.scrollStuck = delta >= 64 ? 'true' : 'false';
+    if (session.followLatest && delta >= 24) {
+      setFollowLatest(session, false, { skipScroll: true });
+    } else if (!session.followLatest && delta < 8) {
+      setFollowLatest(session, true, { skipScroll: true });
+    }
+  };
+  turns.addEventListener('scroll', refreshScrollStuck, { passive: true });
+  session.refreshScrollStuck = refreshScrollStuck;
+
+  // Paint initial lock visuals (class + title + aria-pressed) without
+  // scrolling — the activation path already scrolls to bottom.
+  setFollowLatest(session, session.followLatest, { skipScroll: true });
+
   renderSessionEmptyState(session);
   refreshSessionHeader(session);
 }
@@ -1199,29 +1307,51 @@ function micLabelFor(id) {
 }
 
 function paintTabChipDevices(session) {
-  if (!session.tabDevicesEl) return;
   const cfg = session.config || {};
   const inputInfo = describeSessionInput(session);
   const outputInfo = describeSessionOutput(session);
   const hideOutput = cfg.mode === 'transcribe' || cfg.mode === 'text';
-  session.tabDevicesEl.dataset.mode = cfg.mode || 'audio';
-  if (session.tabDevIn) {
-    const ico = session.tabDevIn.querySelector('.tab-dev-ico');
-    const name = session.tabDevIn.querySelector('.tab-dev-name');
-    if (ico) ico.textContent = inputInfo.icon;
-    if (name) name.textContent = inputInfo.short;
-    session.tabDevIn.title = inputInfo.full;
+  if (session.tabDevicesEl) {
+    session.tabDevicesEl.dataset.mode = cfg.mode || 'audio';
+    if (session.tabDevIn) {
+      const ico = session.tabDevIn.querySelector('.tab-dev-ico');
+      const name = session.tabDevIn.querySelector('.tab-dev-name');
+      if (ico) ico.textContent = inputInfo.icon;
+      if (name) name.textContent = inputInfo.short;
+      session.tabDevIn.title = inputInfo.full;
+    }
+    if (session.tabDevOut) {
+      const ico = session.tabDevOut.querySelector('.tab-dev-ico');
+      const name = session.tabDevOut.querySelector('.tab-dev-name');
+      if (ico) ico.textContent = outputInfo.icon;
+      if (name) name.textContent = outputInfo.short;
+      session.tabDevOut.title = outputInfo.full;
+      session.tabDevOut.style.display = hideOutput ? 'none' : '';
+    }
+    const sep = session.tabDevicesEl.querySelector('.tab-dev-sep');
+    if (sep) sep.style.display = hideOutput ? 'none' : '';
   }
-  if (session.tabDevOut) {
-    const ico = session.tabDevOut.querySelector('.tab-dev-ico');
-    const name = session.tabDevOut.querySelector('.tab-dev-name');
-    if (ico) ico.textContent = outputInfo.icon;
-    if (name) name.textContent = outputInfo.short;
-    session.tabDevOut.title = outputInfo.full;
-    session.tabDevOut.style.display = hideOutput ? 'none' : '';
+  // Mobile mirror inside the panel header — CSS controls visibility.
+  if (session.headerDevicesEl) {
+    session.headerDevicesEl.dataset.mode = cfg.mode || 'audio';
+    if (session.headerDevIn) {
+      const ico = session.headerDevIn.querySelector('.hdr-dev-ico');
+      const name = session.headerDevIn.querySelector('.hdr-dev-name');
+      if (ico) ico.textContent = inputInfo.icon;
+      if (name) name.textContent = inputInfo.short;
+      session.headerDevIn.title = inputInfo.full;
+    }
+    if (session.headerDevOut) {
+      const ico = session.headerDevOut.querySelector('.hdr-dev-ico');
+      const name = session.headerDevOut.querySelector('.hdr-dev-name');
+      if (ico) ico.textContent = outputInfo.icon;
+      if (name) name.textContent = outputInfo.short;
+      session.headerDevOut.title = outputInfo.full;
+      session.headerDevOut.style.display = hideOutput ? 'none' : '';
+    }
+    const sep = session.headerDevicesEl.querySelector('.hdr-dev-sep');
+    if (sep) sep.style.display = hideOutput ? 'none' : '';
   }
-  const sep = session.tabDevicesEl.querySelector('.tab-dev-sep');
-  if (sep) sep.style.display = hideOutput ? 'none' : '';
 }
 
 // Sync the session header strip (title + turn count). Lives separately from
@@ -1727,10 +1857,27 @@ function createNewSession({ activate = true } = {}) {
 
 async function closeSession(session) {
   if (!session) return;
-  if (session.running) {
-    if (!window.confirm('This session is running. Stop it and remove?')) return;
-    await stopSession(session);
+  const running = !!session.running;
+  const unsaved = sessionHasUnsavedTranscript(session);
+  if (running || unsaved) {
+    let title, message, confirmLabel;
+    if (running && unsaved) {
+      title = 'Stop and close without saving?';
+      message = 'This session is running and has translated turns that haven\'t been downloaded. Stop and close anyway?';
+      confirmLabel = 'Stop & discard';
+    } else if (running) {
+      title = 'Stop running session?';
+      message = 'This session is running. Stop it and remove?';
+      confirmLabel = 'Stop & remove';
+    } else {
+      title = 'Close without saving?';
+      message = 'This session has translated turns that haven\'t been downloaded. Close anyway?';
+      confirmLabel = 'Discard & close';
+    }
+    const ok = await showConfirm({ title, message, confirmLabel, confirmStyle: 'danger' });
+    if (!ok) return;
   }
+  if (session.running) await stopSession(session);
   if (session.micPassthrough) {
     try { await session.micPassthrough.stop(); } catch (_) {}
     session.micPassthrough = null;
@@ -1819,6 +1966,12 @@ function maybePromoteArchivedSession() {
         finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
       }));
   }
+  session.exportedTurnCount = Number.isFinite(entry.exportedTurnCount)
+    ? entry.exportedTurnCount
+    : session.history.length;
+  session.followLatest = typeof entry.followLatest === 'boolean'
+    ? entry.followLatest
+    : true;
   state.sessions.set(session.id, session);
   createSessionDOM(session);
   renderSessionHistory(session);
@@ -1894,6 +2047,8 @@ function saveSessions() {
       config: s.config,
       resumeHandle: s.resumeHandle || null,
       history: (s.history || []).slice(-MAX_PERSISTED_HISTORY),
+      exportedTurnCount: s.exportedTurnCount || 0,
+      followLatest: s.followLatest !== false,
     }));
     // Append archivedSessions (extras we hid at restore time) so they're
     // preserved across writes. They never become active sessions in this
@@ -1995,6 +2150,17 @@ function restoreSessionsFromStorage() {
           finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
         }));
     }
+    // Legacy saves don't carry exportedTurnCount — grandfather them as
+    // "already accounted for" so the close-warning only fires for new turns
+    // recorded after the upgrade.
+    session.exportedTurnCount = Number.isFinite(entry.exportedTurnCount)
+      ? entry.exportedTurnCount
+      : session.history.length;
+    // Follow-latest defaults to true (matches new-session default + previous
+    // implicit "always at bottom on restore" behavior).
+    session.followLatest = typeof entry.followLatest === 'boolean'
+      ? entry.followLatest
+      : true;
     state.sessions.set(session.id, session);
     createSessionDOM(session);
     renderSessionHistory(session);
@@ -3387,6 +3553,10 @@ function effectiveStatus(session) {
 function setSessionStatus(session, s) {
   session.status = s;
   refreshSessionDisplay(session);
+  // Renew's enabled state depends on ws.readyState, which only flips alongside
+  // these status transitions — keep the button in sync here so we don't have
+  // to hook every WS open/close site.
+  if (isActive(session)) applyControlButtonsForActiveSession();
 }
 
 // Repaint everything tied to a session's state — chip dot/text, topbar pill
@@ -3422,10 +3592,47 @@ function fmtDuration(ms) {
   return hh > 0 ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+// When a GoAway is pending, surface the countdown to the renewal deadline in
+// the chip's timer slot and on the Renew button so the user sees the limit
+// approaching. During the brief close+reconnect tail (deadline cleared but
+// switching flag still raised), fall back to "Renewing" — there's no
+// countdown to show and the session is genuinely between WS sockets.
+function renewLabelFor(session) {
+  if (!session || !session.switching) return null;
+  const deadline = session.client && session.client.goAwayDeadlineMs;
+  if (deadline && deadline > Date.now()) {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    return `Renew in ${left}s`;
+  }
+  return 'Renewing';
+}
+
 function sessionAgeText(session) {
   if (!session || !session.running) return '00:00';
-  if (session.switching) return 'Switching';
+  const renew = renewLabelFor(session);
+  if (renew) return renew;
   return session.startedAt ? fmtDuration(Date.now() - session.startedAt) : '00:00';
+}
+
+// Refreshes the Renew button's enabled state + label. Disabled unless an
+// active session has an OPEN ws. Label shows the countdown / "Renewing"
+// during a GoAway window, otherwise "Renew". Called from both
+// applyControlButtonsForActiveSession (state transitions) and paintSessionAge
+// (1Hz countdown tick).
+function applyRenewButtonForActiveSession() {
+  const btn = els.btnForceReset;
+  if (!btn) return;
+  const session = activeSession();
+  const label = btn.querySelector('.btn-tx');
+  const renewMsg = session && session.running ? renewLabelFor(session) : null;
+  if (label) label.textContent = renewMsg || 'Renew';
+  if (renewMsg && session && session.client && session.client.goAwayDeadlineMs > Date.now()) {
+    btn.title = `Auto-${renewMsg.toLowerCase()} — click to renew now`;
+  } else {
+    btn.title = 'Reconnect with a fresh context';
+  }
+  const ws = session && session.client && session.client.ws;
+  btn.disabled = !(session && session.running && ws && ws.readyState === WebSocket.OPEN);
 }
 
 function paintSessionAge(session) {
@@ -3437,6 +3644,10 @@ function paintSessionAge(session) {
     session.tabAgeEl.textContent = txt;
     session.tabAgeEl.classList.toggle('is-switching', isSwitching);
   }
+  // Mirror the countdown onto the Renew button each tick so "Renew in Ns"
+  // decrements in lockstep with the chip's age slot. Only the active
+  // session's switching state can be reflected on the single global button.
+  if (isSwitching && isActive(session)) applyRenewButtonForActiveSession();
 }
 
 // One global 1Hz tick that paints the age of every running session. Previously
@@ -3516,12 +3727,12 @@ function flushPending(session) {
   const t = ensureLiveTurn(session);
   if (!t) return;
 
-  // Decide BEFORE mutating: if the user has scrolled up to read earlier turns,
-  // don't yank them back to the bottom on every new chunk. 64 px tolerance
-  // covers "I'm at the bottom" including sub-pixel positions from native
-  // smooth scrolling or a partial last line.
+  // Whether to autoscroll is now strictly driven by session.followLatest (the
+  // lock). The scroll listener auto-unlocks the moment the user scrolls away,
+  // so by the time we get here followLatest is already false if the user is
+  // reading backward — we just have to honor it.
   const el = session.transcriptEl;
-  const autoScroll = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 64);
+  const autoScroll = !!session.followLatest;
 
   if (session.pendingInput) {
     if (t.inputText === '') {
@@ -3552,6 +3763,11 @@ function flushPending(session) {
   if (el && autoScroll) {
     el.scrollTop = el.scrollHeight;
   }
+  // scrollHeight just grew — re-evaluate the stuck flag so the jump-to-latest
+  // button surfaces the first time the transcript exceeds the viewport while
+  // the user is reading older turns. The scroll event from autoscroll would
+  // refresh this too, but only if autoScroll was true.
+  if (session.refreshScrollStuck) session.refreshScrollStuck();
 }
 
 function formatTurnTimestamp(ts, { includeDate = false } = {}) {
@@ -3808,6 +4024,7 @@ function applyControlButtonsForActiveSession() {
     els.btnPause.title = 'Pause mic';
     els.btnPause.setAttribute('aria-label', 'Pause mic');
     els.btnPause.setAttribute('aria-pressed', 'false');
+    applyRenewButtonForActiveSession();
     setControlsLocked(false);
     if (state.pip) state.pip.setRunning(false, false, true);
     refreshPttButtonState();
@@ -3818,6 +4035,9 @@ function applyControlButtonsForActiveSession() {
   setStartStopRunning(!!session.running);
   els.btnHush.disabled = !session.running || !session.isAudio;
   els.btnPause.disabled = !session.running;
+  // Renew button: enable/disable + label (countdown / "Renewing" / "Renew").
+  // See applyRenewButtonForActiveSession for the full rules.
+  applyRenewButtonForActiveSession();
   els.btnPause.classList.toggle('is-paused', !!session.paused);
   els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
   // Keep aria-label and aria-pressed in sync so SR users hear the right state.
@@ -4348,7 +4568,7 @@ function topmostOpenSheet() {
   return last;
 }
 
-function clearConversation(session) {
+async function clearConversation(session) {
   if (!session) session = activeSession();
   if (!session) return;
   // No confirmation when there's nothing to lose — empty state is the only
@@ -4356,10 +4576,18 @@ function clearConversation(session) {
   const turnCount = session.transcriptEl
     ? session.transcriptEl.querySelectorAll(':scope > .turn').length
     : 0;
-  if ((turnCount > 0 || session.history.length > 0) &&
-      !window.confirm('Clear this session\'s conversation?')) return;
+  if (turnCount > 0 || session.history.length > 0) {
+    const ok = await showConfirm({
+      title: 'Clear conversation?',
+      message: 'Clear this session\'s conversation? This cannot be undone.',
+      confirmLabel: 'Clear',
+      confirmStyle: 'danger',
+    });
+    if (!ok) return;
+  }
   session.liveTurn = null;
   session.history = [];
+  session.exportedTurnCount = 0;
   session.pendingInput = '';
   session.pendingOutput = '';
   if (session.transcriptEl) {
@@ -4566,6 +4794,13 @@ function exportConversation(format, opts) {
     ];
     downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
   }
+  // Mark covered sessions as "downloaded up to here" so closeSession doesn't
+  // warn about throwing them away. We use history.length (not turns.length),
+  // since turns may include the live partial — which will keep growing.
+  for (const entry of sessions) {
+    entry.session.exportedTurnCount = entry.session.history.length;
+  }
+  saveSessions();
   if (scope === 'session') {
     log('info', `Exported session as ${format.toUpperCase()}.`);
   } else {
@@ -4614,11 +4849,20 @@ function resetPromptEditor() {
   log('info', 'System prompt reset to default for the current mode.');
 }
 
-// Confirm-then-close wrapper used by the close × and the backdrop. Returns
-// true if the close should proceed; false to abort.
-function confirmDiscardPromptEdits() {
-  if (!isPromptEditorDirty()) return true;
-  return window.confirm('Discard unsaved system prompt edits?');
+// Confirm-then-close wrapper used by the close × / backdrop / Escape paths.
+// If there are no unsaved edits, closes immediately. Otherwise opens the
+// in-app confirm sheet on top of the prompt sheet and closes the prompt sheet
+// only if the user confirms discard. Callers should fire-and-forget — the
+// dialog stack handles ordering.
+async function tryClosePromptSheet() {
+  if (!isPromptEditorDirty()) { closeSheet('prompt-sheet'); return; }
+  const ok = await showConfirm({
+    title: 'Discard edits?',
+    message: 'You have unsaved changes to the system prompt. Discard them?',
+    confirmLabel: 'Discard',
+    confirmStyle: 'danger',
+  });
+  if (ok) closeSheet('prompt-sheet');
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
@@ -5049,7 +5293,7 @@ function wireUI() {
   }
 
   // Generic sheet close handlers. Prompt-sheet additionally guards against
-  // discarding unsaved edits — see confirmDiscardPromptEdits.
+  // discarding unsaved edits — see tryClosePromptSheet.
   document.addEventListener('click', (ev) => {
     // Any click outside an open per-session export menu / its trigger
     // dismisses it. Each menu's own click handler stopPropagation()s to
@@ -5062,7 +5306,7 @@ function wireUI() {
     const tgt = ev.target.closest('[data-close]');
     if (!tgt) return;
     const id = tgt.getAttribute('data-close');
-    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) return;
+    if (id === 'prompt-sheet') { tryClosePromptSheet(); return; }
     // Confirm dialog: dismissal (× / backdrop) is "cancel". settleConfirm
     // closes the sheet, so don't double-close.
     if (id === 'confirm-sheet') { settleConfirm(false); return; }
@@ -5084,8 +5328,9 @@ function wireUI() {
     // from inside Settings) close one at a time, matching native dialog UX.
     const id = topmostOpenSheet();
     if (!id) return;
-    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) {
+    if (id === 'prompt-sheet') {
       ev.preventDefault();
+      tryClosePromptSheet();
       return;
     }
     if (id === 'confirm-sheet') {
