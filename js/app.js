@@ -856,7 +856,10 @@ function fullOnlySettingsAtDefault() {
 function basicResetIsNoOp() {
   if (!fullOnlySettingsAtDefault()) return false;
   if ((els.audioSource.value || 'mic') !== 'mic') return false;
-  if (els.audioInput.value !== '') return false;
+  // Check dataset.preferred too: while the chosen mic is missing from the
+  // option list the select shows (and reads) '', but the preference is still
+  // live and would survive the skipped reset.
+  if (els.audioInput.value !== '' || (els.audioInput.dataset.preferred || '') !== '') return false;
   if (els.speechMode.value !== 'auto') return false;
   if (els.vadPreset.value !== DEFAULT_VAD_PRESET) return false;
   const outIds = getSelectedOutputDeviceIds();
@@ -1003,7 +1006,12 @@ function readConfigFromUI() {
     dir:    els.dirSelect.value,
     vad:    currentVadConfig(),
     audioSource:    els.audioSource.value || 'mic',
-    micDeviceId:    els.audioInput.value || '',
+    // value falls back to dataset.preferred so a config snapshot taken while
+    // the chosen mic is missing from the option list (pre-permission, slow
+    // USB enumeration) doesn't silently downgrade the session to the default
+    // mic. Every explicit selection keeps the two in sync, so an intentional
+    // "System default" ('' in both) still reads as ''.
+    micDeviceId:    els.audioInput.value || els.audioInput.dataset.preferred || '',
     outputDeviceIds: getSelectedOutputDeviceIds(),
     // Per-session passthrough sinks. Empty array = passthrough disabled
     // for this session. Persists across the session's start/stop cycles.
@@ -1773,8 +1781,12 @@ function loadSessionConfigIntoUI(session) {
   // can take a moment to enumerate). Without this, an async refresh after a
   // tab switch would reset the dropdown to the global pref rather than the
   // active session's preference.
-  els.audioInput.value = cfg.micDeviceId;
-  els.audioInput.dataset.preferred = cfg.micDeviceId;
+  // selectOptionByValue (not `.value = X`): when the session's mic isn't in
+  // the option list yet, direct assignment leaves the select with no option
+  // selected (blank box) — this falls back to showing "System default" while
+  // dataset.preferred keeps the real id for the next device refresh.
+  selectOptionByValue(els.audioInput, cfg.micDeviceId || '');
+  els.audioInput.dataset.preferred = cfg.micDeviceId || '';
   const outIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   cfg.outputDeviceIds = outIds;
   setSelectedOutputDeviceIds(outIds);
@@ -2187,9 +2199,13 @@ function savePrefs() {
       source: els.langSource.value,
       target: els.langTarget.value,
       voice:  els.voice.value,
-      input:  els.audioInput.value,
+      // dataset.preferred carries the user's intent even while the device is
+      // missing from the option list (pre-permission enumeration, slow USB
+      // re-enumeration). Persist that, not the momentary fallback value —
+      // otherwise a reload before the mic grant erases the saved choice.
+      input:  els.audioInput.value || els.audioInput.dataset.preferred || '',
       audio:  els.audioSource.value,
-      outputs: getSelectedOutputDeviceIds(),
+      outputs: preferredOutputDeviceIdsForPrefs(),
       passthroughDeviceIds: getPassthroughDeviceIds(),
       mode:   els.modeSelect.value,
       dir:    els.dirSelect.value,
@@ -2528,7 +2544,10 @@ function fillLanguages() {
   els.langTarget.value  = prefs.target || 'zh';
   els.voice.value       = prefs.voice  || 'Zephyr';
   els.audioInput.dataset.preferred = prefs.input || '';
-  els.audioInput.value  = prefs.input  || '';
+  // The option list only holds the "System default" placeholder this early;
+  // selectOptionByValue keeps it visibly selected instead of a blank select
+  // when prefs.input names a device that hasn't been enumerated yet.
+  selectOptionByValue(els.audioInput, prefs.input || '');
   els.audioSource.value = prefs.audio  || 'mic';
   const prefOutIds = normalizeOutputDeviceIds(prefs.outputs, prefs.output);
   els.audioOutput.dataset.preferred = JSON.stringify(prefOutIds);
@@ -2638,6 +2657,20 @@ function isOutputDeviceListDisabled() {
 
 // Reads what's currently ticked. Empty array means "none selected", which
 // downstream we treat as "system default" so a session never goes silent.
+// What savePrefs persists for TTS outputs. dataset.preferred carries the
+// user's intent even while the chosen sinks are missing from the checkbox
+// list (pre-permission enumeration); the live checkbox state in that window
+// is just the auto-ticked System default fallback and must not overwrite the
+// stored preference. Every explicit toggle syncs preferred, so this matches
+// the live state whenever the list is authoritative.
+function preferredOutputDeviceIdsForPrefs() {
+  try {
+    const p = JSON.parse((els.audioOutput && els.audioOutput.dataset.preferred) || 'null');
+    if (Array.isArray(p)) return p;
+  } catch (_) {}
+  return getSelectedOutputDeviceIds();
+}
+
 function getSelectedOutputDeviceIds() {
   if (!els.audioOutput) return [];
   return Array.from(els.audioOutput.querySelectorAll('input.dev-tts:checked'))
@@ -3033,7 +3066,12 @@ async function refreshAudioInputDevices() {
     // report when a stored deviceId vanishes between sessions.
     const target = seen.has(selected) ? selected : '';
     selectOptionByValue(els.audioInput, target);
-    els.audioInput.dataset.preferred = target;
+    // Pre-permission, browsers enumerate inputs with empty deviceIds — such a
+    // list can't confirm that a saved device is gone. Keep the wanted id in
+    // dataset.preferred so the first authoritative refresh (post-grant)
+    // restores it; only an enumeration with real ids may prune it.
+    const authoritative = inputs.some((d) => d.deviceId);
+    els.audioInput.dataset.preferred = authoritative ? target : selected;
 
     if (inputs.length) {
       const hasLabels = inputs.some((d) => d.label);
@@ -3046,7 +3084,10 @@ async function refreshAudioInputDevices() {
     savePrefs();
     refreshAllTabChipDevices();
   } catch (e) {
-    els.audioInput.disabled = true;
+    // Keep the dropdown enabled: disabling here would make the guard at the
+    // top of this function skip every future refresh, permanently bricking
+    // device selection after one transient enumeration failure. The existing
+    // options stay usable and the next devicechange retries.
     els.audioInputHint.textContent = 'Couldn\'t read your microphones.';
     log('warn', 'Microphone devices unavailable: ' + (e && e.message ? e.message : e));
   }
@@ -3099,7 +3140,12 @@ async function refreshAudioOutputDevices() {
     // that at least one TTS sink is always ticked — if everything got pruned,
     // or the user previously saved an empty selection, System default wins.
     ensureAtLeastOneOutputTicked();
-    els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
+    // Same rule as the input dropdown: a pre-permission enumeration (empty
+    // deviceIds) can't confirm a saved sink is gone, so it must not prune
+    // dataset.preferred — the post-grant refresh restores the selection.
+    if (outputs.some((d) => d.deviceId)) {
+      els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
+    }
 
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
@@ -3113,7 +3159,9 @@ async function refreshAudioOutputDevices() {
     refreshActiveDeviceIndicators();
     refreshAllTabChipDevices();
   } catch (e) {
-    setOutputDeviceListDisabled(true);
+    // Don't disable the list here — the guard at the top of this function
+    // skips refreshes while disabled, so one transient enumeration failure
+    // would brick output selection for the rest of the page's life.
     els.audioOutputHint.textContent = 'Couldn\'t read your speakers.';
     log('warn', 'Audio output devices unavailable: ' + (e && e.message ? e.message : e));
   }
