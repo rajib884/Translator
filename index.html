@@ -315,9 +315,6 @@
 
         <section class="section actions">
           <h3 class="section-title actions-title">View</h3>
-          <button id="btn-pip" class="btn ghost" type="button" title="Open a floating window for this session">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>Pop out
-          </button>
           <button id="btn-log" class="btn ghost advanced-only" type="button" title="Open the debug log">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Debug Log
           </button>
@@ -375,6 +372,9 @@
             aria-label="Push to talk">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span><span class="btn-tx">Speak</span>
     </button>
+    <!-- DEPRECATED: mic pause + silence buttons retired. Keeping markup commented
+         in case the feature comes back; JS references in app.js are also commented. -->
+    <!--
     <button id="btn-pause" class="icon-btn full-only" type="button" disabled
             title="Pause mic" aria-label="Pause mic" aria-pressed="false">
       <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
@@ -383,14 +383,16 @@
     <button id="btn-hush" class="btn warn full-only" type="button" disabled title="Silence the current reply">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></span><span class="btn-tx">Silence</span>
     </button>
+    -->
     <button id="btn-force-reset" class="btn ghost advanced-only" type="button"
             title="Reconnect with a fresh context"
             aria-label="Force reconnect">
       <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></span><span class="btn-tx">Renew</span>
     </button>
-    <button id="btn-pip-quick" class="icon-btn quick advanced-only" type="button"
-            title="Pop out" aria-label="Pop out current translation">
-      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg>
+    <button id="btn-pip-quick" class="btn ghost advanced-only" type="button"
+            title="Open a floating overlay window for this session"
+            aria-label="Open overlay window">
+      <span class="btn-ic" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h12v12h-6M9 3v6"/><rect x="3" y="9" width="12" height="12" rx="1"/></svg></span><span class="btn-tx">Overlay</span>
     </button>
   </footer>
 

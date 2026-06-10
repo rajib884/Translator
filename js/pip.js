@@ -461,6 +461,8 @@ class PipController {
                     type="button" title="Close settings" aria-label="Close settings">×</button>
           </div>
           <div class="pip-settings-body">
+            <!-- DEPRECATED: mic pause + silence row retired. -->
+            <!--
             <div class="pip-field">
               <div class="pip-field-label">Mic</div>
               <div class="pip-row-actions">
@@ -468,6 +470,7 @@ class PipController {
                 <button class="pip-btn warn flex" id="pipBtnHush" type="button" disabled>Silence</button>
               </div>
             </div>
+            -->
 
             <div class="pip-field">
               <div class="pip-field-label">Show</div>
@@ -512,8 +515,10 @@ class PipController {
     this.settingsPanelEl = doc.getElementById('pipSettingsPanel');
     this.settingsBackdropEl = doc.getElementById('pipSettingsBackdrop');
     const btnSettingsCloseEl = doc.getElementById('pipBtnSettingsClose');
-    this.btnPauseEl = doc.getElementById('pipBtnPause');
-    this.btnHushEl = doc.getElementById('pipBtnHush');
+    // DEPRECATED: mic pause + silence buttons retired (HTML commented above).
+    // Refs left assignable so other call sites' if-guards still no-op cleanly.
+    this.btnPauseEl = null; // doc.getElementById('pipBtnPause');
+    this.btnHushEl = null;  // doc.getElementById('pipBtnHush');
     this.btnClearEl = doc.getElementById('pipBtnClear');
     this.btnForceResetEl = doc.getElementById('pipBtnForceReset');
     this.displaySegEl = doc.getElementById('pipDisplaySeg');
@@ -539,8 +544,9 @@ class PipController {
     this.settingsBackdropEl.addEventListener('click', () => this.closeSettingsPanel());
 
     // ─── Settings-panel actions ────────────────────────────────────────
-    this.btnPauseEl.addEventListener('click', () => this.onPause());
-    this.btnHushEl.addEventListener('click', () => this.onHush());
+    // DEPRECATED: mic pause + silence buttons retired.
+    // this.btnPauseEl.addEventListener('click', () => this.onPause());
+    // this.btnHushEl.addEventListener('click', () => this.onHush());
     this.btnClearEl.addEventListener('click', () => this.onClear());
 
     this.displaySegEl.addEventListener('click', (ev) => {

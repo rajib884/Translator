@@ -230,15 +230,15 @@ const els = {
   btnSwap:       $('btn-swap'),
   btnStart:      $('btn-start'),
   btnStop:       $('btn-stop'),
-  btnHush:       $('btn-hush'),
-  btnPause:      $('btn-pause'),
+  // DEPRECATED: mic pause + silence buttons retired (HTML commented out in index.html).
+  // btnHush:       $('btn-hush'),
+  // btnPause:      $('btn-pause'),
   btnPtt:        $('btn-ptt'),
   // Per-session Clear / Export live in each session header strip (built in
   // createSessionDOM). No global els.* lookups for those buttons.
   btnMenu:       $('btn-menu'),
   btnLog:        $('btn-log'),
   btnForceReset: $('btn-force-reset'),
-  btnPip:        $('btn-pip'),
   btnPipQuick:   $('btn-pip-quick'),
   btnEditPrompt: $('btn-edit-prompt'),
   btnSavePrompt: $('btn-save-prompt'),
@@ -4018,12 +4018,13 @@ function applyControlButtonsForActiveSession() {
     els.btnStart.disabled = true;
     els.btnStop.disabled = true;
     setStartStopRunning(false);
-    els.btnHush.disabled = true;
-    els.btnPause.disabled = true;
-    els.btnPause.classList.remove('is-paused');
-    els.btnPause.title = 'Pause mic';
-    els.btnPause.setAttribute('aria-label', 'Pause mic');
-    els.btnPause.setAttribute('aria-pressed', 'false');
+    // DEPRECATED: mic pause + silence buttons retired.
+    // els.btnHush.disabled = true;
+    // els.btnPause.disabled = true;
+    // els.btnPause.classList.remove('is-paused');
+    // els.btnPause.title = 'Pause mic';
+    // els.btnPause.setAttribute('aria-label', 'Pause mic');
+    // els.btnPause.setAttribute('aria-pressed', 'false');
     applyRenewButtonForActiveSession();
     setControlsLocked(false);
     if (state.pip) state.pip.setRunning(false, false, true);
@@ -4033,16 +4034,17 @@ function applyControlButtonsForActiveSession() {
   els.btnStart.disabled = session.running;
   els.btnStop.disabled = !session.running;
   setStartStopRunning(!!session.running);
-  els.btnHush.disabled = !session.running || !session.isAudio;
-  els.btnPause.disabled = !session.running;
+  // DEPRECATED: mic pause + silence buttons retired.
+  // els.btnHush.disabled = !session.running || !session.isAudio;
+  // els.btnPause.disabled = !session.running;
   // Renew button: enable/disable + label (countdown / "Renewing" / "Renew").
   // See applyRenewButtonForActiveSession for the full rules.
   applyRenewButtonForActiveSession();
-  els.btnPause.classList.toggle('is-paused', !!session.paused);
-  els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  // els.btnPause.classList.toggle('is-paused', !!session.paused);
+  // els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
   // Keep aria-label and aria-pressed in sync so SR users hear the right state.
-  els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
-  els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
+  // els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
+  // els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
   setControlsLocked(session.running);
   // Mirror into PIP so its Start/Stop/Pause/Hush buttons stay in sync — eg.
   // when togglePause runs from the main control bar, the PIP's pause label
@@ -4153,7 +4155,7 @@ async function startSession(session) {
     els.btnStart.disabled = true;
     els.btnStop.disabled = false;
     setStartStopRunning(true);
-    els.btnHush.disabled = !isAudio;
+    // DEPRECATED: els.btnHush.disabled = !isAudio;
     setControlsLocked(true);
   }
 
@@ -4986,13 +4988,14 @@ function refreshPipSessionCount() {
 function wireUI() {
   els.btnStart.addEventListener('click', startPipeline);
   els.btnStop.addEventListener('click', stopPipeline);
-  els.btnPause.addEventListener('click', togglePause);
+  // DEPRECATED: mic pause + silence buttons retired.
+  // els.btnPause.addEventListener('click', togglePause);
   if (els.btnPtt) els.btnPtt.addEventListener('click', togglePtt);
-  els.btnHush.addEventListener('click', () => {
-    const session = activeSession();
-    if (session) state.ttsCoordinator.hush(session);
-    log('info', 'Playback silenced');
-  });
+  // els.btnHush.addEventListener('click', () => {
+  //   const session = activeSession();
+  //   if (session) state.ttsCoordinator.hush(session);
+  //   log('info', 'Playback silenced');
+  // });
   // Per-session Clear / Export live in each session header strip and are
   // wired in createSessionDOM. The previous sidebar Actions buttons were
   // removed in favour of those — see CLAUDE.md plan note.
@@ -5191,7 +5194,6 @@ function wireUI() {
   els.btnEditPrompt.addEventListener('click', openPromptEditor);
   els.btnSavePrompt.addEventListener('click', savePromptEditor);
   els.btnResetPrompt.addEventListener('click', resetPromptEditor);
-  els.btnPip.addEventListener('click', togglePip);
   els.btnPipQuick.addEventListener('click', togglePip);
 
   const okConfirm = $('btn-confirm-ok');
