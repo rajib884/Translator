@@ -752,6 +752,15 @@ class CompanionPassthrough {
     // the first one's `ready` event arrives.
     this._queue = Promise.resolve();
     this._closingByUs = false;
+    // Resolver for the configure() currently waiting on the companion's
+    // `ready` event. Only one can be pending at a time (configures are
+    // serialised through _queue).
+    this._readyWaiter = null;
+    // Reconnect-and-resend after an unexpected close (companion restart).
+    // Armed only while _lastSent holds an active routing config; same
+    // backoff shape as CompanionAudioCapture.
+    this._reconnectTimer = 0;
+    this._reconnectAttempts = 0;
   }
 
   // Apply a sink list + source descriptor. Idempotent against the last sent
@@ -812,11 +821,36 @@ class CompanionPassthrough {
       this.ws.send(JSON.stringify(payload));
     } catch (_) {
       this.warnings = [{ deviceId: '', reason: 'companion passthrough send failed' }];
+      return;
     }
+    // Wait for the companion's `ready` reply so callers reading .warnings /
+    // .activeSinkIds after configure() see the result of *this* configure,
+    // not whatever the previous one left behind.
+    await this._waitReady(3000);
+  }
+
+  _waitReady(timeoutMs) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve) => {
+      this._readyWaiter = resolve;
+      setTimeout(() => {
+        if (this._readyWaiter === resolve) this._readyWaiter = null;
+        resolve();
+      }, timeoutMs);
+    });
+  }
+
+  _settleReady() {
+    const w = this._readyWaiter;
+    this._readyWaiter = null;
+    if (w) w();
   }
 
   async stop({ keepAttachments = false } = {}) {
     void keepAttachments;  // accepted for call-site parity with the prior API
+    // Cancel before draining the queue — a reconnect that fires mid-stop
+    // would otherwise re-queue a configure and reopen the socket.
+    this._cancelReconnect();
     await this._queue.catch(() => {});
     await this._closeWs();
     this._lastSent = null;
@@ -861,14 +895,21 @@ class CompanionPassthrough {
       const ws = new WebSocket(this.wsUrl);
       this.ws = ws;
       this._closingByUs = false;
-      ws.onopen = () => { if (!done) { done = true; resolve(); } };
+      ws.onopen = () => {
+        this._reconnectAttempts = 0;
+        if (!done) { done = true; resolve(); }
+      };
       ws.onerror = () => { if (!done) { done = true; resolve(); } };
       ws.onclose = () => {
         if (this.ws === ws) this.ws = null;
+        this._settleReady();
         if (!this._closingByUs) {
           this.running = false;
           this.activeSinkIds = [];
           this.onLevel(0);
+          // Companion went away while we had active routing — reconnect and
+          // re-send the last config once it's back.
+          if (this._lastSent) this._scheduleReconnect();
         }
         if (!done) { done = true; resolve(); }
       };
@@ -880,6 +921,7 @@ class CompanionPassthrough {
             this.activeSinkIds = Array.isArray(msg.sinks) ? msg.sinks : [];
             this.warnings = Array.isArray(msg.warnings) ? msg.warnings : [];
             this.running = this.activeSinkIds.length > 0;
+            this._settleReady();
           } else if (msg.event === 'error') {
             this.warnings = [{ deviceId: '', reason: msg.message || 'companion passthrough error' }];
           }
@@ -889,9 +931,42 @@ class CompanionPassthrough {
     });
   }
 
+  _scheduleReconnect() {
+    if (this._reconnectTimer || this._closingByUs || !this._lastSent) return;
+    this._reconnectAttempts++;
+    const base = Math.min(10000, 500 * Math.pow(2, this._reconnectAttempts - 1));
+    const jitter = base * 0.2;
+    const delay = Math.max(250, base - jitter + Math.random() * jitter * 2);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = 0;
+      const last = this._lastSent;
+      if (!last || this._closingByUs) return;
+      // Re-issue through the configure queue. The idempotence check can't
+      // swallow the resend: it requires an OPEN socket, and ours is gone.
+      this.configure(last.sinks, {
+        micId: last.micId,
+        micLabel: last.micLabel,
+        pid: last.pid,
+        loopback: last.loopback,
+      }).then(() => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this._scheduleReconnect();
+      }).catch(() => this._scheduleReconnect());
+    }, delay);
+  }
+
+  _cancelReconnect() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = 0;
+    }
+    this._reconnectAttempts = 0;
+  }
+
   async _closeWs() {
+    this._cancelReconnect();
     if (!this.ws) return;
     this._closingByUs = true;
+    this._settleReady();
     try { this.ws.close(1000); } catch (_) {}
     this.ws = null;
   }

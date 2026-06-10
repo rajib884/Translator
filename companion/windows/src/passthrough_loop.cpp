@@ -104,7 +104,8 @@ void passthrough_session_loop(SOCKET sock) {
            payload.data(),
            payload.size() > 120 ? "..." : "");
     }
-    session.emit_level_if_due();
+    // Level events are driven solely by the session's level thread;
+    // emitting from here too would race on lastLevelAt.
   }
 
   dlog("pt ws loop: shutting down session");

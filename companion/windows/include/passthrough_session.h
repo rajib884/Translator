@@ -37,8 +37,9 @@ class PassthroughSession {
   // Browser → companion: closes the socket cleanly.
   void close_socket();
 
-  // Drive a periodic level event (peak across all sinks). Called by the
-  // session's WS handler thread between reads.
+  // Drive a periodic level event (peak across all sinks). Called only by the
+  // session's level thread — lastLevelAt is not synchronized, so don't add
+  // callers on other threads.
   void emit_level_if_due();
 
   void send_event_ready(const std::vector<std::string>& warnings,
@@ -74,15 +75,16 @@ class PassthroughSession {
   void loopback_source_thread();
   void sink_render_thread(PtSink* sink);
 
-  // Distribute n stereo frames into every active sink. startFrame is the
-  // source's monotonic frame counter (each source has its own — close enough
-  // for passthrough use).
-  void distribute(uint64_t startFrame, const float* L, const float* R, size_t n);
+  // Distribute n stereo frames into every active sink. srcIdx is the ring
+  // source slot (kPtSrcMic / kPtSrcLoopback); startFrame is the source's own
+  // monotonic frame counter — each sink's ring maps it into its frame domain
+  // and rebases on dislocation (see PtRing::mixFrom).
+  void distribute(int srcIdx, uint64_t startFrame, const float* L, const float* R, size_t n);
 
   // Wrap distribute() with bracketing dlog() lines tagged with `who` ("mic
-  // source" / "loopback source") so a crash inside ring.mixIn (or inside
+  // source" / "loopback source") so a crash inside ring.mixFrom (or inside
   // sinksMu acquisition) leaves a breadcrumb trail in the log.
-  void distribute_logged(const char* who, uint64_t startFrame,
+  void distribute_logged(const char* who, int srcIdx, uint64_t startFrame,
                          const float* L, const float* R, size_t n, bool verbose);
 
   void update_peak(float p);
