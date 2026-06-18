@@ -1104,29 +1104,53 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
   animation: live-pulse 1.6s ease-out infinite;
 }
 
-/* Mic preview meter + toggle button. The meter only takes layout when the
-   user clicks "Preview" — otherwise it stays display:none and the panel
-   doesn't reserve vertical space for it. */
-.mic-preview-meter {
-  display: none;
+/* Multi-mic preview list + toggle button. One clickable row per microphone
+   with a live level bar along its bottom edge (same --pt-level overlay trick
+   as the passthrough rows). [hidden] keeps it out of layout until the user
+   clicks Preview, so the panel doesn't reserve vertical space for it. */
+.mic-preview-list {
   margin: 6px 0 0;
-  height: 8px;
   background: var(--bg-3);
   border: 1px solid var(--line);
   border-radius: 4px;
   overflow: hidden;
 }
-.mic-preview-meter.is-active { display: block; }
-.mic-preview-fill {
-  height: 100%; width: 0%;
-  background: linear-gradient(90deg,
-    var(--accent) 0%,
-    var(--accent) 65%,
-    var(--warn)  85%,
-    var(--bad)   100%);
-  transition: width 0.06s linear;
-  will-change: width;
+.mic-preview-row {
+  position: relative;
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 8px 10px 10px;
+  background: none; border: 0;
+  font: inherit; color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  touch-action: manipulation;
 }
+.mic-preview-row:not(:last-child) { border-bottom: 1px solid var(--line); }
+.mic-preview-row:hover,
+.mic-preview-row:active { background: var(--bg-2); }
+.mic-preview-row.is-selected {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.mic-preview-row.is-unavailable { color: var(--fg-2); cursor: default; }
+.mic-preview-note {
+  flex-shrink: 0;
+  font-size: 0.78em;
+  color: var(--fg-2);
+}
+/* Live level bar driven by the --mic-level variable set from JS at rAF rate. */
+.mic-preview-row::after {
+  content: '';
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 3px;
+  background: linear-gradient(to right,
+    var(--accent) 0%,
+    var(--accent) calc(var(--mic-level, 0%) - 1px),
+    transparent calc(var(--mic-level, 0%)),
+    transparent 100%);
+}
+.mic-preview-row.is-unavailable::after { display: none; }
 #btn-mic-preview { flex-shrink: 0; }
 #btn-mic-preview.is-active {
   background: color-mix(in srgb, var(--accent) 18%, var(--bg-2));

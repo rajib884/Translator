@@ -988,37 +988,41 @@ function sameStrArr(a, b) {
 // All in-tree call sites use CompanionPassthrough directly.
 const MicPassthrough = CompanionPassthrough;
 
-// Ephemeral mic-preview meter for the settings panel. Opens a short-lived
-// getUserMedia stream (and own AudioContext), pushes levels to onLevel until
-// stop() or the auto-close timer fires. Decoupled from any session — when the
-// user starts an actual session the preview is torn down so the OS doesn't
-// keep two mic indicators alive.
+// Ephemeral multi-mic preview for the settings panel. Opens a short-lived
+// getUserMedia stream per microphone (one shared AudioContext), and pushes
+// per-device levels to onLevel(deviceId, level) until stop() or the
+// auto-close timer fires. Decoupled from any session — when the user starts
+// an actual session the preview is torn down so the OS doesn't keep extra
+// mic indicators alive.
 class InputPreview {
-  constructor({ onLevel, onAutoStop, autoStopMs = 10000 } = {}) {
+  constructor({ onLevel, onDeviceError, onAutoStop, autoStopMs = 10000 } = {}) {
     this.onLevel = onLevel || (() => {});
+    // Called once per device that failed to open (mic held exclusively by
+    // another app, mobile single-capture limits). The rest keep metering.
+    this.onDeviceError = onDeviceError || (() => {});
     this.onAutoStop = onAutoStop || (() => {});
     this.autoStopMs = autoStopMs;
-    this.stream = null;
     this.ctx = null;
-    this.src = null;
-    this.analyser = null;
-    this._buf = null;
+    // One tap per opened mic: { deviceId, stream, src, analyser, buf, level }.
+    this._taps = [];
     this._rafId = 0;
     this._stopTimer = 0;
     this.running = false;
-    // Serialises start/stop against rapid dropdown changes. Without this, two
-    // concurrent start() calls can interleave: stream A from call 1 is still
-    // resolving when call 2 starts; call 2 overwrites this.stream/ctx/src
-    // before call 1 finishes, leaving stream A's MediaStream and AudioContext
+    // Serialises start/stop against rapid clicks. Without this, two
+    // concurrent start() calls can interleave: streams from call 1 are still
+    // resolving when call 2 starts; call 2 overwrites this._taps/ctx before
+    // call 1 finishes, leaving call 1's MediaStreams and AudioContext
     // unreleased (OS mic indicator stays on, contexts leak). Same pattern
     // TTSPlayer uses for _applyDevicesQueue.
     this._queue = Promise.resolve();
   }
 
-  start(micDeviceId) {
+  // devices: [{ deviceId, label }] — concrete microphone ids (no '' default
+  // alias; the caller lists real devices so each row is unambiguous).
+  start(devices) {
     const next = this._queue
       .catch(() => {})                     // a previous failure must not poison the chain
-      .then(() => this._doStart(micDeviceId));
+      .then(() => this._doStart(devices));
     this._queue = next;
     return next;
   }
@@ -1031,51 +1035,65 @@ class InputPreview {
     return next;
   }
 
-  async _doStart(micDeviceId) {
+  async _doStart(devices) {
     await this._doStop();
+    const list = (devices || []).filter((d) => d && d.deviceId);
+    if (list.length === 0) throw new Error('No microphones to preview.');
     const baseAudio = {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
       channelCount: 1,
     };
-    try {
-      const audio = { ...baseAudio };
-      if (micDeviceId) audio.deviceId = { exact: micDeviceId };
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio });
-    } catch (e) {
-      // Fallback to default mic if the requested deviceId isn't available
-      // anymore (device unplugged between selection and preview).
-      if (!micDeviceId) throw e;
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
-    }
+    // Open every mic in parallel; one held-open or unplugged device must not
+    // sink the whole preview.
+    const results = await Promise.allSettled(list.map((d) =>
+      navigator.mediaDevices.getUserMedia({
+        audio: { ...baseAudio, deviceId: { exact: d.deviceId } },
+      })));
+    const opened = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') {
+        opened.push({ deviceId: list[i].deviceId, stream: r.value });
+      } else {
+        this.onDeviceError(list[i].deviceId,
+          (r.reason && r.reason.message) || 'unavailable');
+      }
+    });
+    if (opened.length === 0) throw new Error('No microphone could be opened.');
 
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
-    this.src = this.ctx.createMediaStreamSource(this.stream);
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-    this.analyser.smoothingTimeConstant = 0;
-    this._buf = new Float32Array(this.analyser.fftSize);
-    this.src.connect(this.analyser);
+    for (const o of opened) {
+      const src = this.ctx.createMediaStreamSource(o.stream);
+      const analyser = this.ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0;
+      src.connect(analyser);
+      this._taps.push({
+        deviceId: o.deviceId, stream: o.stream, src, analyser,
+        buf: new Float32Array(analyser.fftSize), level: 0,
+      });
+    }
 
     this.running = true;
-    let level = 0;
     let last = performance.now();
     const tick = () => {
       if (!this.running) return;
       const now = performance.now();
       const dt = Math.max(0, (now - last) / 1000);
       last = now;
-      this.analyser.getFloatTimeDomainData(this._buf);
-      let peak = 0;
-      for (let i = 0; i < this._buf.length; i++) {
-        const a = this._buf[i] < 0 ? -this._buf[i] : this._buf[i];
-        if (a > peak) peak = a;
+      for (const tap of this._taps) {
+        tap.analyser.getFloatTimeDomainData(tap.buf);
+        let peak = 0;
+        for (let i = 0; i < tap.buf.length; i++) {
+          const a = tap.buf[i] < 0 ? -tap.buf[i] : tap.buf[i];
+          if (a > peak) peak = a;
+        }
+        if (peak > tap.level) tap.level = peak;
+        else tap.level *= Math.exp(-dt / 0.1);
+        this.onLevel(tap.deviceId, tap.level);
       }
-      if (peak > level) level = peak;
-      else level *= Math.exp(-dt / 0.1);
-      this.onLevel(level);
       this._rafId = requestAnimationFrame(tick);
     };
     this._rafId = requestAnimationFrame(tick);
@@ -1096,19 +1114,17 @@ class InputPreview {
     this.running = false;
     if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = 0; }
     if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
-    try { this.src && this.src.disconnect(); } catch (_) {}
-    this.src = null;
-    this.analyser = null;
-    this._buf = null;
-    if (this.stream) {
-      this.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
-      this.stream = null;
+    const taps = this._taps;
+    this._taps = [];
+    for (const tap of taps) {
+      try { tap.src.disconnect(); } catch (_) {}
+      tap.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
     }
     if (this.ctx) {
       try { await this.ctx.close(); } catch (_) {}
       this.ctx = null;
     }
-    if (wasRunning) this.onLevel(0);
+    if (wasRunning) for (const tap of taps) this.onLevel(tap.deviceId, 0);
   }
 }
 

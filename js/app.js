@@ -195,8 +195,7 @@ const els = {
   audioInputHint:$('audio-input-hint'),
   audioInputLive:$('audio-input-live'),
   btnMicPreview:    $('btn-mic-preview'),
-  micPreviewMeter:  $('mic-preview-meter'),
-  micPreviewFill:   $('mic-preview-fill'),
+  micPreviewList:   $('mic-preview-list'),
   audioSource:   segProxy($('audio-source-segmented')),
   audioHint:     $('audio-source-hint'),
   companionApp:      $('companion-app'),
@@ -706,6 +705,9 @@ const state = {
   // Lazily allocated InputPreview for the settings panel's mic visualizer.
   // Stays null until the user clicks the preview button.
   inputPreview: null,
+  // deviceId → row element while the multi-mic preview list is showing;
+  // null otherwise. Owned by buildMicPreviewRows/setMicPreviewActive.
+  micPreviewRows: null,
   // Saved sessions that were over MAX_SESSIONS at restore time. Not loaded
   // into memory or rendered, but threaded through every saveSessions() write
   // so they're preserved verbatim — if MAX_SESSIONS is bumped up in a future
@@ -2861,20 +2863,85 @@ function describePassthroughOutput(id) {
 }
 
 // ─── Input device preview ────────────────────────────────────────────────────
-// Opens a short-lived mic stream just for the visualizer in the settings
-// panel. Auto-closes after ~10 s so we don't keep the OS mic indicator on
+// Opens a short-lived stream per microphone and lists every device with its
+// own live level row, so the user can spot the mic that's actually picking
+// them up without previewing devices one by one. Clicking a row selects that
+// mic. Auto-closes after ~10 s so we don't keep the OS mic indicators on
 // indefinitely when the user forgets to stop it.
 const MIC_PREVIEW_MS = 10000;
 
-function paintMicPreviewLevel(level) {
-  if (!els.micPreviewFill) return;
+function paintMicPreviewLevel(deviceId, level) {
+  if (!state.micPreviewRows || document.hidden) return;
+  const row = state.micPreviewRows.get(deviceId);
+  if (!row) return;
   // Same quantize/skip pattern as paintMeterFill — saves wasted DOM writes
   // when the level hasn't moved a whole percent.
-  if (document.hidden) return;
   const pct = levelToPct(level) | 0;
-  if (els.micPreviewFill._lastPct === pct) return;
-  els.micPreviewFill._lastPct = pct;
-  els.micPreviewFill.style.width = pct + '%';
+  if (row._lastPct === pct) return;
+  row._lastPct = pct;
+  row.style.setProperty('--mic-level', pct + '%');
+}
+
+// Best guess at which concrete deviceId the OS default resolves to, so its
+// row can carry a "default" tag. Sources, in priority order: the id captured
+// from a live capture's track settings, then the label the '' option was
+// enriched with ("System default (X)" / the browser's own "Default - X").
+function micPreviewDefaultId() {
+  if (state.resolvedMicDeviceId) return state.resolvedMicDeviceId;
+  const defOpt = Array.from(els.audioInput.options).find((o) => !o.value);
+  const text = (defOpt && defOpt.textContent) || '';
+  const m = text.match(/^System default \((.+)\)$/) || text.match(/^Default - (.+)$/);
+  if (!m) return '';
+  for (const opt of els.audioInput.options) {
+    if (opt.value && opt.textContent === m[1]) return opt.value;
+  }
+  return '';
+}
+
+// Build one clickable level row per concrete mic in the dropdown (the ''
+// System-default entry is an alias of one of them and is skipped). Returns
+// the device list for InputPreview.start.
+function buildMicPreviewRows() {
+  els.micPreviewList.innerHTML = '';
+  state.micPreviewRows = new Map();
+  const defaultId = micPreviewDefaultId();
+  const devices = [];
+  for (const opt of els.audioInput.options) {
+    if (!opt.value) continue;
+    devices.push({ deviceId: opt.value, label: opt.textContent || 'Microphone' });
+  }
+  for (const d of devices) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'mic-preview-row';
+    const name = document.createElement('span');
+    name.className = 'device-name';
+    name.textContent = d.label;
+    const note = document.createElement('span');
+    note.className = 'mic-preview-note';
+    if (d.deviceId === defaultId) note.textContent = 'default';
+    row.appendChild(name);
+    row.appendChild(note);
+    row.addEventListener('click', () => {
+      selectOptionByValue(els.audioInput, d.deviceId);
+      els.audioInput.dataset.preferred = d.deviceId;
+      changeAudioInput();
+    });
+    state.micPreviewRows.set(d.deviceId, row);
+    els.micPreviewList.appendChild(row);
+  }
+  refreshMicPreviewSelection();
+  return devices;
+}
+
+// Highlight the row matching the dropdown selection. Safe to call any time —
+// no-op while the preview isn't showing.
+function refreshMicPreviewSelection() {
+  if (!state.micPreviewRows) return;
+  const sel = els.audioInput.value || '';
+  for (const [id, row] of state.micPreviewRows) {
+    row.classList.toggle('is-selected', id === sel);
+  }
 }
 
 function setMicPreviewActive(active) {
@@ -2883,14 +2950,17 @@ function setMicPreviewActive(active) {
     els.btnMicPreview.setAttribute('aria-pressed', active ? 'true' : 'false');
     els.btnMicPreview.title = active
       ? 'Stop microphone preview'
-      : 'Preview microphone level (10s)';
+      : 'Preview all mic levels for 10s';
     els.btnMicPreview.setAttribute('aria-label',
-      active ? 'Stop microphone preview' : 'Preview microphone level');
+      active ? 'Stop microphone preview' : 'Preview all microphone levels');
   }
-  if (els.micPreviewMeter) {
-    els.micPreviewMeter.classList.toggle('is-active', !!active);
+  if (els.micPreviewList) {
+    els.micPreviewList.hidden = !active;
+    if (!active) {
+      els.micPreviewList.innerHTML = '';
+      state.micPreviewRows = null;
+    }
   }
-  if (!active) paintMicPreviewLevel(0);
 }
 
 async function stopMicPreview() {
@@ -2903,15 +2973,29 @@ async function stopMicPreview() {
 async function startMicPreview() {
   if (!state.inputPreview) {
     state.inputPreview = new LiveAudio.InputPreview({
-      onLevel: (l) => paintMicPreviewLevel(l),
+      onLevel: (id, l) => paintMicPreviewLevel(id, l),
+      onDeviceError: (id) => {
+        const row = state.micPreviewRows && state.micPreviewRows.get(id);
+        if (!row) return;
+        row.classList.add('is-unavailable');
+        const note = row.querySelector('.mic-preview-note');
+        if (note) note.textContent = 'unavailable';
+      },
       onAutoStop: () => setMicPreviewActive(false),
       autoStopMs: MIC_PREVIEW_MS,
     });
   }
-  const micId = els.audioInput ? els.audioInput.value || '' : '';
   try {
-    await state.inputPreview.start(micId);
+    // Opening one stream per mic needs concrete deviceIds; pre-grant the
+    // dropdown only has the System-default placeholder. Reuse the Detect
+    // button's one-shot grant + refresh to populate it first.
+    if (!Array.from(els.audioInput.options).some((o) => o.value)) {
+      await detectAudioDevices();
+    }
+    const devices = buildMicPreviewRows();
+    if (devices.length === 0) throw new Error('No microphones found.');
     setMicPreviewActive(true);
+    await state.inputPreview.start(devices);
   } catch (e) {
     setMicPreviewActive(false);
     log('warn', 'Mic preview failed: ' + (e && e.message ? e.message : e));
@@ -3510,12 +3594,9 @@ function createCompanionCapture(session) {
 async function changeAudioInput() {
   els.audioInput.dataset.preferred = els.audioInput.value;
   onSettingsChange();
-  // Keep the preview meter pointed at the user's current pick — restart it
-  // against the new device so the visualizer doesn't keep listening to the
-  // old one until the auto-stop timer fires.
-  if (state.inputPreview && state.inputPreview.running) {
-    startMicPreview();
-  }
+  // The multi-mic preview meters every device regardless of selection — just
+  // move its highlight to the new pick (no-op when the preview isn't open).
+  refreshMicPreviewSelection();
   const session = activeSession();
   if (!session || !session.running) return;
 

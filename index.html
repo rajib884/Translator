@@ -235,17 +235,18 @@
                   <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
                 </button>
                 <button id="btn-mic-preview" class="icon-btn small" type="button"
-                        aria-label="Preview microphone level"
+                        aria-label="Preview all microphone levels"
                         aria-pressed="false"
-                        title="Preview mic level for 10s">
+                        title="Preview all mic levels for 10s">
                   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                     <use href="#icon-mic"/>
                   </svg>
                 </button>
               </div>
-              <div class="mic-preview-meter" id="mic-preview-meter" aria-hidden="true">
-                <div class="mic-preview-fill" id="mic-preview-fill"></div>
-              </div>
+              <!-- Per-microphone level rows, built by startMicPreview() while a
+                   preview runs (same DOM-generated pattern as the output and
+                   passthrough device lists). Click a row to select that mic. -->
+              <div class="mic-preview-list" id="mic-preview-list" hidden></div>
               <p class="live-line" id="audio-input-live" aria-live="polite"></p>
               <p class="hint" id="audio-input-hint">Microphone used for speech input.</p>
             </div>
