@@ -76,7 +76,15 @@
 
         <section class="section">
           <h3 class="section-title">Languages</h3>
-          <div class="field-grid">
+          <div class="field">
+            <label>Engine</label>
+            <div class="segmented" id="engine-segmented" role="radiogroup" aria-label="Translation engine">
+              <button class="seg-opt is-active" data-value="live"      type="button" role="radio" aria-checked="true">Prompt</button>
+              <button class="seg-opt"           data-value="translate" type="button" role="radio" aria-checked="false">Live Translate</button>
+            </div>
+            <p class="hint" id="engine-hint">Prompt-based engine. Bidirectional, with text-only and transcribe modes.</p>
+          </div>
+          <div class="field-grid" id="lang-pair-field">
             <div class="field">
               <label for="lang-source">You speak</label>
               <select id="lang-source"></select>
@@ -92,12 +100,24 @@
               <select id="lang-target"></select>
             </div>
           </div>
-          <p class="hint">"You speak" is the language you'll say things in; "Translate to" is what Gemini speaks back. Tap the swap button to flip them.</p>
+          <p class="hint" id="lang-pair-hint">"You speak" is the language you'll say things in; "Translate to" is what Gemini speaks back. Tap the swap button to flip them.</p>
+          <div class="field" id="translate-target-field" style="display:none">
+            <label for="translate-target">Translate to</label>
+            <select id="translate-target"></select>
+            <p class="hint">The model auto-detects what you say and speaks this language back.</p>
+          </div>
+          <div class="field" id="echo-target-field" style="display:none">
+            <label class="checkbox-row">
+              <input type="checkbox" id="echo-target" />
+              <span>Echo speech already in the target language</span>
+            </label>
+            <p class="hint">On: repeats audio that's already in the target language. Off: stays silent when you're already speaking it.</p>
+          </div>
         </section>
 
-        <section class="section advanced-only full-only">
+        <section class="section advanced-only full-only" id="translation-section">
           <h3 class="section-title">Translation</h3>
-          <div class="field">
+          <div class="field" id="mode-field">
             <label>Mode</label>
             <div class="segmented" id="mode-segmented" role="radiogroup" aria-label="Translate mode">
               <button class="seg-opt is-active" data-value="audio"      type="button" role="radio" aria-checked="true">Translate (Voice)</button>
@@ -134,7 +154,7 @@
           </div>
         </section>
 
-        <section class="section advanced-only">
+        <section class="section advanced-only" id="speech-section">
           <h3 class="section-title">Speech detection</h3>
           <div class="field">
             <div class="segmented" id="speech-mode-segmented" role="radiogroup" aria-label="Speech detection">
@@ -294,7 +314,7 @@
           </div>
         </section>
 
-        <section class="section advanced-only full-only">
+        <section class="section advanced-only full-only" id="prompt-section">
           <button id="btn-edit-prompt" class="btn ghost full" type="button" title="Edit the system prompt sent to Gemini">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>Customise system prompt
           </button>

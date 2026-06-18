@@ -21,6 +21,53 @@ const LANGUAGES = [
   ['pt', 'Portuguese'],
 ];
 
+// Target languages for the Live Translation engine (gemini-3.5-live-translate).
+// These are BCP-47 codes from the model's supported list, which differ from the
+// short ISO codes in LANGUAGES above — Chinese is zh-Hans/zh-Hant (not zh) and
+// Portuguese is pt-BR/pt-PT (not pt) — so this engine needs its own list rather
+// than reusing LANGUAGES. The model auto-detects the source, so only a target
+// is ever selected. Curated subset of the ~70 supported languages.
+const TRANSLATE_LANGUAGES = [
+  ['en', 'English'],
+  ['es', 'Spanish'],
+  ['fr', 'French'],
+  ['de', 'German'],
+  ['it', 'Italian'],
+  ['pt-BR', 'Portuguese (Brazil)'],
+  ['pt-PT', 'Portuguese (Portugal)'],
+  ['nl', 'Dutch'],
+  ['pl', 'Polish'],
+  ['ru', 'Russian'],
+  ['uk', 'Ukrainian'],
+  ['tr', 'Turkish'],
+  ['ar', 'Arabic'],
+  ['he', 'Hebrew'],
+  ['fa', 'Persian'],
+  ['hi', 'Hindi'],
+  ['bn', 'Bengali'],
+  ['ur', 'Urdu'],
+  ['ta', 'Tamil'],
+  ['te', 'Telugu'],
+  ['ja', 'Japanese'],
+  ['ko', 'Korean'],
+  ['zh-Hans', 'Chinese (Simplified)'],
+  ['zh-Hant', 'Chinese (Traditional)'],
+  ['id', 'Indonesian'],
+  ['ms', 'Malay'],
+  ['vi', 'Vietnamese'],
+  ['th', 'Thai'],
+  ['sw', 'Swahili'],
+];
+const DEFAULT_TRANSLATE_TARGET = 'es';
+
+// The Live Translation engine streams continuously and never sends turnComplete,
+// so transcript turns are segmented client-side. Finalize after a pause in
+// transcription (a natural utterance boundary), and hard-cap the live turn's
+// duration so a gapless source (e.g. a media player) can't accumulate one
+// unbounded run-on turn that never persists.
+const CONTINUOUS_TURN_IDLE_MS = 1400;
+const CONTINUOUS_TURN_MAX_MS = 12000;
+
 const MAX_TURNS = 1000;
 const MAX_LOG = 200;
 // Multi-session is meant for the occasional power user juggling a couple of
@@ -188,8 +235,16 @@ function segProxy(seg) {
 const els = {
   apiKey:        $('api-key'),
   btnShowKey:    $('btn-show-key'),
+  engineSelect:  segProxy($('engine-segmented')),
+  engineHint:    $('engine-hint'),
   langSource:    $('lang-source'),
   langTarget:    $('lang-target'),
+  langPairField: $('lang-pair-field'),
+  langPairHint:  $('lang-pair-hint'),
+  translateTarget:      $('translate-target'),
+  translateTargetField: $('translate-target-field'),
+  echoTarget:           $('echo-target'),
+  echoTargetField:      $('echo-target-field'),
   voice:         $('voice'),
   audioInput:    $('audio-input'),
   audioInputHint:$('audio-input-hint'),
@@ -210,11 +265,15 @@ const els = {
   passthroughOutputSection: $('passthrough-output-section'),
   passthroughOutputHint: $('passthrough-output-hint'),
   btnDetectDevices: $('btn-detect-devices'),
+  translationSection: $('translation-section'),
+  modeField:     $('mode-field'),
   modeSelect:    segProxy($('mode-segmented')),
   modeHint:      $('mode-hint'),
   dirSelect:     segProxy($('dir-segmented')),
   dirField:      $('dir-field'),
   dirHint:       $('dir-hint'),
+  speechSection: $('speech-section'),
+  promptSection: $('prompt-section'),
   voiceSection:  $('voice-section'),
   micSection:    $('mic-section'),
   speechMode:    segProxy($('speech-mode-segmented')),
@@ -345,7 +404,9 @@ class Session {
     });
   }
 
-  get isAudio() { return this.config.mode === 'audio'; }
+  // The translate engine always speaks the translation, regardless of the
+  // (live-engine-only) mode field.
+  get isAudio() { return this.config.engine === 'translate' || this.config.mode === 'audio'; }
 }
 
 // ─── TTS coordinator ─────────────────────────────────────────────────────────
@@ -379,6 +440,13 @@ class TTSCoordinator {
       buffered: [],
       wantsToSpeak: false,
       turnComplete: false,
+      // The Live Translation engine streams continuously and never sends a
+      // turnComplete, so its "turn" ends when playback drains rather than on a
+      // turn signal. Continuous entries also skip mic gating (see enqueueChunk):
+      // muting the mic on output would stall a model that's meant to keep
+      // translating while the user is still talking — and with no turnComplete
+      // to lift the gate, it would stay muted after the first translation.
+      continuous: !!(session && session.config && session.config.engine === 'translate'),
       // True after Hush is hit mid-turn: drop the rest of the model's chunks
       // for this turn so they don't immediately restart playback. Cleared on
       // the next turn-complete signal (a fresh user utterance gets a fresh slate).
@@ -418,7 +486,8 @@ class TTSCoordinator {
     if (firstChunkOfTurn) {
       entry.wantsToSpeak = true;
       entry.turnComplete = false;
-      session.muteInput = true;
+      // Continuous (translate) sessions are never gated — see entry.continuous.
+      if (!entry.continuous) session.muteInput = true;
       this._requestSpeak(session.id);
       // The session either just became the speaker (status flips via
       // onActiveChange when playChunk fires) or got queued behind someone
@@ -494,12 +563,22 @@ class TTSCoordinator {
 
   _maybeFinishSpeaking(sessionId) {
     const entry = this.entries.get(sessionId);
-    if (!entry || !entry.turnComplete) return;
+    // Turn-based sessions finish only on an explicit turnComplete; continuous
+    // (translate) sessions have none, so they finish whenever playback drains.
+    if (!entry || (!entry.turnComplete && !entry.continuous)) return;
     if (entry.player.isActive()) return;
     entry.wantsToSpeak = false;
     entry.turnComplete = false;
     entry.session.muteInput = false;
     this.currentSpeakerId = null;
+    // Continuous sessions get no turnComplete to drive finalizeTurn from
+    // gemini-live, so a drained playback (a pause in the translation) is the
+    // turn boundary: persist the accumulated transcript and start a fresh turn
+    // on the next chunk. (finalizeTurn no-ops when there's no live turn, so the
+    // turn-based path that already finalized via onTurnComplete is unaffected.)
+    if (entry.continuous) {
+      try { finalizeTurn(entry.session); } catch (_) {}
+    }
     // The session that just finished should flip out of "Speaking" — the
     // wrapped onActiveChange already set status=connected, but we refresh
     // again so the muteInput → mic-meter-unlocked transition is reflected.
@@ -996,10 +1075,22 @@ function sessionHasUnsavedTranscript(session) {
 
 function readConfigFromUI() {
   return {
+    // 'live' = prompt-based bidirectional engine (gemini-3.1-flash-live).
+    // 'translate' = dedicated Live Translation model (gemini-3.5-live-translate):
+    // one-way into translateTarget, source auto-detected, no prompt/VAD/PTT.
+    engine: els.engineSelect.value || 'live',
     source: els.langSource.value,
     target: els.langTarget.value,
+    // BCP-47 target for the translate engine (separate from `target` above,
+    // which uses the live engine's short codes).
+    translateTarget: els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET,
+    echoTarget: !!(els.echoTarget && els.echoTarget.checked),
     voice:  els.voice.value,
-    mode:   els.modeSelect.value,
+    // The translate engine has no mode control; pin 'audio' so the many
+    // mode-based branches (audio input, output visibility, labels, export)
+    // treat it as a speaking session rather than reading a stale live-engine
+    // value left in the hidden control.
+    mode:   els.engineSelect.value === 'translate' ? 'audio' : els.modeSelect.value,
     dir:    els.dirSelect.value,
     vad:    currentVadConfig(),
     audioSource:    els.audioSource.value || 'mic',
@@ -1018,6 +1109,18 @@ function readConfigFromUI() {
 
 function newSessionId() {
   return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+// Engine config can't be inherited from the current-UI fallback during restore:
+// a pre-feature save has no `engine`, and blindly merging would tag it with
+// whatever engine is selected now. Pin it from the saved entry only (absent →
+// 'live'), and ensure a target is present for translate sessions.
+function applySavedEngineDefaults(cfg, savedConfig) {
+  cfg.engine = (savedConfig && savedConfig.engine === 'translate') ? 'translate' : 'live';
+  if (!cfg.translateTarget) cfg.translateTarget = DEFAULT_TRANSLATE_TARGET;
+  cfg.echoTarget = !!(savedConfig && savedConfig.echoTarget);
+  // Keep translate sessions' mode pinned to 'audio' (see readConfigFromUI).
+  if (cfg.engine === 'translate') cfg.mode = 'audio';
 }
 
 // ─── Per-session DOM ─────────────────────────────────────────────────────────
@@ -1235,11 +1338,17 @@ function createSessionDOM(session) {
 function updateTabChip(session) {
   if (!session.tabEl) return;
   const cfg = session.config;
-  const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
-  const label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
+  let label, sym;
+  if (cfg.engine === 'translate') {
+    sym = '»';
+    label = `AUTO ${sym} ${shortLangCode(cfg.translateTarget)}`;
+  } else {
+    sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
+    label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
+  }
   if (session.tabLabelEl) session.tabLabelEl.textContent = label;
   session.tabEl.dataset.audio = session.isAudio ? 'true' : 'false';
-  session.tabEl.title = `${langName(cfg.source)} → ${langName(cfg.target)}`;
+  session.tabEl.title = `${sessionSourceLabel(cfg)} → ${sessionTargetLabel(cfg)}`;
   paintTabChipDevices(session);
   refreshSessionHeader(session);
 }
@@ -1359,8 +1468,10 @@ function paintTabChipDevices(session) {
 function refreshSessionHeader(session) {
   if (!session.headerEl) return;
   const cfg = session.config || {};
-  const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
-  const title = `${langName(cfg.source)} ${sym} ${langName(cfg.target)}`;
+  const sym = cfg.engine === 'translate'
+    ? '»'
+    : (cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔'));
+  const title = `${sessionSourceLabel(cfg)} ${sym} ${sessionTargetLabel(cfg)}`;
   if (session.headerTitleEl) session.headerTitleEl.textContent = title;
   if (session.headerSubEl) {
     const liveActive = !!(session.liveTurn &&
@@ -1740,7 +1851,7 @@ function seedPipFromSession(session) {
   if (!state.pip) return;
   state.pip.setStatus((STATUS_DEF[effectiveStatus(session)] || STATUS_DEF.idle).label(),
     session.status === 'translating' || session.status === 'connected');
-  state.pip.setLangs(langName(session.config.source), langName(session.config.target));
+  state.pip.setLangs(sessionSourceLabel(session.config), sessionTargetLabel(session.config));
   if (session.liveTurn) {
     state.pip.setInput(session.liveTurn.inputText);
     state.pip.setOutput(session.liveTurn.outputText);
@@ -1762,8 +1873,14 @@ function seedPipFromSession(session) {
 
 function loadSessionConfigIntoUI(session) {
   const cfg = session.config;
+  els.engineSelect.value = cfg.engine === 'translate' ? 'translate' : 'live';
   els.langSource.value = cfg.source;
   els.langTarget.value = cfg.target;
+  if (els.translateTarget && cfg.translateTarget) {
+    els.translateTarget.value = cfg.translateTarget;
+    if (!els.translateTarget.value) els.translateTarget.value = DEFAULT_TRANSLATE_TARGET;
+  }
+  if (els.echoTarget) els.echoTarget.checked = !!cfg.echoTarget;
   els.voice.value = cfg.voice;
   els.modeSelect.value = cfg.mode;
   els.dirSelect.value = cfg.dir;
@@ -1949,6 +2066,7 @@ function maybePromoteArchivedSession() {
   const fallback = readConfigFromUI();
   const cfg = Object.assign({}, fallback, entry.config || {});
   cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+  applySavedEngineDefaults(cfg, entry.config);
   cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   delete cfg.outputDeviceId;
   if (!Array.isArray(cfg.passthroughDeviceIds)) cfg.passthroughDeviceIds = [];
@@ -2121,6 +2239,7 @@ function restoreSessionsFromStorage() {
   for (const entry of entries) {
     const cfg = Object.assign({}, fallback, entry.config || {});
     cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+    applySavedEngineDefaults(cfg, entry.config);
     cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
     delete cfg.outputDeviceId;
     // Migration: older saves don't carry passthroughDeviceIds (it lived in
@@ -2184,8 +2303,11 @@ function savePrefs() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       apiKey: els.apiKey.value,
+      engine: els.engineSelect.value || 'live',
       source: els.langSource.value,
       target: els.langTarget.value,
+      translateTarget: els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET,
+      echoTarget: !!(els.echoTarget && els.echoTarget.checked),
       voice:  els.voice.value,
       input:  els.audioInput.value,
       audio:  els.audioSource.value,
@@ -2210,6 +2332,25 @@ function savePrefs() {
 function langName(code) {
   for (const [c, n] of LANGUAGES) if (c === code) return n;
   return code;
+}
+
+function translateLangName(code) {
+  for (const [c, n] of TRANSLATE_LANGUAGES) if (c === code) return n;
+  return code;
+}
+
+// Short uppercase tag for a chip label, e.g. 'zh-Hans' → 'ZH', 'en' → 'EN'.
+function shortLangCode(code) {
+  return String(code || '').split('-')[0].toUpperCase();
+}
+
+// Source / target display labels for a session, accounting for the engine.
+// The translate engine auto-detects the source and targets a BCP-47 code.
+function sessionSourceLabel(cfg) {
+  return cfg.engine === 'translate' ? 'Auto' : langName(cfg.source);
+}
+function sessionTargetLabel(cfg) {
+  return cfg.engine === 'translate' ? translateLangName(cfg.translateTarget) : langName(cfg.target);
 }
 
 // ─── System prompt resolution ────────────────────────────────────────────────
@@ -2245,12 +2386,38 @@ function modeDescriptiveLabel() {
 function updateUIVisibility() {
   const mode = els.modeSelect.value;
   const source = els.audioSource.value;
+  const engine = els.engineSelect.value || 'live';
+  const isTranslate = engine === 'translate';
+  document.body.dataset.engine = engine;
 
-  // Direction: only for translation modes
+  // Languages section: the translate engine auto-detects the source and uses a
+  // BCP-47 target, so swap the live engine's source⇄target pair for a single
+  // target picker plus the echo toggle.
+  if (els.langPairField)       els.langPairField.style.display       = isTranslate ? 'none' : '';
+  if (els.langPairHint)        els.langPairHint.style.display        = isTranslate ? 'none' : '';
+  if (els.translateTargetField) els.translateTargetField.style.display = isTranslate ? '' : 'none';
+  if (els.echoTargetField)     els.echoTargetField.style.display     = isTranslate ? '' : 'none';
+
+  // The translate model is config-driven: no prompt, no turn/VAD controls, no
+  // mode/direction. Hide those whole sections so they can't feed stale config
+  // into a translate session. (They're full-only via CSS too, but engine can be
+  // 'translate' in any UI mode, so gate them here as well.)
+  if (els.translationSection) els.translationSection.style.display = isTranslate ? 'none' : '';
+  if (els.speechSection)      els.speechSection.style.display      = isTranslate ? 'none' : '';
+  if (els.promptSection)      els.promptSection.style.display      = isTranslate ? 'none' : '';
+
+  if (els.engineHint) {
+    els.engineHint.textContent = isTranslate
+      ? 'Dedicated low-latency model. Auto-detects what you say and speaks the target language. One-way; no prompt or push-to-talk.'
+      : 'Prompt-based engine. Bidirectional, with text-only and transcribe modes.';
+  }
+
+  // Direction: only for translation modes (live engine)
   els.dirField.style.display = (mode === 'transcribe') ? 'none' : '';
 
-  // Voice & Audio Output: only for Translate (Voice) mode
-  const showAudio = (mode === 'audio');
+  // Voice & Audio Output: for Translate (Voice) mode, or any translate session
+  // (which always speaks the translation).
+  const showAudio = isTranslate || (mode === 'audio');
   els.voiceSection.style.display = showAudio ? '' : 'none';
   els.audioOutputSection.style.display = showAudio ? '' : 'none';
 
@@ -2522,10 +2689,28 @@ function fillLanguages() {
   els.langSource.appendChild(frag1);
   els.langTarget.appendChild(frag2);
 
+  // Translate-engine target list (BCP-47 codes; source is auto-detected).
+  if (els.translateTarget) {
+    const fragT = document.createDocumentFragment();
+    for (const [code, name] of TRANSLATE_LANGUAGES) {
+      const o = document.createElement('option');
+      o.value = code; o.textContent = name; fragT.appendChild(o);
+    }
+    els.translateTarget.appendChild(fragT);
+  }
+
   const prefs = loadPrefs();
   els.apiKey.value      = prefs.apiKey || '';
+  els.engineSelect.value = prefs.engine === 'translate' ? 'translate' : 'live';
   els.langSource.value  = prefs.source || 'en';
   els.langTarget.value  = prefs.target || 'zh';
+  if (els.translateTarget) {
+    els.translateTarget.value = prefs.translateTarget || DEFAULT_TRANSLATE_TARGET;
+    // A select snaps to '' when the saved code isn't an option (e.g. a list
+    // change between builds) — fall back to the default so it's never blank.
+    if (!els.translateTarget.value) els.translateTarget.value = DEFAULT_TRANSLATE_TARGET;
+  }
+  if (els.echoTarget)      els.echoTarget.checked = !!prefs.echoTarget;
   els.voice.value       = prefs.voice  || 'Zephyr';
   els.audioInput.dataset.preferred = prefs.input || '';
   els.audioInput.value  = prefs.input  || '';
@@ -3768,6 +3953,30 @@ function flushPending(session) {
   // the user is reading older turns. The scroll event from autoscroll would
   // refresh this too, but only if autoScroll was true.
   if (session.refreshScrollStuck) session.refreshScrollStuck();
+
+  noteContinuousActivity(session);
+}
+
+// Segment the live turn for continuous (translate) sessions, which get no
+// turnComplete from the model. Called after each flush: resets an idle timer so
+// the turn finalizes ~CONTINUOUS_TURN_IDLE_MS after transcription stops (a
+// natural pause), and force-finalizes once the turn exceeds CONTINUOUS_TURN_MAX_MS
+// so a gapless source still produces readable, persisted turns. No-op for the
+// turn-based live engine, which finalizes on onTurnComplete instead.
+function noteContinuousActivity(session) {
+  if (!session || session._finalizing || !session.running || !session.liveTurn) return;
+  if (!session.config || session.config.engine !== 'translate') return;
+  const t = session.liveTurn;
+  if (t.startedAt && (Date.now() - t.startedAt) >= CONTINUOUS_TURN_MAX_MS) {
+    // finalizeTurn clears the idle timer; the next chunk opens a fresh turn.
+    finalizeTurn(session);
+    return;
+  }
+  if (session._contIdleTimer) clearTimeout(session._contIdleTimer);
+  session._contIdleTimer = setTimeout(() => {
+    session._contIdleTimer = 0;
+    finalizeTurn(session);
+  }, CONTINUOUS_TURN_IDLE_MS);
 }
 
 function formatTurnTimestamp(ts, { includeDate = false } = {}) {
@@ -3816,7 +4025,7 @@ function renderHistoryTurn(session, h) {
   inRow.className = 'turn-row input';
   const inLab = document.createElement('span');
   inLab.className = 'turn-label';
-  inLab.textContent = '🎙 ' + langName(session.config.source);
+  inLab.textContent = '🎙 ' + sessionSourceLabel(session.config);
   const inText = document.createElement('span');
   const input = h.input || '';
   inText.className = 'turn-text' + (input ? '' : ' empty');
@@ -3830,7 +4039,7 @@ function renderHistoryTurn(session, h) {
     outRow.className = 'turn-row output';
     const outLab = document.createElement('span');
     outLab.className = 'turn-label';
-    outLab.textContent = '→ ' + langName(session.config.target);
+    outLab.textContent = '→ ' + sessionTargetLabel(session.config);
     const outText = document.createElement('span');
     const output = h.output || '';
     outText.className = 'turn-text' + (output ? '' : ' empty');
@@ -3868,7 +4077,7 @@ function ensureLiveTurn(session) {
   inRow.className = 'turn-row input';
   const inLab = document.createElement('span');
   inLab.className = 'turn-label';
-  inLab.textContent = '🎙 ' + langName(session.config.source);
+  inLab.textContent = '🎙 ' + sessionSourceLabel(session.config);
   const inText = document.createElement('span');
   inText.className = 'turn-text empty';
   // Hold an explicit text-node reference so flushPending / finalizeTurn can
@@ -3887,7 +4096,7 @@ function ensureLiveTurn(session) {
     outRow.className = 'turn-row output';
     const outLab = document.createElement('span');
     outLab.className = 'turn-label';
-    outLab.textContent = '→ ' + langName(session.config.target);
+    outLab.textContent = '→ ' + sessionTargetLabel(session.config);
     outText = document.createElement('span');
     outText.className = 'turn-text empty';
     outTextNode = document.createTextNode('…');
@@ -3924,7 +4133,7 @@ function ensureLiveTurn(session) {
   };
 
   if (state.pip && state.pipFollowingSessionId === session.id) {
-    state.pip.setLangs(langName(session.config.source), langName(session.config.target));
+    state.pip.setLangs(sessionSourceLabel(session.config), sessionTargetLabel(session.config));
     state.pip.setInput('');
     state.pip.setOutput('');
   }
@@ -3936,7 +4145,12 @@ function appendOutputFor(session, chunk) { session.pendingOutput += chunk; if (s
 function clearThinkingFor(session) { if (session && session.liveTurn) session.liveTurn.root.classList.remove('is-thinking'); }
 
 function finalizeTurn(session) {
+  if (session._contIdleTimer) { clearTimeout(session._contIdleTimer); session._contIdleTimer = 0; }
+  // Guard the flush below from re-triggering segmentation (flushPending →
+  // noteContinuousActivity → finalizeTurn) while we're already finalizing.
+  session._finalizing = true;
   flushPending(session);
+  session._finalizing = false;
   if (!session.liveTurn) return;
   const t = session.liveTurn;
   t.root.classList.remove('is-thinking');
@@ -4137,13 +4351,16 @@ async function startSession(session) {
     return;
   }
   const cfg = session.config;
-  if (cfg.source === cfg.target) {
+  const isTranslate = cfg.engine === 'translate';
+  // The translate engine auto-detects the source, so there's no source/target
+  // pair to validate — only the live engine needs distinct languages.
+  if (!isTranslate && cfg.source === cfg.target) {
     log('error', 'Source and target languages must differ.');
     return;
   }
   savePrefs();
 
-  const isAudio = cfg.mode === 'audio';
+  const isAudio = isTranslate ? true : cfg.mode === 'audio';
 
   setSessionStatus(session, 'connecting');
   // Eagerly disable Start while the pipeline negotiates so a double-click
@@ -4173,29 +4390,25 @@ async function startSession(session) {
     session.player = null;
   }
 
-  const systemInstruction = GeminiLive.renderSystemPrompt(
-    effectivePromptTemplateFor(cfg.mode, cfg.dir),
-    langName(cfg.source), langName(cfg.target));
+  // PTT is a live-engine affordance only; the translate model streams
+  // continuously and has no manual-activity signalling.
+  const isPtt = !isTranslate && cfg.pttMode === 'ptt';
 
-  const isPtt = cfg.pttMode === 'ptt';
+  // Output transcription is on for everything except live transcribe mode.
+  const wantsOutputText = isTranslate || cfg.mode !== 'transcribe';
 
-  session.client = new GeminiLive.GeminiLiveClient({
+  const clientOpts = {
     apiKey,
     voice: cfg.voice,
-    systemInstruction,
-    vad: cfg.vad,
-    // manualActivity disables Gemini's auto VAD so we control turn boundaries
-    // via activityStart/activityEnd (sent from the PTT key handlers below).
-    manualActivity: isPtt,
     resumeHandle: session.resumeHandle || null,
     onResumeHandle: (handle) => {
       session.resumeHandle = handle || null;
       scheduleSaveSessions();
     },
-    useOutputTranscription: cfg.mode !== 'transcribe',
+    useOutputTranscription: wantsOutputText,
     onAudio: isAudio ? (b64) => { clearThinkingFor(session); state.ttsCoordinator.enqueueChunk(session, b64); } : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
-    onOutputChunk: cfg.mode !== 'transcribe' ? (chunk) => appendOutputFor(session, chunk) : () => {},
+    onOutputChunk: wantsOutputText ? (chunk) => appendOutputFor(session, chunk) : () => {},
     onTurnComplete: () => {
       if (isAudio) state.ttsCoordinator.markTurnComplete(session);
       finalizeTurn(session);
@@ -4213,7 +4426,27 @@ async function startSession(session) {
       refreshSessionDisplay(session);
     },
     onLog: log,
-  });
+  };
+
+  if (isTranslate) {
+    // Dedicated translation model: config-driven, no system prompt, no VAD.
+    clientOpts.model = GeminiLive.TRANSLATE_MODEL;
+    clientOpts.translationConfig = {
+      targetLanguageCode: cfg.translateTarget || DEFAULT_TRANSLATE_TARGET,
+      echoTargetLanguage: !!cfg.echoTarget,
+    };
+    clientOpts.manualActivity = false;
+  } else {
+    clientOpts.systemInstruction = GeminiLive.renderSystemPrompt(
+      effectivePromptTemplateFor(cfg.mode, cfg.dir),
+      langName(cfg.source), langName(cfg.target));
+    clientOpts.vad = cfg.vad;
+    // manualActivity disables Gemini's auto VAD so we control turn boundaries
+    // via activityStart/activityEnd (sent from the PTT key handlers below).
+    clientOpts.manualActivity = isPtt;
+  }
+
+  session.client = new GeminiLive.GeminiLiveClient(clientOpts);
 
   // PTT integration:
   //   - The in-page Talk button (footer + popup) is the primary input and
@@ -4313,9 +4546,13 @@ async function startSession(session) {
   // Paint once immediately so the chip doesn't read "00:00" for a full second.
   paintSessionAge(session);
 
-  const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
-  const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
-  log('info', `Session started: ${langName(cfg.source)} ${dirLabel} ${langName(cfg.target)}${modeLabel}`);
+  if (isTranslate) {
+    log('info', `Session started: Auto → ${sessionTargetLabel(cfg)} (live translate)`);
+  } else {
+    const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
+    const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
+    log('info', `Session started: ${langName(cfg.source)} ${dirLabel} ${langName(cfg.target)}${modeLabel}`);
+  }
 }
 
 async function stopPipeline() {
@@ -4383,8 +4620,11 @@ async function stopSession(session) {
 }
 
 function setControlsLocked(locked) {
+  els.engineSelect.disabled  = locked;
   els.langSource.disabled    = locked;
   els.langTarget.disabled    = locked;
+  if (els.translateTarget) els.translateTarget.disabled = locked;
+  if (els.echoTarget)      els.echoTarget.disabled      = locked;
   els.voice.disabled         = locked;
   els.audioSource.disabled   = locked;
   els.apiKey.disabled        = locked;
@@ -4706,8 +4946,10 @@ function exportTimeline(entries) {
       index: 0,
       sessionIndex: entry.index,
       sessionId: entry.session.id,
+      engine: entry.session.config.engine,
       source: entry.session.config.source,
       target: entry.session.config.target,
+      translateTarget: entry.session.config.translateTarget,
       mode: entry.session.config.mode,
       input: turn.input,
       output: turn.output,
@@ -4757,7 +4999,9 @@ function exportConversation(format, opts) {
   let base;
   if (scope === 'session') {
     const cfg = sessions[0].session.config || {};
-    const pair = `${(cfg.source || '').toLowerCase()}-${(cfg.target || '').toLowerCase()}`;
+    const pair = cfg.engine === 'translate'
+      ? `auto-${(cfg.translateTarget || '').toLowerCase()}`
+      : `${(cfg.source || '').toLowerCase()}-${(cfg.target || '').toLowerCase()}`;
     base = `live-translator-${pair}-${stamp}`;
   } else {
     base = `live-translator-all-sessions-${stamp}`;
@@ -4786,9 +5030,9 @@ function exportConversation(format, opts) {
       `Exported: ${exportedAt.toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}${scope === 'all' ? ` - Session ${t.sessionIndex}` : ''} - ${langName(t.source)} -> ${langName(t.target)}`,
-        `${langName(t.source)}: ${t.input || '(empty)'}`,
-        t.mode === 'transcribe' ? '' : `${langName(t.target)}: ${t.output || '(empty)'}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}${scope === 'all' ? ` - Session ${t.sessionIndex}` : ''} - ${sessionSourceLabel(t)} -> ${sessionTargetLabel(t)}`,
+        `${sessionSourceLabel(t)}: ${t.input || '(empty)'}`,
+        t.mode === 'transcribe' ? '' : `${sessionTargetLabel(t)}: ${t.output || '(empty)'}`,
         '',
       ]),
     ];
@@ -4966,7 +5210,11 @@ async function togglePip() {
     pip.setStatus('Idle', false);
     pip.setEffectiveStatus('idle');
     pip.setRunning(false, false, true);
-    pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+    if (els.engineSelect.value === 'translate') {
+      pip.setLangs('Auto', translateLangName(els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET));
+    } else {
+      pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+    }
   }
   // Seed the cycle-button visibility now that the PIP exists. Subsequent
   // session add/close/restore paths re-call this via refreshPipSessionCount.
@@ -5018,6 +5266,16 @@ function wireUI() {
     updateUIVisibility();
     onSettingsChange();
   });
+  els.engineSelect.addEventListener('change', () => {
+    updateUIVisibility();
+    onSettingsChange();
+  });
+  if (els.translateTarget) {
+    els.translateTarget.addEventListener('change', onSettingsChange);
+  }
+  if (els.echoTarget) {
+    els.echoTarget.addEventListener('change', onSettingsChange);
+  }
   els.vadPreset.addEventListener('change', () => {
     if (els.vadPreset.value !== 'custom') applyVadPreset(els.vadPreset.value);
     updateUIVisibility();
