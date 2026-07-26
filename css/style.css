@@ -175,6 +175,27 @@ a:hover { text-decoration: underline; }
    the single visible chip can stretch to fill the row.
    Advanced-only sidebar sections are still hidden, of course. */
 body[data-ui-mode="simple"] .advanced-only { display: none !important; }
+
+/* Basic normally hides the whole Audio section. The microphone picker is the
+   one exception, and only when the machine actually offers a choice (2+ real,
+   labelled inputs — see the has-mic-choice toggle in refreshAudioInputDevices).
+   Rationale: every other Advanced setting still produces *something* when it's
+   wrong, but a wrong mic produces silence — no meter, no turns, no error — and
+   a Basic user has no way to diagnose or fix it without finding the mode
+   switcher. Reveal the select alone; source/output/preview stay Advanced. */
+body[data-ui-mode="simple"].has-mic-choice #audio-section { display: block !important; }
+body[data-ui-mode="simple"].has-mic-choice #audio-section > .field,
+body[data-ui-mode="simple"].has-mic-choice #audio-section > .subgroup:not(#mic-section) {
+  display: none !important;
+}
+body[data-ui-mode="simple"].has-mic-choice #mic-section .icon-btn,
+body[data-ui-mode="simple"].has-mic-choice #mic-section .mic-preview-list,
+body[data-ui-mode="simple"].has-mic-choice #mic-section .live-line,
+/* The hint talks about "Mic + Tab", an audio-source option Basic doesn't
+   show — a labelled dropdown needs no caption anyway. */
+body[data-ui-mode="simple"].has-mic-choice #mic-section .hint {
+  display: none !important;
+}
 body[data-ui-mode="simple"] .tab-new      { display: none; }
 body[data-ui-mode="simple"] .tab-close    { display: none; }
 body[data-ui-mode="simple"] .tab-chip {
@@ -220,7 +241,13 @@ body.no-companion .companion-only { display: none !important; }
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
-  min-height: 80px;
+  /* The chips do not propagate their height up through the stretch chain, so
+     this floor — not intrinsic sizing — is what gives the strip its height
+     (setting it to `auto` collapses the strip to its padding). It must clear
+     the tallest chip: head + status/age + device row + meters, which needs
+     ~99px in Advanced/Full. At the old 80px the meters row was cropped away
+     entirely and the device row was sliced in half. */
+  min-height: 100px;
 }
 .tabs::-webkit-scrollbar { height: 4px; }
 .tabs::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 2px; }

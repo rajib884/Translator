@@ -78,7 +78,7 @@
 
         <section class="section">
           <h3 class="section-title">Languages</h3>
-          <div class="field">
+          <div class="field full-only" id="engine-field">
             <label>Engine</label>
             <div class="segmented" id="engine-segmented" role="radiogroup" aria-label="Translation engine">
               <button class="seg-opt is-active" data-value="live"      type="button" role="radio" aria-checked="true">Prompt</button>
@@ -103,12 +103,15 @@
             </div>
           </div>
           <p class="hint" id="lang-pair-hint">"You speak" is the language you'll say things in; "Translate to" is what Gemini speaks back. Tap the swap button to flip them.</p>
-          <div class="field" id="translate-target-field" style="display:none">
+          <!-- Engine-dependent: only meaningful while the Live Translate engine is
+               selected, which is itself Full-only. JS toggles the inline display;
+               full-only wins over it in Basic/Advanced via !important. -->
+          <div class="field full-only" id="translate-target-field" style="display:none">
             <label for="translate-target">Translate to</label>
             <select id="translate-target"></select>
             <p class="hint">The model auto-detects what you say and speaks this language back.</p>
           </div>
-          <div class="field" id="echo-target-field" style="display:none">
+          <div class="field full-only" id="echo-target-field" style="display:none">
             <label class="checkbox-row">
               <input type="checkbox" id="echo-target" />
               <span>Echo speech already in the target language</span>
@@ -232,7 +235,7 @@
           </div>
         </section>
 
-        <section class="section advanced-only">
+        <section class="section advanced-only" id="audio-section">
           <h3 class="section-title">Audio</h3>
           <div class="field">
             <label>Audio source</label>
@@ -336,7 +339,10 @@
           </div>
         </section>
 
-        <section class="section actions">
+        <!-- advanced-only on the section, not just the button: its only child is
+             the advanced-only debug log, so in Basic mode the heading would
+             otherwise render alone with nothing beneath it. -->
+        <section class="section actions advanced-only">
           <h3 class="section-title actions-title">View</h3>
           <button id="btn-log" class="btn ghost advanced-only" type="button" title="Open the debug log">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1em;height:1em;vertical-align:middle;margin-right:0.5em;"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Debug Log

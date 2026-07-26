@@ -14,7 +14,7 @@ const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
 class PipController {
   constructor({ onStart, onStop, onPause, onHush, onClear,
                 onCycleSession, onPttToggle, onPrefsChange,
-                onForceReset } = {}) {
+                onForceReset, onMicChange } = {}) {
     this.win = null;
     this.doc = null;
 
@@ -38,6 +38,8 @@ class PipController {
     this.onPttToggle = onPttToggle || (() => {});
     this.onPrefsChange = onPrefsChange || (() => {});
     this.onForceReset = onForceReset || (() => {});
+    // Microphone picked in the overlay — main window applies it.
+    this.onMicChange = onMicChange || (() => {});
     this.onClose = () => {};
 
     // Element references — set by _setup, nulled by _cleanup.
@@ -49,6 +51,17 @@ class PipController {
     this.outputEl = null;
     this.inputRowEl = null;
     this.outputRowEl = null;
+    // Level meters (mic in / translation out).
+    this.micFillEl = null;
+    this.outFillEl = null;
+    this.outMeterEl = null;
+    // Microphone picker (mirrors the main window's dropdown).
+    this.micFieldEl = null;
+    this.micSelectEl = null;
+    this._micOptions = [];
+    this._micSelected = '';
+    this._micHasChoice = false;
+    this._micOptionsSig = null;
     // Header action buttons + settings slide-over.
     this.btnStartStopEl = null;
     this.btnPttEl = null;
@@ -257,6 +270,43 @@ class PipController {
         .pip-iconbtn.pip-cycle { display: none; }
       }
 
+      /* ─── Level meters ───
+         Mirrors the main window's tab-chip meters: mic on top, translation
+         output below. A glance at the overlay then answers "is it hearing me
+         / is it speaking" without parsing the status pill. Kept to 3px so the
+         strip costs almost nothing at the tiny sizes the PIP gets dragged to. */
+      .pip-meters {
+        display: flex; flex-direction: column; gap: 2px;
+        padding: 4px 6px;
+        background: ${palette.bg1};
+        border-bottom: 1px solid ${palette.line};
+        flex: 0 0 auto;
+      }
+      .pip-meter {
+        position: relative; height: 3px;
+        background: ${palette.bg3};
+        border-radius: 2px; overflow: hidden;
+      }
+      .pip-meter.is-hidden { display: none; }
+      .pip-meter-fill {
+        height: 100%; width: 0%;
+        border-radius: 2px; will-change: width;
+        transition: background-color 0.18s ease, opacity 0.18s ease;
+      }
+      .pip-meter.mic .pip-meter-fill { background: ${palette.accent}; }
+      .pip-meter.out .pip-meter-fill { background: ${palette.accent2}; }
+      /* Stopped or paused: the model is not receiving audio. Grey the fill so a
+         live mic level can't be mistaken for "you're being heard" — same
+         reasoning as the main window's per-status meter dimming. */
+      body.pip-meters-muted .pip-meter-fill {
+        background: ${palette.fg2} !important; opacity: 0.55;
+      }
+      /* The strip is the first thing to go when the window gets very short on
+         width — status and transcript matter more than the levels. */
+      @container pip (max-width: 200px) {
+        .pip-meters { display: none; }
+      }
+
       /* ─── Transcript ─── */
       main.pip-transcript {
         padding: 12px 14px; overflow-y: auto;
@@ -336,6 +386,15 @@ class PipController {
       .pip-btn.danger { background: ${palette.bad};  color: #fff;    border-color: transparent; }
       .pip-btn.flex { flex: 1 1 0; }
       .pip-btn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: 2px; }
+      .pip-field.is-hidden { display: none; }
+      .pip-select {
+        width: 100%;
+        background: ${palette.bg3}; color: ${palette.fg0};
+        border: 1px solid ${palette.line}; border-radius: 7px;
+        padding: 7px 8px; font: inherit; font-size: 12px;
+        min-height: 34px; cursor: pointer;
+      }
+      .pip-select:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: 2px; }
 
       .pip-seg {
         display: flex; gap: 0;
@@ -440,6 +499,11 @@ class PipController {
         </span>
       </header>
 
+      <div class="pip-meters" id="pipMeters">
+        <div class="pip-meter mic"><div class="pip-meter-fill" id="pipMicFill"></div></div>
+        <div class="pip-meter out" id="pipOutMeter"><div class="pip-meter-fill" id="pipOutFill"></div></div>
+      </div>
+
       <div class="pip-body-wrap">
         <main class="pip-transcript">
           <div class="pip-row" id="pipInputRow">
@@ -471,6 +535,13 @@ class PipController {
               </div>
             </div>
             -->
+
+            <!-- Hidden until the main window reports 2+ labelled inputs; with a
+                 single mic there is no choice to offer. -->
+            <div class="pip-field is-hidden" id="pipMicField">
+              <div class="pip-field-label">Microphone</div>
+              <select class="pip-select" id="pipMicSelect" aria-label="Microphone"></select>
+            </div>
 
             <div class="pip-field">
               <div class="pip-field-label">Show</div>
@@ -507,6 +578,13 @@ class PipController {
     this.outputEl = doc.getElementById('pipout');
     this.inputRowEl = doc.getElementById('pipInputRow');
     this.outputRowEl = doc.getElementById('pipOutputRow');
+    this.micFillEl = doc.getElementById('pipMicFill');
+    this.outFillEl = doc.getElementById('pipOutFill');
+    this.outMeterEl = doc.getElementById('pipOutMeter');
+    this.micFieldEl = doc.getElementById('pipMicField');
+    this.micSelectEl = doc.getElementById('pipMicSelect');
+    // Fresh document, so the previous signature no longer describes it.
+    this._micOptionsSig = null;
 
     this.btnStartStopEl = doc.getElementById('pipBtnStartStop');
     this.btnPttEl = doc.getElementById('pipBtnPtt');
@@ -560,6 +638,14 @@ class PipController {
     this.fontDecEl.addEventListener('click', () => this.setFontStep(this._fontStep - 1, true));
     this.fontIncEl.addEventListener('click', () => this.setFontStep(this._fontStep + 1, true));
 
+    // The main window owns the device switch (it has to restart capture on a
+    // running session), so just report the pick and let it drive the change —
+    // the resulting refresh calls setMicOptions back with the new selection.
+    this.micSelectEl.addEventListener('change', () => {
+      this._micSelected = this.micSelectEl.value;
+      this.onMicChange(this._micSelected);
+    });
+
     // ESC closes the settings panel if it's open.
     doc.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape' && this._settingsOpen) {
@@ -578,6 +664,7 @@ class PipController {
     this.setDisplayMode(this._displayMode, /* persist */ false);
     this.setFontStep(this._fontStep, /* persist */ false);
     this.setSessionCount(this._sessionCount);
+    this.setMicOptions(this._micOptions, this._micSelected, this._micHasChoice);
   }
 
   // Settings slide-over open/close.
@@ -715,6 +802,12 @@ class PipController {
       this._pttHeld = false;
       this.btnPttEl.dataset.held = 'false';
     }
+    // Meter chrome rides on the same state, and _setup replays setRunning with
+    // the cached values — so driving it here is also what restores the meters
+    // correctly when the user closes and reopens the overlay.
+    this.setMetersAudio(this._currentIsAudio);
+    this.setMetersMuted(!this._currentRunning || this._currentPaused);
+    if (!this._currentRunning) { this.setMicLevel(0); this.setOutLevel(0); }
   }
 
   setStatus(text, live) {
@@ -754,11 +847,63 @@ class PipController {
     }
   }
 
+  // Levels are 0..1 peaks, pushed from the main window at capture/playback
+  // cadence. Writing width directly (rather than transitioning it) keeps the
+  // bar responsive — a transition here would smear the peaks into mush.
+  // Mirror of the main window's microphone dropdown. `hasChoice` is decided
+  // there (2+ concrete, labelled inputs) so both pickers appear and disappear
+  // on exactly the same condition. Re-applied on every device refresh, so the
+  // list stays correct as devices come and go.
+  setMicOptions(options, selectedValue, hasChoice) {
+    this._micOptions = options || [];
+    this._micSelected = selectedValue || '';
+    this._micHasChoice = !!hasChoice;
+    if (!this.micSelectEl || !this.micFieldEl) return;
+    this.micFieldEl.classList.toggle('is-hidden', !this._micHasChoice);
+    // Rebuilding drops any open dropdown, so skip it when nothing changed.
+    const sig = this._micOptions.map((o) => o.value + ' ' + o.label).join('');
+    if (sig !== this._micOptionsSig) {
+      this._micOptionsSig = sig;
+      this.micSelectEl.innerHTML = '';
+      for (const o of this._micOptions) {
+        const opt = this.doc.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        this.micSelectEl.appendChild(opt);
+      }
+    }
+    this.micSelectEl.value = this._micSelected;
+  }
+
+  setMicLevel(level) { this._paintMeter(this.micFillEl, level); }
+  setOutLevel(level) { this._paintMeter(this.outFillEl, level); }
+
+  _paintMeter(el, level) {
+    if (!el) return;
+    const pct = Math.max(0, Math.min(100, (Number(level) || 0) * 100));
+    el.style.width = pct.toFixed(1) + '%';
+  }
+
+  // Text/transcribe sessions never speak, so the output bar would sit dead at
+  // zero — drop it and leave the mic bar on its own, matching how the main
+  // window's chip meters behave for the same modes.
+  setMetersAudio(isAudio) {
+    if (this.outMeterEl) this.outMeterEl.classList.toggle('is-hidden', !isAudio);
+  }
+
+  // Grey the fills whenever the model isn't actually receiving audio.
+  setMetersMuted(muted) {
+    if (this.doc) this.doc.body.classList.toggle('pip-meters-muted', !!muted);
+  }
+
   _cleanup() {
     this.win = null;
     this.doc = null;
     this.statusEl = this.dotEl = null;
     this.inputEl = this.outputEl = null;
+    this.micFillEl = this.outFillEl = this.outMeterEl = null;
+    this.micFieldEl = this.micSelectEl = null;
+    this._micOptionsSig = null;
     this.inputLabelEl = this.outputLabelEl = null;
     this.inputRowEl = this.outputRowEl = null;
     this.btnStartStopEl = null;

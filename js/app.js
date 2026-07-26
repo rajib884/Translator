@@ -868,6 +868,11 @@ function setUIMode(mode) {
 // and the system-prompt override. Going Full → Advanced (mid) resets them so
 // hidden state can't keep affecting sessions in a way the user can't see.
 function resetFullOnlySettings() {
+  // Engine is Full-only: leaving it on 'translate' while narrowing would strand
+  // the user with no engine control AND no language controls, since
+  // updateUIVisibility hides the live engine's language pair for translate and
+  // the translate target picker is itself Full-only.
+  els.engineSelect.value = 'live';
   els.modeSelect.value = 'audio';
   els.dirSelect.value = 'bidir';
   state.systemPromptTemplate = null;
@@ -878,8 +883,10 @@ function resetAdvancedSettingsForBasic() {
   // skip any layer.
   resetFullOnlySettings();
   els.audioSource.value = 'mic';
-  els.audioInput.value = '';
-  els.audioInput.dataset.preferred = '';
+  // Deliberately NOT resetting the microphone: Basic can now show the picker
+  // when the machine has 2+ inputs, so clearing it here would silently discard
+  // a choice the user can still see and change. The other audio fields stay
+  // hidden in Basic, so resetting those is still the right call.
   els.audioOutput.dataset.preferred = JSON.stringify(['']);
   if (els.passthroughOutput) els.passthroughOutput.dataset.preferred = JSON.stringify([]);
   setPassthroughDeviceIds([]);
@@ -926,7 +933,8 @@ function resetFullSettingsForAdvanced() {
 // resetFullOnlySettings() would clobber. Lets us skip the confirm dialog when
 // the narrowing transition wouldn't actually change anything.
 function fullOnlySettingsAtDefault() {
-  return els.modeSelect.value === 'audio'
+  return (els.engineSelect.value || 'live') === 'live'
+      && els.modeSelect.value === 'audio'
       && els.dirSelect.value === 'bidir'
       && state.systemPromptTemplate === null;
 }
@@ -937,10 +945,9 @@ function fullOnlySettingsAtDefault() {
 function basicResetIsNoOp() {
   if (!fullOnlySettingsAtDefault()) return false;
   if ((els.audioSource.value || 'mic') !== 'mic') return false;
-  // Check dataset.preferred too: while the chosen mic is missing from the
-  // option list the select shows (and reads) '', but the preference is still
-  // live and would survive the skipped reset.
-  if (els.audioInput.value !== '' || (els.audioInput.dataset.preferred || '') !== '') return false;
+  // The microphone is intentionally absent from this check — it is no longer
+  // one of the fields resetAdvancedSettingsForBasic() clears, so a non-default
+  // mic must not force the "switch & reset" confirm.
   if (els.speechMode.value !== 'auto') return false;
   if (els.vadPreset.value !== DEFAULT_VAD_PRESET) return false;
   const outIds = getSelectedOutputDeviceIds();
@@ -972,7 +979,7 @@ async function requestUIModeChange(mode) {
       if (mode === 'simple') {
         const ok = await showConfirm({
           title: 'Switch to Basic?',
-          message: 'Resets this session\'s advanced settings — voice, mic, VAD, devices, and prompt.',
+          message: 'Resets this session\'s advanced settings — engine, voice, VAD, devices, and prompt.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -983,7 +990,7 @@ async function requestUIModeChange(mode) {
         // keep using a configuration the user can no longer see.
         const ok = await showConfirm({
           title: 'Switch to Advanced?',
-          message: 'Resets mode, direction, and the system prompt to defaults.',
+          message: 'Resets engine, mode, direction, and the system prompt to defaults.',
           confirmLabel: 'Switch & reset',
         });
         if (!ok) return;
@@ -1497,18 +1504,55 @@ function refreshAllTabChipDevices() {
   for (const session of state.sessions.values()) paintTabChipDevices(session);
 }
 
+// The placeholder describes what the user should do next, so it has to track
+// the session's actual state — a running session told to "press Start", or a
+// configured user told to paste a key they already saved, reads as broken.
+// This is the full set of inputs it varies on; it doubles as a change-detection
+// key so refreshSessionEmptyState can skip identical re-renders.
+function emptyStateSignature(session) {
+  // The key hint is only worth showing while there's actually no key to use.
+  // Once one is saved (or a session is up, which already required one) it's noise.
+  const needsKey = !session.running && !els.apiKey.value.trim();
+  return `${session.running ? 1 : 0}${session.paused ? 1 : 0}${needsKey ? 1 : 0}`;
+}
+
 function renderSessionEmptyState(session) {
   if (!session.transcriptEl) return;
   session.transcriptEl.innerHTML = '';
   const empty = document.createElement('div');
   empty.className = 'empty-state';
+
+  const sig = emptyStateSignature(session);
+  empty.dataset.sig = sig;
+  const lead = !session.running
+    ? 'Press <strong>Start</strong> and speak.'
+    : (session.paused ? 'Paused — resume to keep translating.'
+                      : 'Listening — go ahead and speak.');
+  const hint = sig[2] === '1'
+    ? '<p class="hint">First, open <button class="link-btn" data-empty-action="open-settings" type="button">Settings</button> and paste your Gemini API key.</p>'
+    : '';
+
   empty.innerHTML =
     '<div class="empty-icon" aria-hidden="true">' +
       '<svg class="icon" viewBox="0 0 24 24"><use href="#icon-mic"/></svg>' +
     '</div>' +
-    '<p>Press <strong>Start</strong> and speak.<br/>Your words appear on one side, the translation on the other.</p>' +
-    '<p class="hint">First, open <button class="link-btn" data-empty-action="open-settings" type="button">Settings</button> and paste your Gemini API key.</p>';
+    '<p>' + lead + '<br/>Your words appear on one side, the translation on the other.</p>' +
+    hint;
   session.transcriptEl.appendChild(empty);
+}
+
+// Re-render the placeholder in place when what it says may have gone stale
+// (session started/stopped/paused, API key entered). No-op once real turns
+// exist — the placeholder is gone by then and there is nothing to update.
+// The signature check matters beyond saving work: refreshSessionDisplay fires
+// on every status transition, and a blind re-render would tear down the
+// "Settings" link-button mid-keyboard-focus.
+function refreshSessionEmptyState(session) {
+  if (!session || !session.transcriptEl) return;
+  const cur = session.transcriptEl.querySelector(':scope > .empty-state');
+  if (!cur) return;
+  if (cur.dataset.sig === emptyStateSignature(session)) return;
+  renderSessionEmptyState(session);
 }
 
 function removeSessionEmptyState(session) {
@@ -1862,6 +1906,11 @@ function seedPipFromSession(session) {
   state.pip.setStatus((STATUS_DEF[effectiveStatus(session)] || STATUS_DEF.idle).label(),
     session.status === 'translating' || session.status === 'connected');
   state.pip.setLangs(sessionSourceLabel(session.config), sessionTargetLabel(session.config));
+  // Levels are pushed per-callback, so without seeding here the bars would keep
+  // the previously-followed session's values until its next audio frame.
+  state.pip.setRunning(!!session.running, !!session.paused, !!session.isAudio);
+  state.pip.setMicLevel(session.lastMicLevel || 0);
+  state.pip.setOutLevel(session.lastOutLevel || 0);
   if (session.liveTurn) {
     state.pip.setInput(session.liveTurn.inputText);
     state.pip.setOutput(session.liveTurn.outputText);
@@ -1906,6 +1955,7 @@ function loadSessionConfigIntoUI(session) {
   // dataset.preferred keeps the real id for the next device refresh.
   selectOptionByValue(els.audioInput, cfg.micDeviceId || '');
   els.audioInput.dataset.preferred = cfg.micDeviceId || '';
+  els.audioInput.dataset.wanted = cfg.micDeviceId || '';
   const outIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   cfg.outputDeviceIds = outIds;
   setSelectedOutputDeviceIds(outIds);
@@ -2327,7 +2377,10 @@ function savePrefs() {
       // missing from the option list (pre-permission enumeration, slow USB
       // re-enumeration). Persist that, not the momentary fallback value —
       // otherwise a reload before the mic grant erases the saved choice.
-      input:  els.audioInput.value || els.audioInput.dataset.preferred || '',
+      // Persist the sticky choice rather than the currently-resolvable one, so
+      // a mic that merely isn't present right now isn't forgotten on reload.
+      input:  els.audioInput.dataset.wanted
+              || els.audioInput.value || els.audioInput.dataset.preferred || '',
       audio:  els.audioSource.value,
       outputs: preferredOutputDeviceIdsForPrefs(),
       passthroughDeviceIds: getPassthroughDeviceIds(),
@@ -2731,6 +2784,7 @@ function fillLanguages() {
   if (els.echoTarget)      els.echoTarget.checked = !!prefs.echoTarget;
   els.voice.value       = prefs.voice  || 'Zephyr';
   els.audioInput.dataset.preferred = prefs.input || '';
+  els.audioInput.dataset.wanted = prefs.input || '';
   // The option list only holds the "System default" placeholder this early;
   // selectOptionByValue keeps it visibly selected instead of a blank select
   // when prefs.input names a device that hasn't been enumerated yet.
@@ -3283,10 +3337,24 @@ async function refreshDeviceListsIfStale() {
   } catch (_) { /* device enumeration failures are non-fatal here */ }
 }
 
+// Flat [{ value, label }] snapshot of the mic dropdown, for the PIP's own
+// picker. The PIP runs in a same-origin window but owns its DOM, so it gets
+// plain data rather than a reference to the main document's <option>s.
+function micOptionsForPip() {
+  if (!els.audioInput) return [];
+  return Array.from(els.audioInput.options).map((o) => ({ value: o.value, label: o.textContent }));
+}
+
 async function refreshAudioInputDevices() {
   if (!els.audioInput || els.audioInput.disabled) return;
   try {
-    const selected = els.audioInput.value || els.audioInput.dataset.preferred || '';
+    // `wanted` is the sticky record of what the user actually picked. It
+    // survives enumerations that don't list the device — an unplugged USB mic,
+    // a sleeping bluetooth headset, a virtual cable whose driver initialises
+    // after page load — so the choice can be restored when the device returns.
+    // `preferred` below is the narrower "what can we open right now" value.
+    const wanted = els.audioInput.dataset.wanted
+      || els.audioInput.value || els.audioInput.dataset.preferred || '';
     const devices = await navigator.mediaDevices.enumerateDevices();
     const inputs = devices.filter((d) => d.kind === 'audioinput');
     const seen = new Set();
@@ -3333,17 +3401,31 @@ async function refreshAudioInputDevices() {
     // `select.value = X`, which silently falls back to the first option when
     // X isn't present — that's the root of the "selects a non-default device"
     // report when a stored deviceId vanishes between sessions.
-    const target = seen.has(selected) ? selected : '';
+    const target = seen.has(wanted) ? wanted : '';
     selectOptionByValue(els.audioInput, target);
     // Pre-permission, browsers enumerate inputs with empty deviceIds — such a
-    // list can't confirm that a saved device is gone. Keep the wanted id in
-    // dataset.preferred so the first authoritative refresh (post-grant)
-    // restores it; only an enumeration with real ids may prune it.
+    // list can't confirm that a saved device is gone, so keep pointing at the
+    // wanted id. Once ids are real, `preferred` narrows to what is actually
+    // present so readConfigFromUI never hands a vanished device to
+    // getUserMedia. `wanted` is deliberately never pruned: pruning it made an
+    // absent-at-load device unrecoverable, because the devicechange refresh
+    // that fires when it reappears had nothing left to match against.
     const authoritative = inputs.some((d) => d.deviceId);
-    els.audioInput.dataset.preferred = authoritative ? target : selected;
+    els.audioInput.dataset.preferred = authoritative ? target : wanted;
+    els.audioInput.dataset.wanted = wanted;
+
+    // Basic mode surfaces the mic picker only when there is a real choice to
+    // make: 2+ concrete devices (the default/communications pseudo-entries are
+    // already filtered out above) AND labels, which only exist post-permission.
+    // Pre-grant the browser reports "Microphone 1 / 2", which is worse than
+    // showing nothing — so the picker appears after the first Start.
+    const hasLabels = inputs.some((d) => d.label);
+    const concreteCount = seen.size - 1; // minus the '' System-default entry
+    document.body.classList.toggle('has-mic-choice', concreteCount >= 2 && hasLabels);
+    // Mirror the same list into the overlay's settings panel.
+    if (state.pip) state.pip.setMicOptions(micOptionsForPip(), target, concreteCount >= 2 && hasLabels);
 
     if (inputs.length) {
-      const hasLabels = inputs.some((d) => d.label);
       els.audioInputHint.textContent = hasLabels
         ? 'Switching applies immediately. Mic + Tab asks you to repick the tab.'
         : 'Tap Start once to grant mic access — names appear after.';
@@ -3777,7 +3859,10 @@ function createCompanionCapture(session) {
 }
 
 async function changeAudioInput() {
+  // An explicit pick updates both: what to open now, and the sticky intent
+  // that has to survive enumerations where the device isn't listed.
   els.audioInput.dataset.preferred = els.audioInput.value;
+  els.audioInput.dataset.wanted = els.audioInput.value;
   onSettingsChange();
   // The multi-mic preview meters every device regardless of selection — just
   // move its highlight to the new pick (no-op when the preview isn't open).
@@ -3885,6 +3970,7 @@ function refreshSessionDisplay(session) {
   if (session.tabStatusEl) session.tabStatusEl.textContent = text;
 
   paintSessionAge(session);
+  refreshSessionEmptyState(session);
   // PiP mirrors the followed session's status, not the active one — so the
   // popout stays consistent with the transcript it's showing. setEffectiveStatus
   // drives the background tint (calm listening, lit speaking, amber reconnect,
@@ -4339,11 +4425,15 @@ function setMicLevelFor(session, level) {
   // is hearing them, while the status text says "Hold [KEY]".
   session.lastMicLevel = level;
   paintMeterFill(session.tabMicFill, level);
+  // Mirror into the overlay, which shows the same two bars for whichever
+  // session it is currently following.
+  if (state.pip && state.pipFollowingSessionId === session.id) state.pip.setMicLevel(level);
 }
 
 function setOutLevelFor(session, level) {
   session.lastOutLevel = level;
   paintMeterFill(session.tabOutFill, level);
+  if (state.pip && state.pipFollowingSessionId === session.id) state.pip.setOutLevel(level);
 }
 
 // ─── Control-bar state ───────────────────────────────────────────────────────
@@ -5304,12 +5394,25 @@ async function togglePip() {
       savePrefs();
     },
     onForceReset: forceResetActiveSession,
+    // Drive the real dropdown so the overlay's pick goes through exactly the
+    // same path as the main window's — including the live capture swap on a
+    // running session and the prefs write.
+    onMicChange: (deviceId) => {
+      if (!els.audioInput) return;
+      selectOptionByValue(els.audioInput, deviceId);
+      changeAudioInput();
+    },
   });
   // Seed PIP-side state BEFORE open() so _setup paints with the user's saved
   // preferences instead of flashing the defaults for one frame.
   const seedPrefs = state.pipPrefs || {};
   if (seedPrefs.displayMode) pip._displayMode = seedPrefs.displayMode;
   if (Number.isInteger(seedPrefs.fontStep)) pip._fontStep = seedPrefs.fontStep;
+  // Same for the mic list — _setup replays it, so seeding here avoids a frame
+  // with an empty picker before the next device refresh lands.
+  pip._micOptions = micOptionsForPip();
+  pip._micSelected = els.audioInput ? els.audioInput.value : '';
+  pip._micHasChoice = document.body.classList.contains('has-mic-choice');
   try {
     await pip.open();
   } catch (e) {
@@ -5539,6 +5642,10 @@ function wireUI() {
     return () => { clearTimeout(t); t = setTimeout(savePrefs, 500); };
   })();
   els.apiKey.addEventListener('input', debouncedSavePrefs);
+  // Drop the "paste your API key" placeholder hint as soon as there is a key.
+  els.apiKey.addEventListener('input', () => {
+    for (const s of state.sessions.values()) refreshSessionEmptyState(s);
+  });
   // Flush on blur and before unload so a paste-then-tab-away can't lose it.
   els.apiKey.addEventListener('blur', savePrefs);
 
