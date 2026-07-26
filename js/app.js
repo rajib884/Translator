@@ -21,6 +21,53 @@ const LANGUAGES = [
   ['pt', 'Portuguese'],
 ];
 
+// Target languages for the Live Translation engine (gemini-3.5-live-translate).
+// These are BCP-47 codes from the model's supported list, which differ from the
+// short ISO codes in LANGUAGES above — Chinese is zh-Hans/zh-Hant (not zh) and
+// Portuguese is pt-BR/pt-PT (not pt) — so this engine needs its own list rather
+// than reusing LANGUAGES. The model auto-detects the source, so only a target
+// is ever selected. Curated subset of the ~70 supported languages.
+const TRANSLATE_LANGUAGES = [
+  ['en', 'English'],
+  ['es', 'Spanish'],
+  ['fr', 'French'],
+  ['de', 'German'],
+  ['it', 'Italian'],
+  ['pt-BR', 'Portuguese (Brazil)'],
+  ['pt-PT', 'Portuguese (Portugal)'],
+  ['nl', 'Dutch'],
+  ['pl', 'Polish'],
+  ['ru', 'Russian'],
+  ['uk', 'Ukrainian'],
+  ['tr', 'Turkish'],
+  ['ar', 'Arabic'],
+  ['he', 'Hebrew'],
+  ['fa', 'Persian'],
+  ['hi', 'Hindi'],
+  ['bn', 'Bengali'],
+  ['ur', 'Urdu'],
+  ['ta', 'Tamil'],
+  ['te', 'Telugu'],
+  ['ja', 'Japanese'],
+  ['ko', 'Korean'],
+  ['zh-Hans', 'Chinese (Simplified)'],
+  ['zh-Hant', 'Chinese (Traditional)'],
+  ['id', 'Indonesian'],
+  ['ms', 'Malay'],
+  ['vi', 'Vietnamese'],
+  ['th', 'Thai'],
+  ['sw', 'Swahili'],
+];
+const DEFAULT_TRANSLATE_TARGET = 'es';
+
+// The Live Translation engine streams continuously and never sends turnComplete,
+// so transcript turns are segmented client-side. Finalize after a pause in
+// transcription (a natural utterance boundary), and hard-cap the live turn's
+// duration so a gapless source (e.g. a media player) can't accumulate one
+// unbounded run-on turn that never persists.
+const CONTINUOUS_TURN_IDLE_MS = 1400;
+const CONTINUOUS_TURN_MAX_MS = 12000;
+
 const MAX_TURNS = 1000;
 const MAX_LOG = 200;
 // Multi-session is meant for the occasional power user juggling a couple of
@@ -188,15 +235,22 @@ function segProxy(seg) {
 const els = {
   apiKey:        $('api-key'),
   btnShowKey:    $('btn-show-key'),
+  engineSelect:  segProxy($('engine-segmented')),
+  engineHint:    $('engine-hint'),
   langSource:    $('lang-source'),
   langTarget:    $('lang-target'),
+  langPairField: $('lang-pair-field'),
+  langPairHint:  $('lang-pair-hint'),
+  translateTarget:      $('translate-target'),
+  translateTargetField: $('translate-target-field'),
+  echoTarget:           $('echo-target'),
+  echoTargetField:      $('echo-target-field'),
   voice:         $('voice'),
   audioInput:    $('audio-input'),
   audioInputHint:$('audio-input-hint'),
   audioInputLive:$('audio-input-live'),
   btnMicPreview:    $('btn-mic-preview'),
-  micPreviewMeter:  $('mic-preview-meter'),
-  micPreviewFill:   $('mic-preview-fill'),
+  micPreviewList:   $('mic-preview-list'),
   audioSource:   segProxy($('audio-source-segmented')),
   audioHint:     $('audio-source-hint'),
   companionApp:      $('companion-app'),
@@ -210,11 +264,15 @@ const els = {
   passthroughOutputSection: $('passthrough-output-section'),
   passthroughOutputHint: $('passthrough-output-hint'),
   btnDetectDevices: $('btn-detect-devices'),
+  translationSection: $('translation-section'),
+  modeField:     $('mode-field'),
   modeSelect:    segProxy($('mode-segmented')),
   modeHint:      $('mode-hint'),
   dirSelect:     segProxy($('dir-segmented')),
   dirField:      $('dir-field'),
   dirHint:       $('dir-hint'),
+  speechSection: $('speech-section'),
+  promptSection: $('prompt-section'),
   voiceSection:  $('voice-section'),
   micSection:    $('mic-section'),
   speechMode:    segProxy($('speech-mode-segmented')),
@@ -230,18 +288,15 @@ const els = {
   btnSwap:       $('btn-swap'),
   btnStart:      $('btn-start'),
   btnStop:       $('btn-stop'),
-  btnHush:       $('btn-hush'),
-  btnPause:      $('btn-pause'),
+  // DEPRECATED: mic pause + silence buttons retired (HTML commented out in index.html).
+  // btnHush:       $('btn-hush'),
+  // btnPause:      $('btn-pause'),
   btnPtt:        $('btn-ptt'),
-  btnClear:      $('btn-clear'),
-  btnExport:     $('btn-export'),
-  exportMenu:    $('export-menu'),
-  btnExportJson: $('btn-export-json'),
-  btnExportText: $('btn-export-text'),
+  // Per-session Clear / Export live in each session header strip (built in
+  // createSessionDOM). No global els.* lookups for those buttons.
   btnMenu:       $('btn-menu'),
   btnLog:        $('btn-log'),
   btnForceReset: $('btn-force-reset'),
-  btnPip:        $('btn-pip'),
   btnPipQuick:   $('btn-pip-quick'),
   btnEditPrompt: $('btn-edit-prompt'),
   btnSavePrompt: $('btn-save-prompt'),
@@ -295,7 +350,6 @@ class Session {
 
     // Wall-clock when the session connected; drives the age display.
     this.startedAt = 0;
-    this.ageTimer = 0;
 
     // Live transcript bookkeeping.
     this.liveTurn = null;
@@ -305,6 +359,15 @@ class Session {
     // Full finalized turn history kept in memory so the export captures
     // everything — the DOM only retains MAX_TURNS for performance.
     this.history = []; // [{ input, output, finalizedAt }]
+    // Last value of history.length at the time of a successful per-session
+    // (or "all sessions") export. Used by closeSession to warn when the user
+    // is about to throw away turns that were never downloaded.
+    this.exportedTurnCount = 0;
+    // Scroll-to-bottom lock. When true, every appended chunk forces scrollTop
+    // to the bottom (see flushPending). Scrolling away from the bottom in the
+    // transcript flips this off; scrolling back flips it on. Persisted per
+    // session so the user's choice survives reloads.
+    this.followLatest = true;
 
     // DOM owned by this session.
     this.tabEl = null;             // .tab-chip
@@ -340,7 +403,9 @@ class Session {
     });
   }
 
-  get isAudio() { return this.config.mode === 'audio'; }
+  // The translate engine always speaks the translation, regardless of the
+  // (live-engine-only) mode field.
+  get isAudio() { return this.config.engine === 'translate' || this.config.mode === 'audio'; }
 }
 
 // ─── TTS coordinator ─────────────────────────────────────────────────────────
@@ -374,6 +439,13 @@ class TTSCoordinator {
       buffered: [],
       wantsToSpeak: false,
       turnComplete: false,
+      // The Live Translation engine streams continuously and never sends a
+      // turnComplete, so its "turn" ends when playback drains rather than on a
+      // turn signal. Continuous entries also skip mic gating (see enqueueChunk):
+      // muting the mic on output would stall a model that's meant to keep
+      // translating while the user is still talking — and with no turnComplete
+      // to lift the gate, it would stay muted after the first translation.
+      continuous: !!(session && session.config && session.config.engine === 'translate'),
       // True after Hush is hit mid-turn: drop the rest of the model's chunks
       // for this turn so they don't immediately restart playback. Cleared on
       // the next turn-complete signal (a fresh user utterance gets a fresh slate).
@@ -413,7 +485,8 @@ class TTSCoordinator {
     if (firstChunkOfTurn) {
       entry.wantsToSpeak = true;
       entry.turnComplete = false;
-      session.muteInput = true;
+      // Continuous (translate) sessions are never gated — see entry.continuous.
+      if (!entry.continuous) session.muteInput = true;
       this._requestSpeak(session.id);
       // The session either just became the speaker (status flips via
       // onActiveChange when playChunk fires) or got queued behind someone
@@ -489,12 +562,22 @@ class TTSCoordinator {
 
   _maybeFinishSpeaking(sessionId) {
     const entry = this.entries.get(sessionId);
-    if (!entry || !entry.turnComplete) return;
+    // Turn-based sessions finish only on an explicit turnComplete; continuous
+    // (translate) sessions have none, so they finish whenever playback drains.
+    if (!entry || (!entry.turnComplete && !entry.continuous)) return;
     if (entry.player.isActive()) return;
     entry.wantsToSpeak = false;
     entry.turnComplete = false;
     entry.session.muteInput = false;
     this.currentSpeakerId = null;
+    // Continuous sessions get no turnComplete to drive finalizeTurn from
+    // gemini-live, so a drained playback (a pause in the translation) is the
+    // turn boundary: persist the accumulated transcript and start a fresh turn
+    // on the next chunk. (finalizeTurn no-ops when there's no live turn, so the
+    // turn-based path that already finalized via onTurnComplete is unaffected.)
+    if (entry.continuous) {
+      try { finalizeTurn(entry.session); } catch (_) {}
+    }
     // The session that just finished should flip out of "Speaking" — the
     // wrapped onActiveChange already set status=connected, but we refresh
     // again so the muteInput → mic-meter-unlocked transition is reflected.
@@ -701,6 +784,9 @@ const state = {
   // Lazily allocated InputPreview for the settings panel's mic visualizer.
   // Stays null until the user clicks the preview button.
   inputPreview: null,
+  // deviceId → row element while the multi-mic preview list is showing;
+  // null otherwise. Owned by buildMicPreviewRows/setMicPreviewActive.
+  micPreviewRows: null,
   // Saved sessions that were over MAX_SESSIONS at restore time. Not loaded
   // into memory or rendered, but threaded through every saveSessions() write
   // so they're preserved verbatim — if MAX_SESSIONS is bumped up in a future
@@ -851,7 +937,10 @@ function fullOnlySettingsAtDefault() {
 function basicResetIsNoOp() {
   if (!fullOnlySettingsAtDefault()) return false;
   if ((els.audioSource.value || 'mic') !== 'mic') return false;
-  if (els.audioInput.value !== '') return false;
+  // Check dataset.preferred too: while the chosen mic is missing from the
+  // option list the select shows (and reads) '', but the preference is still
+  // live and would survive the skipped reset.
+  if (els.audioInput.value !== '' || (els.audioInput.dataset.preferred || '') !== '') return false;
   if (els.speechMode.value !== 'auto') return false;
   if (els.vadPreset.value !== DEFAULT_VAD_PRESET) return false;
   const outIds = getSelectedOutputDeviceIds();
@@ -951,16 +1040,71 @@ function isActive(session) {
   return !!session && session.id === state.activeSessionId;
 }
 
+// Single point of truth for the follow-latest lock. Flips session.followLatest,
+// repaints the header button (class + title + aria-pressed), optionally snaps
+// the transcript to the bottom (skip with opts.skipScroll when we're already
+// there — eg. auto-relock from the scroll listener), and persists. Caller is
+// free to invoke it with the current value as a no-op refresh of the visuals.
+function setFollowLatest(session, on, opts = {}) {
+  if (!session) return;
+  on = !!on;
+  const changed = session.followLatest !== on;
+  session.followLatest = on;
+  if (session.headerLockBtn) {
+    session.headerLockBtn.classList.toggle('is-following', on);
+    session.headerLockBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    session.headerLockBtn.title = on
+      ? 'Following latest (click to pause)'
+      : 'Paused — not following (click to resume)';
+  }
+  if (on && !opts.skipScroll && session.transcriptEl) {
+    session.transcriptEl.scrollTop = session.transcriptEl.scrollHeight;
+  }
+  if (changed) saveSessions();
+}
+
+// True iff the session has finalized turns past the last export point, or an
+// in-progress live turn with text. Used by closeSession to warn before
+// throwing away content that was never downloaded.
+function sessionHasUnsavedTranscript(session) {
+  if (!session) return false;
+  const histCount = session.history ? session.history.length : 0;
+  const lt = session.liveTurn;
+  const liveText = !!(lt && (
+    (lt.inputText && lt.inputText.trim()) ||
+    (lt.outputText && lt.outputText.trim())
+  ));
+  if (histCount === 0 && !liveText) return false;
+  return histCount > (session.exportedTurnCount || 0) || liveText;
+}
+
 function readConfigFromUI() {
   return {
+    // 'live' = prompt-based bidirectional engine (gemini-3.1-flash-live).
+    // 'translate' = dedicated Live Translation model (gemini-3.5-live-translate):
+    // one-way into translateTarget, source auto-detected, no prompt/VAD/PTT.
+    engine: els.engineSelect.value || 'live',
     source: els.langSource.value,
     target: els.langTarget.value,
+    // BCP-47 target for the translate engine (separate from `target` above,
+    // which uses the live engine's short codes).
+    translateTarget: els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET,
+    echoTarget: !!(els.echoTarget && els.echoTarget.checked),
     voice:  els.voice.value,
-    mode:   els.modeSelect.value,
+    // The translate engine has no mode control; pin 'audio' so the many
+    // mode-based branches (audio input, output visibility, labels, export)
+    // treat it as a speaking session rather than reading a stale live-engine
+    // value left in the hidden control.
+    mode:   els.engineSelect.value === 'translate' ? 'audio' : els.modeSelect.value,
     dir:    els.dirSelect.value,
     vad:    currentVadConfig(),
     audioSource:    els.audioSource.value || 'mic',
-    micDeviceId:    els.audioInput.value || '',
+    // value falls back to dataset.preferred so a config snapshot taken while
+    // the chosen mic is missing from the option list (pre-permission, slow
+    // USB enumeration) doesn't silently downgrade the session to the default
+    // mic. Every explicit selection keeps the two in sync, so an intentional
+    // "System default" ('' in both) still reads as ''.
+    micDeviceId:    els.audioInput.value || els.audioInput.dataset.preferred || '',
     outputDeviceIds: getSelectedOutputDeviceIds(),
     // Per-session passthrough sinks. Empty array = passthrough disabled
     // for this session. Persists across the session's start/stop cycles.
@@ -975,6 +1119,18 @@ function readConfigFromUI() {
 
 function newSessionId() {
   return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+// Engine config can't be inherited from the current-UI fallback during restore:
+// a pre-feature save has no `engine`, and blindly merging would tag it with
+// whatever engine is selected now. Pin it from the saved entry only (absent →
+// 'live'), and ensure a target is present for translate sessions.
+function applySavedEngineDefaults(cfg, savedConfig) {
+  cfg.engine = (savedConfig && savedConfig.engine === 'translate') ? 'translate' : 'live';
+  if (!cfg.translateTarget) cfg.translateTarget = DEFAULT_TRANSLATE_TARGET;
+  cfg.echoTarget = !!(savedConfig && savedConfig.echoTarget);
+  // Keep translate sessions' mode pinned to 'audio' (see readConfigFromUI).
+  if (cfg.engine === 'translate') cfg.mode = 'audio';
 }
 
 // ─── Per-session DOM ─────────────────────────────────────────────────────────
@@ -1016,6 +1172,17 @@ function createSessionDOM(session) {
       '<span class="tab-status-text">Idle</span>' +
       '<span class="tab-age mono">00:00</span>' +
     '</div>' +
+    '<div class="tab-chip-devices" aria-hidden="true">' +
+      '<span class="tab-dev tab-dev-in">' +
+        '<span class="tab-dev-ico"></span>' +
+        '<span class="tab-dev-name"></span>' +
+      '</span>' +
+      '<span class="tab-dev-sep">→</span>' +
+      '<span class="tab-dev tab-dev-out">' +
+        '<span class="tab-dev-ico"></span>' +
+        '<span class="tab-dev-name"></span>' +
+      '</span>' +
+    '</div>' +
     '<div class="tab-meters" aria-hidden="true">' +
       '<div class="tab-meter mic"><div class="tab-meter-fill"></div></div>' +
       '<div class="tab-meter out"><div class="tab-meter-fill"></div></div>' +
@@ -1027,8 +1194,102 @@ function createSessionDOM(session) {
   session.tabAgeEl    = chip.querySelector('.tab-age');
   session.tabMicFill  = chip.querySelector('.tab-meter.mic .tab-meter-fill');
   session.tabOutFill  = chip.querySelector('.tab-meter.out .tab-meter-fill');
+  session.tabDevicesEl = chip.querySelector('.tab-chip-devices');
+  session.tabDevIn    = chip.querySelector('.tab-dev-in');
+  session.tabDevOut   = chip.querySelector('.tab-dev-out');
   updateTabChip(session);
   refreshSessionDisplay(session);
+
+  // Per-session header strip: sits above the transcript and hosts the
+  // session's title + turn count, Clear, and Export (with this-session /
+  // all-sessions scopes). Visibility mirrors the transcript panel —
+  // .is-active is added/removed by setActiveSession.
+  const header = document.createElement('div');
+  header.className = 'session-header';
+  header.dataset.sessionId = session.id;
+  header.innerHTML =
+    '<div class="session-header-meta">' +
+      '<span class="session-header-title"></span>' +
+      '<span class="session-header-sub"></span>' +
+      '<div class="session-header-devices" aria-hidden="true">' +
+        '<span class="hdr-dev hdr-dev-in">' +
+          '<span class="hdr-dev-ico"></span>' +
+          '<span class="hdr-dev-name"></span>' +
+        '</span>' +
+        '<span class="hdr-dev-sep">→</span>' +
+        '<span class="hdr-dev hdr-dev-out">' +
+          '<span class="hdr-dev-ico"></span>' +
+          '<span class="hdr-dev-name"></span>' +
+        '</span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="session-header-actions">' +
+      '<button class="btn ghost session-lock" type="button" aria-pressed="true" aria-label="Toggle follow latest" title="Following latest (click to pause)">' +
+        '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>' +
+        '<span class="btn-tx">Follow</span>' +
+      '</button>' +
+      '<button class="btn ghost session-clear" type="button" title="Clear this session\'s conversation" aria-label="Clear chat">' +
+        '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>' +
+        '<span class="btn-tx">Clear</span>' +
+      '</button>' +
+      '<div class="export-wrap session-export-wrap">' +
+        '<button class="btn ghost session-export" type="button" aria-haspopup="menu" aria-expanded="false" title="Export chat">' +
+          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+          '<span class="btn-tx">Export</span>' +
+          '<span class="dropdown-caret" aria-hidden="true">▾</span>' +
+        '</button>' +
+        '<div class="export-menu" role="menu" hidden>' +
+          '<div class="export-menu-group">' +
+            '<div class="export-menu-label">This session</div>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="session" data-format="json">JSON</button>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="session" data-format="text">Text</button>' +
+          '</div>' +
+          '<div class="export-menu-sep" role="separator"></div>' +
+          '<div class="export-menu-group">' +
+            '<div class="export-menu-label">All sessions</div>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="all" data-format="json">JSON</button>' +
+            '<button class="export-item" type="button" role="menuitem" data-scope="all" data-format="text">Text</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  // Each session owns a vertical panel: header strip on top, transcript
+  // below. Only the active panel is shown — display:none otherwise.
+  const panel = document.createElement('div');
+  panel.className = 'session-panel';
+  panel.dataset.sessionId = session.id;
+  panel.appendChild(header);
+  els.turnsHost.appendChild(panel);
+  session.panelEl         = panel;
+  session.headerEl        = header;
+  session.headerTitleEl   = header.querySelector('.session-header-title');
+  session.headerSubEl     = header.querySelector('.session-header-sub');
+  session.headerClearBtn  = header.querySelector('.session-clear');
+  session.headerExportBtn = header.querySelector('.session-export');
+  session.headerExportMenu = header.querySelector('.export-menu');
+  session.headerDevicesEl = header.querySelector('.session-header-devices');
+  session.headerDevIn     = header.querySelector('.hdr-dev-in');
+  session.headerDevOut    = header.querySelector('.hdr-dev-out');
+  session.headerLockBtn   = header.querySelector('.session-lock');
+
+  session.headerLockBtn.addEventListener('click', () => {
+    setFollowLatest(session, !session.followLatest);
+  });
+
+  session.headerClearBtn.addEventListener('click', () => clearConversation(session));
+  session.headerExportBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleExportMenu(session.headerExportMenu, session.headerExportBtn);
+  });
+  session.headerExportMenu.addEventListener('click', (ev) => {
+    const item = ev.target.closest('.export-item');
+    ev.stopPropagation();
+    if (!item) return;
+    closeExportMenu(session.headerExportMenu, session.headerExportBtn);
+    const scope = item.dataset.scope === 'all' ? 'all' : 'session';
+    const format = item.dataset.format === 'text' ? 'text' : 'json';
+    exportConversation(format, { scope, session });
+  });
 
   const turns = document.createElement('div');
   turns.className = 'session-turns';
@@ -1040,19 +1301,200 @@ function createSessionDOM(session) {
   turns.setAttribute('role', 'tabpanel');
   turns.setAttribute('aria-labelledby', tabId);
   turns.setAttribute('tabindex', '0');
-  els.turnsHost.appendChild(turns);
+  panel.appendChild(turns);
   session.transcriptEl = turns;
+
+  // Floating "jump to latest" button — only visible when the user has
+  // scrolled away from the bottom of this session's transcript. Clicking
+  // re-engages the implicit auto-scroll (flushPending re-evaluates the
+  // at-bottom threshold on every chunk, so scrolling to bottom is enough).
+  const scrollBtn = document.createElement('button');
+  scrollBtn.className = 'scroll-bottom-btn';
+  scrollBtn.type = 'button';
+  scrollBtn.title = 'Scroll to latest';
+  scrollBtn.setAttribute('aria-label', 'Scroll to latest');
+  scrollBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+  scrollBtn.addEventListener('click', () => { turns.scrollTop = turns.scrollHeight; });
+  panel.appendChild(scrollBtn);
+  session.scrollBottomBtn = scrollBtn;
+
+  // One scroll handler drives three things:
+  //   1. Floating "↓" pill visibility (delta >= 64).
+  //   2. Auto-unlock the follow-latest lock when the user scrolls away
+  //      (delta >= 24). Tolerance is intentionally tighter than the pill
+  //      threshold so even small reads-backward pause the autoscroll.
+  //   3. Auto-relock when the user returns to the bottom (delta < 8). The
+  //      gap between 8 and 24 prevents thrash at the boundary.
+  const refreshScrollStuck = () => {
+    const delta = turns.scrollHeight - turns.scrollTop - turns.clientHeight;
+    panel.dataset.scrollStuck = delta >= 64 ? 'true' : 'false';
+    if (session.followLatest && delta >= 24) {
+      setFollowLatest(session, false, { skipScroll: true });
+    } else if (!session.followLatest && delta < 8) {
+      setFollowLatest(session, true, { skipScroll: true });
+    }
+  };
+  turns.addEventListener('scroll', refreshScrollStuck, { passive: true });
+  session.refreshScrollStuck = refreshScrollStuck;
+
+  // Paint initial lock visuals (class + title + aria-pressed) without
+  // scrolling — the activation path already scrolls to bottom.
+  setFollowLatest(session, session.followLatest, { skipScroll: true });
+
   renderSessionEmptyState(session);
+  refreshSessionHeader(session);
 }
 
 function updateTabChip(session) {
   if (!session.tabEl) return;
   const cfg = session.config;
-  const sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
-  const label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
+  let label, sym;
+  if (cfg.engine === 'translate') {
+    sym = '»';
+    label = `AUTO ${sym} ${shortLangCode(cfg.translateTarget)}`;
+  } else {
+    sym = cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔');
+    label = `${cfg.source.toUpperCase()} ${sym} ${cfg.target.toUpperCase()}`;
+  }
   if (session.tabLabelEl) session.tabLabelEl.textContent = label;
   session.tabEl.dataset.audio = session.isAudio ? 'true' : 'false';
-  session.tabEl.title = `${langName(cfg.source)} → ${langName(cfg.target)}`;
+  session.tabEl.title = `${sessionSourceLabel(cfg)} → ${sessionTargetLabel(cfg)}`;
+  paintTabChipDevices(session);
+  refreshSessionHeader(session);
+}
+
+// Pure formatters: turn a session's config into a short label + full title.
+// Called from updateTabChip; cheap, so they can run on every refresh trigger.
+function describeSessionInput(session) {
+  const cfg = session.config || {};
+  if (cfg.mode === 'text') {
+    return { icon: '⌨', short: 'Text input', full: 'Text-only session (no audio input)' };
+  }
+  const src = cfg.audioSource || 'mic';
+  if (src === 'display') {
+    return { icon: '🖥', short: 'Tab audio', full: 'Browser tab / display capture' };
+  }
+  if (src === 'companion') {
+    const exe = cfg.companionApp || '';
+    if (!exe) return { icon: '🎧', short: 'All system audio', full: 'Companion: all system audio' };
+    const match = state && state.companionApps && state.companionApps.find((a) => a.name === exe);
+    const display = match && match.displayName && match.displayName !== exe
+      ? `${match.displayName} (${exe})` : exe;
+    return { icon: '🎧', short: display, full: 'Companion app: ' + display };
+  }
+  // 'mic' or 'both'
+  const micLabel = micLabelFor(cfg.micDeviceId);
+  if (src === 'both') {
+    return { icon: '🎤', short: micLabel + ' + tab', full: 'Mic (' + micLabel + ') + browser tab audio' };
+  }
+  return { icon: '🎤', short: micLabel, full: 'Mic: ' + micLabel };
+}
+
+function describeSessionOutput(session) {
+  const cfg = session.config || {};
+  if (cfg.mode === 'transcribe' || cfg.mode === 'text') {
+    return { icon: '📝', short: 'Transcript only', full: 'No translated speech — transcript only' };
+  }
+  const ids = Array.isArray(cfg.outputDeviceIds) ? cfg.outputDeviceIds : [];
+  let primary = 'System default';
+  let extras = 0;
+  if (ids.length === 0) {
+    primary = 'System default';
+  } else {
+    primary = deviceLabelForId(ids[0], 'output') || 'System default';
+    extras = Math.max(0, ids.length - 1);
+  }
+  const labelShort = extras > 0 ? `${primary} (+${extras})` : primary;
+  let labelFull = ids.length === 0
+    ? 'System default'
+    : ids.map((id) => deviceLabelForId(id, 'output') || 'System default').join(', ');
+  const ptIds = Array.isArray(cfg.passthroughDeviceIds) ? cfg.passthroughDeviceIds : [];
+  if (ptIds.length > 0) {
+    labelFull += '  ·  Passthrough: ' + ptIds.length + ' sink' + (ptIds.length === 1 ? '' : 's');
+  }
+  return { icon: '🔊', short: labelShort, full: labelFull };
+}
+
+// Look up a mic device's human label from the (already-populated) input
+// dropdown. Returns "System default" for empty id, "Microphone" when labels
+// haven't been granted yet.
+function micLabelFor(id) {
+  if (!els.audioInput) return id ? 'Microphone' : 'System default';
+  const opt = Array.from(els.audioInput.options).find((o) => o.value === (id || ''));
+  if (opt && opt.textContent && opt.textContent.trim()) return opt.textContent.trim();
+  return id ? 'Microphone' : 'System default';
+}
+
+function paintTabChipDevices(session) {
+  const cfg = session.config || {};
+  const inputInfo = describeSessionInput(session);
+  const outputInfo = describeSessionOutput(session);
+  const hideOutput = cfg.mode === 'transcribe' || cfg.mode === 'text';
+  if (session.tabDevicesEl) {
+    session.tabDevicesEl.dataset.mode = cfg.mode || 'audio';
+    if (session.tabDevIn) {
+      const ico = session.tabDevIn.querySelector('.tab-dev-ico');
+      const name = session.tabDevIn.querySelector('.tab-dev-name');
+      if (ico) ico.textContent = inputInfo.icon;
+      if (name) name.textContent = inputInfo.short;
+      session.tabDevIn.title = inputInfo.full;
+    }
+    if (session.tabDevOut) {
+      const ico = session.tabDevOut.querySelector('.tab-dev-ico');
+      const name = session.tabDevOut.querySelector('.tab-dev-name');
+      if (ico) ico.textContent = outputInfo.icon;
+      if (name) name.textContent = outputInfo.short;
+      session.tabDevOut.title = outputInfo.full;
+      session.tabDevOut.style.display = hideOutput ? 'none' : '';
+    }
+    const sep = session.tabDevicesEl.querySelector('.tab-dev-sep');
+    if (sep) sep.style.display = hideOutput ? 'none' : '';
+  }
+  // Mobile mirror inside the panel header — CSS controls visibility.
+  if (session.headerDevicesEl) {
+    session.headerDevicesEl.dataset.mode = cfg.mode || 'audio';
+    if (session.headerDevIn) {
+      const ico = session.headerDevIn.querySelector('.hdr-dev-ico');
+      const name = session.headerDevIn.querySelector('.hdr-dev-name');
+      if (ico) ico.textContent = inputInfo.icon;
+      if (name) name.textContent = inputInfo.short;
+      session.headerDevIn.title = inputInfo.full;
+    }
+    if (session.headerDevOut) {
+      const ico = session.headerDevOut.querySelector('.hdr-dev-ico');
+      const name = session.headerDevOut.querySelector('.hdr-dev-name');
+      if (ico) ico.textContent = outputInfo.icon;
+      if (name) name.textContent = outputInfo.short;
+      session.headerDevOut.title = outputInfo.full;
+      session.headerDevOut.style.display = hideOutput ? 'none' : '';
+    }
+    const sep = session.headerDevicesEl.querySelector('.hdr-dev-sep');
+    if (sep) sep.style.display = hideOutput ? 'none' : '';
+  }
+}
+
+// Sync the session header strip (title + turn count). Lives separately from
+// the chip so the strip is decoupled from the tablist's responsibilities.
+function refreshSessionHeader(session) {
+  if (!session.headerEl) return;
+  const cfg = session.config || {};
+  const sym = cfg.engine === 'translate'
+    ? '»'
+    : (cfg.mode === 'transcribe' ? '·' : (cfg.dir === 'oneway' ? '→' : '↔'));
+  const title = `${sessionSourceLabel(cfg)} ${sym} ${sessionTargetLabel(cfg)}`;
+  if (session.headerTitleEl) session.headerTitleEl.textContent = title;
+  if (session.headerSubEl) {
+    const liveActive = !!(session.liveTurn &&
+      ((session.liveTurn.inputText && session.liveTurn.inputText.trim()) ||
+       (session.liveTurn.outputText && session.liveTurn.outputText.trim())));
+    const n = (session.history ? session.history.length : 0) + (liveActive ? 1 : 0);
+    session.headerSubEl.textContent = n === 0 ? 'No turns yet' : `${n} turn${n === 1 ? '' : 's'}`;
+  }
+}
+
+function refreshAllTabChipDevices() {
+  if (!state || !state.sessions) return;
+  for (const session of state.sessions.values()) paintTabChipDevices(session);
 }
 
 function renderSessionEmptyState(session) {
@@ -1370,6 +1812,8 @@ function setActiveSession(id) {
       prev.transcriptEl.removeAttribute('aria-live');
       prev.transcriptEl.removeAttribute('aria-relevant');
     }
+    if (prev.panelEl) prev.panelEl.classList.remove('is-active');
+    if (prev.headerExportMenu) closeExportMenu(prev.headerExportMenu, prev.headerExportBtn);
   }
   state.activeSessionId = id;
   const next = state.sessions.get(id);
@@ -1385,6 +1829,8 @@ function setActiveSession(id) {
     next.transcriptEl.setAttribute('aria-live', 'polite');
     next.transcriptEl.setAttribute('aria-relevant', 'additions');
   }
+  if (next.panelEl) next.panelEl.classList.add('is-active');
+  refreshSessionHeader(next);
 
   loadSessionConfigIntoUI(next);
   refreshSessionDisplay(next);
@@ -1415,7 +1861,7 @@ function seedPipFromSession(session) {
   if (!state.pip) return;
   state.pip.setStatus((STATUS_DEF[effectiveStatus(session)] || STATUS_DEF.idle).label(),
     session.status === 'translating' || session.status === 'connected');
-  state.pip.setLangs(langName(session.config.source), langName(session.config.target));
+  state.pip.setLangs(sessionSourceLabel(session.config), sessionTargetLabel(session.config));
   if (session.liveTurn) {
     state.pip.setInput(session.liveTurn.inputText);
     state.pip.setOutput(session.liveTurn.outputText);
@@ -1437,8 +1883,14 @@ function seedPipFromSession(session) {
 
 function loadSessionConfigIntoUI(session) {
   const cfg = session.config;
+  els.engineSelect.value = cfg.engine === 'translate' ? 'translate' : 'live';
   els.langSource.value = cfg.source;
   els.langTarget.value = cfg.target;
+  if (els.translateTarget && cfg.translateTarget) {
+    els.translateTarget.value = cfg.translateTarget;
+    if (!els.translateTarget.value) els.translateTarget.value = DEFAULT_TRANSLATE_TARGET;
+  }
+  if (els.echoTarget) els.echoTarget.checked = !!cfg.echoTarget;
   els.voice.value = cfg.voice;
   els.modeSelect.value = cfg.mode;
   els.dirSelect.value = cfg.dir;
@@ -1448,8 +1900,12 @@ function loadSessionConfigIntoUI(session) {
   // can take a moment to enumerate). Without this, an async refresh after a
   // tab switch would reset the dropdown to the global pref rather than the
   // active session's preference.
-  els.audioInput.value = cfg.micDeviceId;
-  els.audioInput.dataset.preferred = cfg.micDeviceId;
+  // selectOptionByValue (not `.value = X`): when the session's mic isn't in
+  // the option list yet, direct assignment leaves the select with no option
+  // selected (blank box) — this falls back to showing "System default" while
+  // dataset.preferred keeps the real id for the next device refresh.
+  selectOptionByValue(els.audioInput, cfg.micDeviceId || '');
+  els.audioInput.dataset.preferred = cfg.micDeviceId || '';
   const outIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   cfg.outputDeviceIds = outIds;
   setSelectedOutputDeviceIds(outIds);
@@ -1532,16 +1988,33 @@ function createNewSession({ activate = true } = {}) {
 
 async function closeSession(session) {
   if (!session) return;
-  if (session.running) {
-    if (!window.confirm('This session is running. Stop it and remove?')) return;
-    await stopSession(session);
+  const running = !!session.running;
+  const unsaved = sessionHasUnsavedTranscript(session);
+  if (running || unsaved) {
+    let title, message, confirmLabel;
+    if (running && unsaved) {
+      title = 'Stop and close without saving?';
+      message = 'This session is running and has translated turns that haven\'t been downloaded. Stop and close anyway?';
+      confirmLabel = 'Stop & discard';
+    } else if (running) {
+      title = 'Stop running session?';
+      message = 'This session is running. Stop it and remove?';
+      confirmLabel = 'Stop & remove';
+    } else {
+      title = 'Close without saving?';
+      message = 'This session has translated turns that haven\'t been downloaded. Close anyway?';
+      confirmLabel = 'Discard & close';
+    }
+    const ok = await showConfirm({ title, message, confirmLabel, confirmStyle: 'danger' });
+    if (!ok) return;
   }
+  if (session.running) await stopSession(session);
   if (session.micPassthrough) {
     try { await session.micPassthrough.stop(); } catch (_) {}
     session.micPassthrough = null;
   }
   if (session.tabEl) session.tabEl.remove();
-  if (session.transcriptEl) session.transcriptEl.remove();
+  if (session.panelEl) session.panelEl.remove();
   state.sessions.delete(session.id);
   // Closing a session opens a visible slot — surface the next archived
   // session if there is one. They're FIFO: the first archived entry is the
@@ -1607,6 +2080,7 @@ function maybePromoteArchivedSession() {
   const fallback = readConfigFromUI();
   const cfg = Object.assign({}, fallback, entry.config || {});
   cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+  applySavedEngineDefaults(cfg, entry.config);
   cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
   delete cfg.outputDeviceId;
   if (!Array.isArray(cfg.passthroughDeviceIds)) cfg.passthroughDeviceIds = [];
@@ -1624,6 +2098,12 @@ function maybePromoteArchivedSession() {
         finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
       }));
   }
+  session.exportedTurnCount = Number.isFinite(entry.exportedTurnCount)
+    ? entry.exportedTurnCount
+    : session.history.length;
+  session.followLatest = typeof entry.followLatest === 'boolean'
+    ? entry.followLatest
+    : true;
   state.sessions.set(session.id, session);
   createSessionDOM(session);
   renderSessionHistory(session);
@@ -1686,12 +2166,21 @@ async function stopAllSessions() {
 // quota, so very large transcripts may need IndexedDB later.
 const MAX_PERSISTED_HISTORY = 10000;
 function saveSessions() {
+  // Cancel any pending debounced write — we're writing immediately, so the
+  // debounced fire would just clobber this snapshot with a stale one (well,
+  // same data; cheaper to just skip).
+  if (_pendingSaveSessionsTimer) {
+    clearTimeout(_pendingSaveSessionsTimer);
+    _pendingSaveSessionsTimer = 0;
+  }
   try {
     const visible = [...state.sessions.values()].map((s) => ({
       id: s.id,
       config: s.config,
       resumeHandle: s.resumeHandle || null,
       history: (s.history || []).slice(-MAX_PERSISTED_HISTORY),
+      exportedTurnCount: s.exportedTurnCount || 0,
+      followLatest: s.followLatest !== false,
     }));
     // Append archivedSessions (extras we hid at restore time) so they're
     // preserved across writes. They never become active sessions in this
@@ -1702,6 +2191,20 @@ function saveSessions() {
       activeId: state.activeSessionId,
     }));
   } catch (_) {}
+}
+
+// Trailing-edge debounce for the per-turn save path. During active translation
+// `finalizeTurn` fires saveSessions ~once/sec/session; with 3 sessions that's
+// up to 3 multi-KB JSON.stringify + localStorage writes per second. Coalesce
+// to one write every 1.5s. Lifecycle saves (create/close/resume/stop) still
+// call saveSessions() directly so the write hits disk before navigation.
+let _pendingSaveSessionsTimer = 0;
+function scheduleSaveSessions() {
+  if (_pendingSaveSessionsTimer) return;
+  _pendingSaveSessionsTimer = setTimeout(() => {
+    _pendingSaveSessionsTimer = 0;
+    saveSessions();
+  }, 1500);
 }
 
 function loadSavedSessions() {
@@ -1750,6 +2253,7 @@ function restoreSessionsFromStorage() {
   for (const entry of entries) {
     const cfg = Object.assign({}, fallback, entry.config || {});
     cfg.vad = Object.assign({}, fallback.vad, (entry.config && entry.config.vad) || {});
+    applySavedEngineDefaults(cfg, entry.config);
     cfg.outputDeviceIds = normalizeOutputDeviceIds(cfg.outputDeviceIds, cfg.outputDeviceId);
     delete cfg.outputDeviceId;
     // Migration: older saves don't carry passthroughDeviceIds (it lived in
@@ -1779,6 +2283,17 @@ function restoreSessionsFromStorage() {
           finalizedAt: Number.isFinite(h.finalizedAt) ? h.finalizedAt : 0,
         }));
     }
+    // Legacy saves don't carry exportedTurnCount — grandfather them as
+    // "already accounted for" so the close-warning only fires for new turns
+    // recorded after the upgrade.
+    session.exportedTurnCount = Number.isFinite(entry.exportedTurnCount)
+      ? entry.exportedTurnCount
+      : session.history.length;
+    // Follow-latest defaults to true (matches new-session default + previous
+    // implicit "always at bottom on restore" behavior).
+    session.followLatest = typeof entry.followLatest === 'boolean'
+      ? entry.followLatest
+      : true;
     state.sessions.set(session.id, session);
     createSessionDOM(session);
     renderSessionHistory(session);
@@ -1802,12 +2317,19 @@ function savePrefs() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       apiKey: els.apiKey.value,
+      engine: els.engineSelect.value || 'live',
       source: els.langSource.value,
       target: els.langTarget.value,
+      translateTarget: els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET,
+      echoTarget: !!(els.echoTarget && els.echoTarget.checked),
       voice:  els.voice.value,
-      input:  els.audioInput.value,
+      // dataset.preferred carries the user's intent even while the device is
+      // missing from the option list (pre-permission enumeration, slow USB
+      // re-enumeration). Persist that, not the momentary fallback value —
+      // otherwise a reload before the mic grant erases the saved choice.
+      input:  els.audioInput.value || els.audioInput.dataset.preferred || '',
       audio:  els.audioSource.value,
-      outputs: getSelectedOutputDeviceIds(),
+      outputs: preferredOutputDeviceIdsForPrefs(),
       passthroughDeviceIds: getPassthroughDeviceIds(),
       mode:   els.modeSelect.value,
       dir:    els.dirSelect.value,
@@ -1828,6 +2350,25 @@ function savePrefs() {
 function langName(code) {
   for (const [c, n] of LANGUAGES) if (c === code) return n;
   return code;
+}
+
+function translateLangName(code) {
+  for (const [c, n] of TRANSLATE_LANGUAGES) if (c === code) return n;
+  return code;
+}
+
+// Short uppercase tag for a chip label, e.g. 'zh-Hans' → 'ZH', 'en' → 'EN'.
+function shortLangCode(code) {
+  return String(code || '').split('-')[0].toUpperCase();
+}
+
+// Source / target display labels for a session, accounting for the engine.
+// The translate engine auto-detects the source and targets a BCP-47 code.
+function sessionSourceLabel(cfg) {
+  return cfg.engine === 'translate' ? 'Auto' : langName(cfg.source);
+}
+function sessionTargetLabel(cfg) {
+  return cfg.engine === 'translate' ? translateLangName(cfg.translateTarget) : langName(cfg.target);
 }
 
 // ─── System prompt resolution ────────────────────────────────────────────────
@@ -1863,12 +2404,38 @@ function modeDescriptiveLabel() {
 function updateUIVisibility() {
   const mode = els.modeSelect.value;
   const source = els.audioSource.value;
+  const engine = els.engineSelect.value || 'live';
+  const isTranslate = engine === 'translate';
+  document.body.dataset.engine = engine;
 
-  // Direction: only for translation modes
+  // Languages section: the translate engine auto-detects the source and uses a
+  // BCP-47 target, so swap the live engine's source⇄target pair for a single
+  // target picker plus the echo toggle.
+  if (els.langPairField)       els.langPairField.style.display       = isTranslate ? 'none' : '';
+  if (els.langPairHint)        els.langPairHint.style.display        = isTranslate ? 'none' : '';
+  if (els.translateTargetField) els.translateTargetField.style.display = isTranslate ? '' : 'none';
+  if (els.echoTargetField)     els.echoTargetField.style.display     = isTranslate ? '' : 'none';
+
+  // The translate model is config-driven: no prompt, no turn/VAD controls, no
+  // mode/direction. Hide those whole sections so they can't feed stale config
+  // into a translate session. (They're full-only via CSS too, but engine can be
+  // 'translate' in any UI mode, so gate them here as well.)
+  if (els.translationSection) els.translationSection.style.display = isTranslate ? 'none' : '';
+  if (els.speechSection)      els.speechSection.style.display      = isTranslate ? 'none' : '';
+  if (els.promptSection)      els.promptSection.style.display      = isTranslate ? 'none' : '';
+
+  if (els.engineHint) {
+    els.engineHint.textContent = isTranslate
+      ? 'Dedicated low-latency model. Auto-detects what you say and speaks the target language. One-way; no prompt or push-to-talk.'
+      : 'Prompt-based engine. Bidirectional, with text-only and transcribe modes.';
+  }
+
+  // Direction: only for translation modes (live engine)
   els.dirField.style.display = (mode === 'transcribe') ? 'none' : '';
 
-  // Voice & Audio Output: only for Translate (Voice) mode
-  const showAudio = (mode === 'audio');
+  // Voice & Audio Output: for Translate (Voice) mode, or any translate session
+  // (which always speaks the translation).
+  const showAudio = isTranslate || (mode === 'audio');
   els.voiceSection.style.display = showAudio ? '' : 'none';
   els.audioOutputSection.style.display = showAudio ? '' : 'none';
 
@@ -2113,6 +2680,7 @@ async function refreshCompanionApps({ silent = true } = {}) {
         : 'No app is playing sound. Start playback, then refresh ↻.';
     }
     if (!silent) log('info', `Companion: found ${apps.length} app${apps.length === 1 ? '' : 's'} with active audio.`);
+    refreshAllTabChipDevices();
   } catch (e) {
     if (!silent) log('warn', 'Could not list companion apps: ' + (e && e.message ? e.message : e));
     if (els.companionAppHint) {
@@ -2139,13 +2707,34 @@ function fillLanguages() {
   els.langSource.appendChild(frag1);
   els.langTarget.appendChild(frag2);
 
+  // Translate-engine target list (BCP-47 codes; source is auto-detected).
+  if (els.translateTarget) {
+    const fragT = document.createDocumentFragment();
+    for (const [code, name] of TRANSLATE_LANGUAGES) {
+      const o = document.createElement('option');
+      o.value = code; o.textContent = name; fragT.appendChild(o);
+    }
+    els.translateTarget.appendChild(fragT);
+  }
+
   const prefs = loadPrefs();
   els.apiKey.value      = prefs.apiKey || '';
+  els.engineSelect.value = prefs.engine === 'translate' ? 'translate' : 'live';
   els.langSource.value  = prefs.source || 'en';
   els.langTarget.value  = prefs.target || 'zh';
+  if (els.translateTarget) {
+    els.translateTarget.value = prefs.translateTarget || DEFAULT_TRANSLATE_TARGET;
+    // A select snaps to '' when the saved code isn't an option (e.g. a list
+    // change between builds) — fall back to the default so it's never blank.
+    if (!els.translateTarget.value) els.translateTarget.value = DEFAULT_TRANSLATE_TARGET;
+  }
+  if (els.echoTarget)      els.echoTarget.checked = !!prefs.echoTarget;
   els.voice.value       = prefs.voice  || 'Zephyr';
   els.audioInput.dataset.preferred = prefs.input || '';
-  els.audioInput.value  = prefs.input  || '';
+  // The option list only holds the "System default" placeholder this early;
+  // selectOptionByValue keeps it visibly selected instead of a blank select
+  // when prefs.input names a device that hasn't been enumerated yet.
+  selectOptionByValue(els.audioInput, prefs.input || '');
   els.audioSource.value = prefs.audio  || 'mic';
   const prefOutIds = normalizeOutputDeviceIds(prefs.outputs, prefs.output);
   els.audioOutput.dataset.preferred = JSON.stringify(prefOutIds);
@@ -2255,6 +2844,20 @@ function isOutputDeviceListDisabled() {
 
 // Reads what's currently ticked. Empty array means "none selected", which
 // downstream we treat as "system default" so a session never goes silent.
+// What savePrefs persists for TTS outputs. dataset.preferred carries the
+// user's intent even while the chosen sinks are missing from the checkbox
+// list (pre-permission enumeration); the live checkbox state in that window
+// is just the auto-ticked System default fallback and must not overwrite the
+// stored preference. Every explicit toggle syncs preferred, so this matches
+// the live state whenever the list is authoritative.
+function preferredOutputDeviceIdsForPrefs() {
+  try {
+    const p = JSON.parse((els.audioOutput && els.audioOutput.dataset.preferred) || 'null');
+    if (Array.isArray(p)) return p;
+  } catch (_) {}
+  return getSelectedOutputDeviceIds();
+}
+
 function getSelectedOutputDeviceIds() {
   if (!els.audioOutput) return [];
   return Array.from(els.audioOutput.querySelectorAll('input.dev-tts:checked'))
@@ -2445,14 +3048,85 @@ function describePassthroughOutput(id) {
 }
 
 // ─── Input device preview ────────────────────────────────────────────────────
-// Opens a short-lived mic stream just for the visualizer in the settings
-// panel. Auto-closes after ~10 s so we don't keep the OS mic indicator on
+// Opens a short-lived stream per microphone and lists every device with its
+// own live level row, so the user can spot the mic that's actually picking
+// them up without previewing devices one by one. Clicking a row selects that
+// mic. Auto-closes after ~10 s so we don't keep the OS mic indicators on
 // indefinitely when the user forgets to stop it.
 const MIC_PREVIEW_MS = 10000;
 
-function paintMicPreviewLevel(level) {
-  if (!els.micPreviewFill) return;
-  els.micPreviewFill.style.width = levelToPct(level) + '%';
+function paintMicPreviewLevel(deviceId, level) {
+  if (!state.micPreviewRows || document.hidden) return;
+  const row = state.micPreviewRows.get(deviceId);
+  if (!row) return;
+  // Same quantize/skip pattern as paintMeterFill — saves wasted DOM writes
+  // when the level hasn't moved a whole percent.
+  const pct = levelToPct(level) | 0;
+  if (row._lastPct === pct) return;
+  row._lastPct = pct;
+  row.style.setProperty('--mic-level', pct + '%');
+}
+
+// Best guess at which concrete deviceId the OS default resolves to, so its
+// row can carry a "default" tag. Sources, in priority order: the id captured
+// from a live capture's track settings, then the label the '' option was
+// enriched with ("System default (X)" / the browser's own "Default - X").
+function micPreviewDefaultId() {
+  if (state.resolvedMicDeviceId) return state.resolvedMicDeviceId;
+  const defOpt = Array.from(els.audioInput.options).find((o) => !o.value);
+  const text = (defOpt && defOpt.textContent) || '';
+  const m = text.match(/^System default \((.+)\)$/) || text.match(/^Default - (.+)$/);
+  if (!m) return '';
+  for (const opt of els.audioInput.options) {
+    if (opt.value && opt.textContent === m[1]) return opt.value;
+  }
+  return '';
+}
+
+// Build one clickable level row per concrete mic in the dropdown (the ''
+// System-default entry is an alias of one of them and is skipped). Returns
+// the device list for InputPreview.start.
+function buildMicPreviewRows() {
+  els.micPreviewList.innerHTML = '';
+  state.micPreviewRows = new Map();
+  const defaultId = micPreviewDefaultId();
+  const devices = [];
+  for (const opt of els.audioInput.options) {
+    if (!opt.value) continue;
+    devices.push({ deviceId: opt.value, label: opt.textContent || 'Microphone' });
+  }
+  for (const d of devices) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'mic-preview-row';
+    const name = document.createElement('span');
+    name.className = 'device-name';
+    name.textContent = d.label;
+    const note = document.createElement('span');
+    note.className = 'mic-preview-note';
+    if (d.deviceId === defaultId) note.textContent = 'default';
+    row.appendChild(name);
+    row.appendChild(note);
+    row.addEventListener('click', () => {
+      selectOptionByValue(els.audioInput, d.deviceId);
+      els.audioInput.dataset.preferred = d.deviceId;
+      changeAudioInput();
+    });
+    state.micPreviewRows.set(d.deviceId, row);
+    els.micPreviewList.appendChild(row);
+  }
+  refreshMicPreviewSelection();
+  return devices;
+}
+
+// Highlight the row matching the dropdown selection. Safe to call any time —
+// no-op while the preview isn't showing.
+function refreshMicPreviewSelection() {
+  if (!state.micPreviewRows) return;
+  const sel = els.audioInput.value || '';
+  for (const [id, row] of state.micPreviewRows) {
+    row.classList.toggle('is-selected', id === sel);
+  }
 }
 
 function setMicPreviewActive(active) {
@@ -2461,14 +3135,17 @@ function setMicPreviewActive(active) {
     els.btnMicPreview.setAttribute('aria-pressed', active ? 'true' : 'false');
     els.btnMicPreview.title = active
       ? 'Stop microphone preview'
-      : 'Preview microphone level (10s)';
+      : 'Preview all mic levels for 10s';
     els.btnMicPreview.setAttribute('aria-label',
-      active ? 'Stop microphone preview' : 'Preview microphone level');
+      active ? 'Stop microphone preview' : 'Preview all microphone levels');
   }
-  if (els.micPreviewMeter) {
-    els.micPreviewMeter.classList.toggle('is-active', !!active);
+  if (els.micPreviewList) {
+    els.micPreviewList.hidden = !active;
+    if (!active) {
+      els.micPreviewList.innerHTML = '';
+      state.micPreviewRows = null;
+    }
   }
-  if (!active) paintMicPreviewLevel(0);
 }
 
 async function stopMicPreview() {
@@ -2481,15 +3158,29 @@ async function stopMicPreview() {
 async function startMicPreview() {
   if (!state.inputPreview) {
     state.inputPreview = new LiveAudio.InputPreview({
-      onLevel: (l) => paintMicPreviewLevel(l),
+      onLevel: (id, l) => paintMicPreviewLevel(id, l),
+      onDeviceError: (id) => {
+        const row = state.micPreviewRows && state.micPreviewRows.get(id);
+        if (!row) return;
+        row.classList.add('is-unavailable');
+        const note = row.querySelector('.mic-preview-note');
+        if (note) note.textContent = 'unavailable';
+      },
       onAutoStop: () => setMicPreviewActive(false),
       autoStopMs: MIC_PREVIEW_MS,
     });
   }
-  const micId = els.audioInput ? els.audioInput.value || '' : '';
   try {
-    await state.inputPreview.start(micId);
+    // Opening one stream per mic needs concrete deviceIds; pre-grant the
+    // dropdown only has the System-default placeholder. Reuse the Detect
+    // button's one-shot grant + refresh to populate it first.
+    if (!Array.from(els.audioInput.options).some((o) => o.value)) {
+      await detectAudioDevices();
+    }
+    const devices = buildMicPreviewRows();
+    if (devices.length === 0) throw new Error('No microphones found.');
     setMicPreviewActive(true);
+    await state.inputPreview.start(devices);
   } catch (e) {
     setMicPreviewActive(false);
     log('warn', 'Mic preview failed: ' + (e && e.message ? e.message : e));
@@ -2644,7 +3335,12 @@ async function refreshAudioInputDevices() {
     // report when a stored deviceId vanishes between sessions.
     const target = seen.has(selected) ? selected : '';
     selectOptionByValue(els.audioInput, target);
-    els.audioInput.dataset.preferred = target;
+    // Pre-permission, browsers enumerate inputs with empty deviceIds — such a
+    // list can't confirm that a saved device is gone. Keep the wanted id in
+    // dataset.preferred so the first authoritative refresh (post-grant)
+    // restores it; only an enumeration with real ids may prune it.
+    const authoritative = inputs.some((d) => d.deviceId);
+    els.audioInput.dataset.preferred = authoritative ? target : selected;
 
     if (inputs.length) {
       const hasLabels = inputs.some((d) => d.label);
@@ -2655,8 +3351,12 @@ async function refreshAudioInputDevices() {
       els.audioInputHint.textContent = 'No microphones found.';
     }
     savePrefs();
+    refreshAllTabChipDevices();
   } catch (e) {
-    els.audioInput.disabled = true;
+    // Keep the dropdown enabled: disabling here would make the guard at the
+    // top of this function skip every future refresh, permanently bricking
+    // device selection after one transient enumeration failure. The existing
+    // options stay usable and the next devicechange retries.
     els.audioInputHint.textContent = 'Couldn\'t read your microphones.';
     log('warn', 'Microphone devices unavailable: ' + (e && e.message ? e.message : e));
   }
@@ -2709,7 +3409,12 @@ async function refreshAudioOutputDevices() {
     // that at least one TTS sink is always ticked — if everything got pruned,
     // or the user previously saved an empty selection, System default wins.
     ensureAtLeastOneOutputTicked();
-    els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
+    // Same rule as the input dropdown: a pre-permission enumeration (empty
+    // deviceIds) can't confirm a saved sink is gone, so it must not prune
+    // dataset.preferred — the post-grant refresh restores the selection.
+    if (outputs.some((d) => d.deviceId)) {
+      els.audioOutput.dataset.preferred = JSON.stringify(getSelectedOutputDeviceIds());
+    }
 
     if (outputs.length) {
       const hasLabels = outputs.some((d) => d.label);
@@ -2721,8 +3426,11 @@ async function refreshAudioOutputDevices() {
     }
     savePrefs();
     refreshActiveDeviceIndicators();
+    refreshAllTabChipDevices();
   } catch (e) {
-    setOutputDeviceListDisabled(true);
+    // Don't disable the list here — the guard at the top of this function
+    // skips refreshes while disabled, so one transient enumeration failure
+    // would brick output selection for the rest of the page's life.
     els.audioOutputHint.textContent = 'Couldn\'t read your speakers.';
     log('warn', 'Audio output devices unavailable: ' + (e && e.message ? e.message : e));
   }
@@ -2932,7 +3640,10 @@ function collectLiveDeviceState() {
 function paintPassthroughLevel(session, level) {
   if (!els.passthroughOutput) return;
   if (!session || !isActive(session)) return;
-  const pct = levelToPct(level);
+  if (document.hidden) return;
+  const pct = levelToPct(level) | 0;
+  if (session._lastPassthroughPct === pct) return;
+  session._lastPassthroughPct = pct;
   els.passthroughOutput
     .querySelectorAll('.device-option.is-live-passthrough')
     .forEach((row) => { row.style.setProperty('--pt-level', pct + '%'); });
@@ -3068,12 +3779,9 @@ function createCompanionCapture(session) {
 async function changeAudioInput() {
   els.audioInput.dataset.preferred = els.audioInput.value;
   onSettingsChange();
-  // Keep the preview meter pointed at the user's current pick — restart it
-  // against the new device so the visualizer doesn't keep listening to the
-  // old one until the auto-stop timer fires.
-  if (state.inputPreview && state.inputPreview.running) {
-    startMicPreview();
-  }
+  // The multi-mic preview meters every device regardless of selection — just
+  // move its highlight to the new pick (no-op when the preview isn't open).
+  refreshMicPreviewSelection();
   const session = activeSession();
   if (!session || !session.running) return;
 
@@ -3159,6 +3867,10 @@ function effectiveStatus(session) {
 function setSessionStatus(session, s) {
   session.status = s;
   refreshSessionDisplay(session);
+  // Renew's enabled state depends on ws.readyState, which only flips alongside
+  // these status transitions — keep the button in sync here so we don't have
+  // to hook every WS open/close site.
+  if (isActive(session)) applyControlButtonsForActiveSession();
 }
 
 // Repaint everything tied to a session's state — chip dot/text, topbar pill
@@ -3194,10 +3906,47 @@ function fmtDuration(ms) {
   return hh > 0 ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+// When a GoAway is pending, surface the countdown to the renewal deadline in
+// the chip's timer slot and on the Renew button so the user sees the limit
+// approaching. During the brief close+reconnect tail (deadline cleared but
+// switching flag still raised), fall back to "Renewing" — there's no
+// countdown to show and the session is genuinely between WS sockets.
+function renewLabelFor(session) {
+  if (!session || !session.switching) return null;
+  const deadline = session.client && session.client.goAwayDeadlineMs;
+  if (deadline && deadline > Date.now()) {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    return `Renew in ${left}s`;
+  }
+  return 'Renewing';
+}
+
 function sessionAgeText(session) {
   if (!session || !session.running) return '00:00';
-  if (session.switching) return 'Switching';
+  const renew = renewLabelFor(session);
+  if (renew) return renew;
   return session.startedAt ? fmtDuration(Date.now() - session.startedAt) : '00:00';
+}
+
+// Refreshes the Renew button's enabled state + label. Disabled unless an
+// active session has an OPEN ws. Label shows the countdown / "Renewing"
+// during a GoAway window, otherwise "Renew". Called from both
+// applyControlButtonsForActiveSession (state transitions) and paintSessionAge
+// (1Hz countdown tick).
+function applyRenewButtonForActiveSession() {
+  const btn = els.btnForceReset;
+  if (!btn) return;
+  const session = activeSession();
+  const label = btn.querySelector('.btn-tx');
+  const renewMsg = session && session.running ? renewLabelFor(session) : null;
+  if (label) label.textContent = renewMsg || 'Renew';
+  if (renewMsg && session && session.client && session.client.goAwayDeadlineMs > Date.now()) {
+    btn.title = `Auto-${renewMsg.toLowerCase()} — click to renew now`;
+  } else {
+    btn.title = 'Reconnect with a fresh context';
+  }
+  const ws = session && session.client && session.client.ws;
+  btn.disabled = !(session && session.running && ws && ws.readyState === WebSocket.OPEN);
 }
 
 function paintSessionAge(session) {
@@ -3209,6 +3958,35 @@ function paintSessionAge(session) {
     session.tabAgeEl.textContent = txt;
     session.tabAgeEl.classList.toggle('is-switching', isSwitching);
   }
+  // Mirror the countdown onto the Renew button each tick so "Renew in Ns"
+  // decrements in lockstep with the chip's age slot. Only the active
+  // session's switching state can be reflected on the single global button.
+  if (isSwitching && isActive(session)) applyRenewButtonForActiveSession();
+}
+
+// One global 1Hz tick that paints the age of every running session. Previously
+// each session owned its own setInterval, drifting in phase and burning extra
+// timer slots. Lifecycle: ensure on the first running session, stop when none
+// remain. ensureAgeTick() is idempotent; maybeStopAgeTick() is a no-op when
+// any session is still running.
+let _ageTickHandle = 0;
+function _anyRunningSession() {
+  for (const s of state.sessions.values()) if (s.running) return true;
+  return false;
+}
+function ensureAgeTick() {
+  if (_ageTickHandle) return;
+  _ageTickHandle = setInterval(() => {
+    for (const s of state.sessions.values()) {
+      if (s.running) paintSessionAge(s);
+    }
+  }, 1000);
+}
+function maybeStopAgeTick() {
+  if (!_ageTickHandle) return;
+  if (_anyRunningSession()) return;
+  clearInterval(_ageTickHandle);
+  _ageTickHandle = 0;
 }
 
 function log(level, message) {
@@ -3263,12 +4041,12 @@ function flushPending(session) {
   const t = ensureLiveTurn(session);
   if (!t) return;
 
-  // Decide BEFORE mutating: if the user has scrolled up to read earlier turns,
-  // don't yank them back to the bottom on every new chunk. 64 px tolerance
-  // covers "I'm at the bottom" including sub-pixel positions from native
-  // smooth scrolling or a partial last line.
+  // Whether to autoscroll is now strictly driven by session.followLatest (the
+  // lock). The scroll listener auto-unlocks the moment the user scrolls away,
+  // so by the time we get here followLatest is already false if the user is
+  // reading backward — we just have to honor it.
   const el = session.transcriptEl;
-  const autoScroll = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 64);
+  const autoScroll = !!session.followLatest;
 
   if (session.pendingInput) {
     if (t.inputText === '') {
@@ -3299,6 +4077,35 @@ function flushPending(session) {
   if (el && autoScroll) {
     el.scrollTop = el.scrollHeight;
   }
+  // scrollHeight just grew — re-evaluate the stuck flag so the jump-to-latest
+  // button surfaces the first time the transcript exceeds the viewport while
+  // the user is reading older turns. The scroll event from autoscroll would
+  // refresh this too, but only if autoScroll was true.
+  if (session.refreshScrollStuck) session.refreshScrollStuck();
+
+  noteContinuousActivity(session);
+}
+
+// Segment the live turn for continuous (translate) sessions, which get no
+// turnComplete from the model. Called after each flush: resets an idle timer so
+// the turn finalizes ~CONTINUOUS_TURN_IDLE_MS after transcription stops (a
+// natural pause), and force-finalizes once the turn exceeds CONTINUOUS_TURN_MAX_MS
+// so a gapless source still produces readable, persisted turns. No-op for the
+// turn-based live engine, which finalizes on onTurnComplete instead.
+function noteContinuousActivity(session) {
+  if (!session || session._finalizing || !session.running || !session.liveTurn) return;
+  if (!session.config || session.config.engine !== 'translate') return;
+  const t = session.liveTurn;
+  if (t.startedAt && (Date.now() - t.startedAt) >= CONTINUOUS_TURN_MAX_MS) {
+    // finalizeTurn clears the idle timer; the next chunk opens a fresh turn.
+    finalizeTurn(session);
+    return;
+  }
+  if (session._contIdleTimer) clearTimeout(session._contIdleTimer);
+  session._contIdleTimer = setTimeout(() => {
+    session._contIdleTimer = 0;
+    finalizeTurn(session);
+  }, CONTINUOUS_TURN_IDLE_MS);
 }
 
 function formatTurnTimestamp(ts, { includeDate = false } = {}) {
@@ -3347,7 +4154,7 @@ function renderHistoryTurn(session, h) {
   inRow.className = 'turn-row input';
   const inLab = document.createElement('span');
   inLab.className = 'turn-label';
-  inLab.textContent = '🎙 ' + langName(session.config.source);
+  inLab.textContent = '🎙 ' + sessionSourceLabel(session.config);
   const inText = document.createElement('span');
   const input = h.input || '';
   inText.className = 'turn-text' + (input ? '' : ' empty');
@@ -3361,7 +4168,7 @@ function renderHistoryTurn(session, h) {
     outRow.className = 'turn-row output';
     const outLab = document.createElement('span');
     outLab.className = 'turn-label';
-    outLab.textContent = '→ ' + langName(session.config.target);
+    outLab.textContent = '→ ' + sessionTargetLabel(session.config);
     const outText = document.createElement('span');
     const output = h.output || '';
     outText.className = 'turn-text' + (output ? '' : ' empty');
@@ -3399,7 +4206,7 @@ function ensureLiveTurn(session) {
   inRow.className = 'turn-row input';
   const inLab = document.createElement('span');
   inLab.className = 'turn-label';
-  inLab.textContent = '🎙 ' + langName(session.config.source);
+  inLab.textContent = '🎙 ' + sessionSourceLabel(session.config);
   const inText = document.createElement('span');
   inText.className = 'turn-text empty';
   // Hold an explicit text-node reference so flushPending / finalizeTurn can
@@ -3418,7 +4225,7 @@ function ensureLiveTurn(session) {
     outRow.className = 'turn-row output';
     const outLab = document.createElement('span');
     outLab.className = 'turn-label';
-    outLab.textContent = '→ ' + langName(session.config.target);
+    outLab.textContent = '→ ' + sessionTargetLabel(session.config);
     outText = document.createElement('span');
     outText.className = 'turn-text empty';
     outTextNode = document.createTextNode('…');
@@ -3455,7 +4262,7 @@ function ensureLiveTurn(session) {
   };
 
   if (state.pip && state.pipFollowingSessionId === session.id) {
-    state.pip.setLangs(langName(session.config.source), langName(session.config.target));
+    state.pip.setLangs(sessionSourceLabel(session.config), sessionTargetLabel(session.config));
     state.pip.setInput('');
     state.pip.setOutput('');
   }
@@ -3467,7 +4274,12 @@ function appendOutputFor(session, chunk) { session.pendingOutput += chunk; if (s
 function clearThinkingFor(session) { if (session && session.liveTurn) session.liveTurn.root.classList.remove('is-thinking'); }
 
 function finalizeTurn(session) {
+  if (session._contIdleTimer) { clearTimeout(session._contIdleTimer); session._contIdleTimer = 0; }
+  // Guard the flush below from re-triggering segmentation (flushPending →
+  // noteContinuousActivity → finalizeTurn) while we're already finalizing.
+  session._finalizing = true;
   flushPending(session);
+  session._finalizing = false;
   if (!session.liveTurn) return;
   const t = session.liveTurn;
   t.root.classList.remove('is-thinking');
@@ -3492,9 +4304,10 @@ function finalizeTurn(session) {
       }
     }
     session.history.push({ input: inText, output: outText, finalizedAt });
-    saveSessions();
+    scheduleSaveSessions();
   }
   session.liveTurn = null;
+  refreshSessionHeader(session);
 }
 
 // Per-session level → meter-fill width. Same sqrt curve as before, just
@@ -3507,7 +4320,16 @@ function levelToPct(level) {
 
 function paintMeterFill(el, level) {
   if (!el) return;
-  el.style.width = levelToPct(level) + '%';
+  // Quantize to integer percent and skip the write when nothing visibly changed.
+  // LevelMeter callbacks fire at ~60Hz; with 3 sessions × 2 meters this is
+  // ~360 DOM writes/sec at baseline. Most of those produce no visual delta —
+  // the rounded percent only steps about a dozen times per second of audio.
+  // Background-tab paints are also wasted; the rAF still ticks slowly there.
+  if (document.hidden) return;
+  const pct = levelToPct(level) | 0;
+  if (el._lastPct === pct) return;
+  el._lastPct = pct;
+  el.style.width = pct + '%';
 }
 
 function setMicLevelFor(session, level) {
@@ -3539,12 +4361,14 @@ function applyControlButtonsForActiveSession() {
     els.btnStart.disabled = true;
     els.btnStop.disabled = true;
     setStartStopRunning(false);
-    els.btnHush.disabled = true;
-    els.btnPause.disabled = true;
-    els.btnPause.classList.remove('is-paused');
-    els.btnPause.title = 'Pause mic';
-    els.btnPause.setAttribute('aria-label', 'Pause mic');
-    els.btnPause.setAttribute('aria-pressed', 'false');
+    // DEPRECATED: mic pause + silence buttons retired.
+    // els.btnHush.disabled = true;
+    // els.btnPause.disabled = true;
+    // els.btnPause.classList.remove('is-paused');
+    // els.btnPause.title = 'Pause mic';
+    // els.btnPause.setAttribute('aria-label', 'Pause mic');
+    // els.btnPause.setAttribute('aria-pressed', 'false');
+    applyRenewButtonForActiveSession();
     setControlsLocked(false);
     if (state.pip) state.pip.setRunning(false, false, true);
     refreshPttButtonState();
@@ -3553,13 +4377,17 @@ function applyControlButtonsForActiveSession() {
   els.btnStart.disabled = session.running;
   els.btnStop.disabled = !session.running;
   setStartStopRunning(!!session.running);
-  els.btnHush.disabled = !session.running || !session.isAudio;
-  els.btnPause.disabled = !session.running;
-  els.btnPause.classList.toggle('is-paused', !!session.paused);
-  els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
+  // DEPRECATED: mic pause + silence buttons retired.
+  // els.btnHush.disabled = !session.running || !session.isAudio;
+  // els.btnPause.disabled = !session.running;
+  // Renew button: enable/disable + label (countdown / "Renewing" / "Renew").
+  // See applyRenewButtonForActiveSession for the full rules.
+  applyRenewButtonForActiveSession();
+  // els.btnPause.classList.toggle('is-paused', !!session.paused);
+  // els.btnPause.title = session.paused ? 'Resume mic' : 'Pause mic';
   // Keep aria-label and aria-pressed in sync so SR users hear the right state.
-  els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
-  els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
+  // els.btnPause.setAttribute('aria-label', session.paused ? 'Resume mic' : 'Pause mic');
+  // els.btnPause.setAttribute('aria-pressed', session.paused ? 'true' : 'false');
   setControlsLocked(session.running);
   // Mirror into PIP so its Start/Stop/Pause/Hush buttons stay in sync — eg.
   // when togglePause runs from the main control bar, the PIP's pause label
@@ -3654,13 +4482,16 @@ async function startSession(session) {
     return;
   }
   const cfg = session.config;
-  if (cfg.source === cfg.target) {
+  const isTranslate = cfg.engine === 'translate';
+  // The translate engine auto-detects the source, so there's no source/target
+  // pair to validate — only the live engine needs distinct languages.
+  if (!isTranslate && cfg.source === cfg.target) {
     log('error', 'Source and target languages must differ.');
     return;
   }
   savePrefs();
 
-  const isAudio = cfg.mode === 'audio';
+  const isAudio = isTranslate ? true : cfg.mode === 'audio';
 
   setSessionStatus(session, 'connecting');
   // Eagerly disable Start while the pipeline negotiates so a double-click
@@ -3670,7 +4501,7 @@ async function startSession(session) {
     els.btnStart.disabled = true;
     els.btnStop.disabled = false;
     setStartStopRunning(true);
-    els.btnHush.disabled = !isAudio;
+    // DEPRECATED: els.btnHush.disabled = !isAudio;
     setControlsLocked(true);
   }
 
@@ -3690,29 +4521,25 @@ async function startSession(session) {
     session.player = null;
   }
 
-  const systemInstruction = GeminiLive.renderSystemPrompt(
-    effectivePromptTemplateFor(cfg.mode, cfg.dir),
-    langName(cfg.source), langName(cfg.target));
+  // PTT is a live-engine affordance only; the translate model streams
+  // continuously and has no manual-activity signalling.
+  const isPtt = !isTranslate && cfg.pttMode === 'ptt';
 
-  const isPtt = cfg.pttMode === 'ptt';
+  // Output transcription is on for everything except live transcribe mode.
+  const wantsOutputText = isTranslate || cfg.mode !== 'transcribe';
 
-  session.client = new GeminiLive.GeminiLiveClient({
+  const clientOpts = {
     apiKey,
     voice: cfg.voice,
-    systemInstruction,
-    vad: cfg.vad,
-    // manualActivity disables Gemini's auto VAD so we control turn boundaries
-    // via activityStart/activityEnd (sent from the PTT key handlers below).
-    manualActivity: isPtt,
     resumeHandle: session.resumeHandle || null,
     onResumeHandle: (handle) => {
       session.resumeHandle = handle || null;
-      saveSessions();
+      scheduleSaveSessions();
     },
-    useOutputTranscription: cfg.mode !== 'transcribe',
+    useOutputTranscription: wantsOutputText,
     onAudio: isAudio ? (b64) => { clearThinkingFor(session); state.ttsCoordinator.enqueueChunk(session, b64); } : () => {},
     onInputChunk:  (chunk) => appendInputFor(session, chunk),
-    onOutputChunk: cfg.mode !== 'transcribe' ? (chunk) => appendOutputFor(session, chunk) : () => {},
+    onOutputChunk: wantsOutputText ? (chunk) => appendOutputFor(session, chunk) : () => {},
     onTurnComplete: () => {
       if (isAudio) state.ttsCoordinator.markTurnComplete(session);
       finalizeTurn(session);
@@ -3730,7 +4557,27 @@ async function startSession(session) {
       refreshSessionDisplay(session);
     },
     onLog: log,
-  });
+  };
+
+  if (isTranslate) {
+    // Dedicated translation model: config-driven, no system prompt, no VAD.
+    clientOpts.model = GeminiLive.TRANSLATE_MODEL;
+    clientOpts.translationConfig = {
+      targetLanguageCode: cfg.translateTarget || DEFAULT_TRANSLATE_TARGET,
+      echoTargetLanguage: !!cfg.echoTarget,
+    };
+    clientOpts.manualActivity = false;
+  } else {
+    clientOpts.systemInstruction = GeminiLive.renderSystemPrompt(
+      effectivePromptTemplateFor(cfg.mode, cfg.dir),
+      langName(cfg.source), langName(cfg.target));
+    clientOpts.vad = cfg.vad;
+    // manualActivity disables Gemini's auto VAD so we control turn boundaries
+    // via activityStart/activityEnd (sent from the PTT key handlers below).
+    clientOpts.manualActivity = isPtt;
+  }
+
+  session.client = new GeminiLive.GeminiLiveClient(clientOpts);
 
   // PTT integration:
   //   - The in-page Talk button (footer + popup) is the primary input and
@@ -3826,16 +4673,17 @@ async function startSession(session) {
   applyPassthrough(session);
 
   session.startedAt = Date.now();
-  if (session.ageTimer) clearInterval(session.ageTimer);
-  session.ageTimer = setInterval(() => {
-    paintSessionAge(session);
-  }, 1000);
+  ensureAgeTick();
   // Paint once immediately so the chip doesn't read "00:00" for a full second.
   paintSessionAge(session);
 
-  const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
-  const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
-  log('info', `Session started: ${langName(cfg.source)} ${dirLabel} ${langName(cfg.target)}${modeLabel}`);
+  if (isTranslate) {
+    log('info', `Session started: Auto → ${sessionTargetLabel(cfg)} (live translate)`);
+  } else {
+    const dirLabel = cfg.dir === 'oneway' ? '→' : '⇄';
+    const modeLabel = cfg.mode !== 'audio' ? ` (${cfg.mode === 'text' ? 'text only' : 'transcribe'})` : '';
+    log('info', `Session started: ${langName(cfg.source)} ${dirLabel} ${langName(cfg.target)}${modeLabel}`);
+  }
 }
 
 async function stopPipeline() {
@@ -3884,7 +4732,7 @@ async function stopSession(session) {
   session.running = false;
   session.paused = false;
   session.switching = false;
-  if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
+  maybeStopAgeTick();
   finalizeTurn(session);
   setSessionStatus(session, 'idle');
   // Stale meter state would imply audio is still flowing; zero it explicitly.
@@ -3903,8 +4751,11 @@ async function stopSession(session) {
 }
 
 function setControlsLocked(locked) {
+  els.engineSelect.disabled  = locked;
   els.langSource.disabled    = locked;
   els.langTarget.disabled    = locked;
+  if (els.translateTarget) els.translateTarget.disabled = locked;
+  if (els.echoTarget)      els.echoTarget.disabled      = locked;
   els.voice.disabled         = locked;
   els.audioSource.disabled   = locked;
   els.apiKey.disabled        = locked;
@@ -4088,25 +4939,34 @@ function topmostOpenSheet() {
   return last;
 }
 
-function clearConversation() {
-  const session = activeSession();
+async function clearConversation(session) {
+  if (!session) session = activeSession();
   if (!session) return;
   // No confirmation when there's nothing to lose — empty state is the only
   // child, so clearing is a visual no-op anyway.
   const turnCount = session.transcriptEl
     ? session.transcriptEl.querySelectorAll(':scope > .turn').length
     : 0;
-  if ((turnCount > 0 || session.history.length > 0) &&
-      !window.confirm('Clear this session\'s conversation?')) return;
+  if (turnCount > 0 || session.history.length > 0) {
+    const ok = await showConfirm({
+      title: 'Clear conversation?',
+      message: 'Clear this session\'s conversation? This cannot be undone.',
+      confirmLabel: 'Clear',
+      confirmStyle: 'danger',
+    });
+    if (!ok) return;
+  }
   session.liveTurn = null;
   session.history = [];
+  session.exportedTurnCount = 0;
   session.pendingInput = '';
   session.pendingOutput = '';
   if (session.transcriptEl) {
     session.transcriptEl.innerHTML = '';
     renderSessionEmptyState(session);
   }
-  if (state.pip) { state.pip.setInput(''); state.pip.setOutput(''); }
+  if (state.pip && isActive(session)) { state.pip.setInput(''); state.pip.setOutput(''); }
+  refreshSessionHeader(session);
   saveSessions();
 }
 
@@ -4140,30 +5000,52 @@ function conversationTurns(session) {
   return out;
 }
 
-// Export popup menu controls. The two format buttons (JSON / Text) used to
-// sit side-by-side eating real estate in the actions row; collapsing them
-// behind one Export button keeps the row scannable. The menu is dismissed
-// by outside-click (document-level listener installed in wireUI) and by
-// pressing Escape (global keydown handler in wireUI).
-function isExportMenuOpen() {
-  return !!(els.exportMenu && !els.exportMenu.hasAttribute('hidden'));
+// Export popup menus live per-session in the session header strip. The
+// menu groups "this session" and "all sessions" exports. Each menu is keyed
+// off its own (menu, trigger) pair so multiple chips can co-exist without
+// clobbering each other's open state. Outside-click and Escape close any
+// open menu (handlers in wireUI).
+function isExportMenuOpen(menuEl) {
+  return !!(menuEl && !menuEl.hasAttribute('hidden'));
 }
-function openExportMenu() {
-  if (!els.exportMenu || !els.btnExport) return;
-  els.exportMenu.removeAttribute('hidden');
-  els.btnExport.setAttribute('aria-expanded', 'true');
-  // Move focus to the first menu item so keyboard users land somewhere usable.
-  const firstItem = els.exportMenu.querySelector('.export-item');
+function openExportMenu(menuEl, triggerEl) {
+  if (!menuEl) return;
+  closeAllExportMenus(menuEl);
+  menuEl.removeAttribute('hidden');
+  if (triggerEl) triggerEl.setAttribute('aria-expanded', 'true');
+  const firstItem = menuEl.querySelector('.export-item');
   if (firstItem) firstItem.focus();
 }
-function closeExportMenu() {
-  if (!els.exportMenu || !els.btnExport) return;
-  if (!isExportMenuOpen()) return;
-  els.exportMenu.setAttribute('hidden', '');
-  els.btnExport.setAttribute('aria-expanded', 'false');
+function closeExportMenu(menuEl, triggerEl) {
+  if (!menuEl) return;
+  if (!isExportMenuOpen(menuEl)) return;
+  menuEl.setAttribute('hidden', '');
+  if (triggerEl) triggerEl.setAttribute('aria-expanded', 'false');
 }
-function toggleExportMenu() {
-  if (isExportMenuOpen()) closeExportMenu(); else openExportMenu();
+function toggleExportMenu(menuEl, triggerEl) {
+  if (isExportMenuOpen(menuEl)) closeExportMenu(menuEl, triggerEl);
+  else openExportMenu(menuEl, triggerEl);
+}
+function closeAllExportMenus(exceptEl) {
+  if (!state || !state.sessions) return;
+  for (const s of state.sessions.values()) {
+    if (!s.headerExportMenu || s.headerExportMenu === exceptEl) continue;
+    closeExportMenu(s.headerExportMenu, s.headerExportBtn);
+  }
+}
+function anyExportMenuOpen() {
+  if (!state || !state.sessions) return false;
+  for (const s of state.sessions.values()) {
+    if (isExportMenuOpen(s.headerExportMenu)) return true;
+  }
+  return false;
+}
+function findOpenExportMenu() {
+  if (!state || !state.sessions) return null;
+  for (const s of state.sessions.values()) {
+    if (isExportMenuOpen(s.headerExportMenu)) return s;
+  }
+  return null;
 }
 
 function downloadText(filename, text, type) {
@@ -4195,8 +5077,10 @@ function exportTimeline(entries) {
       index: 0,
       sessionIndex: entry.index,
       sessionId: entry.session.id,
+      engine: entry.session.config.engine,
       source: entry.session.config.source,
       target: entry.session.config.target,
+      translateTarget: entry.session.config.translateTarget,
       mode: entry.session.config.mode,
       input: turn.input,
       output: turn.output,
@@ -4219,19 +5103,45 @@ function exportTimeline(entries) {
     });
 }
 
-function exportConversation(format) {
-  const sessions = exportableSessionEntries();
-  if (sessions.length === 0) {
-    log('warn', 'Nothing to export for any session.');
-    return;
+function exportConversation(format, opts) {
+  const scope = (opts && opts.scope === 'all') ? 'all' : 'session';
+  let sessions;
+  if (scope === 'session') {
+    const targetSession = (opts && opts.session) || activeSession();
+    if (!targetSession) {
+      log('warn', 'No session selected to export.');
+      return;
+    }
+    const turns = conversationTurns(targetSession);
+    if (turns.length === 0) {
+      log('warn', 'Nothing to export for this session.');
+      return;
+    }
+    sessions = [{ index: 1, session: targetSession, turns }];
+  } else {
+    sessions = exportableSessionEntries();
+    if (sessions.length === 0) {
+      log('warn', 'Nothing to export for any session.');
+      return;
+    }
   }
   const turns = exportTimeline(sessions);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const base = `live-translator-all-sessions-${stamp}`;
+  let base;
+  if (scope === 'session') {
+    const cfg = sessions[0].session.config || {};
+    const pair = cfg.engine === 'translate'
+      ? `auto-${(cfg.translateTarget || '').toLowerCase()}`
+      : `${(cfg.source || '').toLowerCase()}-${(cfg.target || '').toLowerCase()}`;
+    base = `live-translator-${pair}-${stamp}`;
+  } else {
+    base = `live-translator-all-sessions-${stamp}`;
+  }
   const exportedAt = new Date();
   if (format === 'json') {
     downloadText(base + '.json', JSON.stringify({
       exportedAt: exportedAt.toISOString(),
+      scope,
       sessionCount: sessions.length,
       sessions: sessions.map((entry) => ({
         index: entry.index,
@@ -4246,19 +5156,31 @@ function exportConversation(format) {
   } else {
     const lines = [
       'Live Translator export',
+      `Scope: ${scope === 'session' ? 'single session' : 'all sessions'}`,
       `Sessions: ${sessions.length}`,
       `Exported: ${exportedAt.toLocaleString()}`,
       '',
       ...turns.flatMap((t) => [
-        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''} - Session ${t.sessionIndex} - ${langName(t.source)} -> ${langName(t.target)}`,
-        `${langName(t.source)}: ${t.input || '(empty)'}`,
-        t.mode === 'transcribe' ? '' : `${langName(t.target)}: ${t.output || '(empty)'}`,
+        `#${t.index}${t.finalizedAtMs ? ` - ${formatTurnTimestamp(t.finalizedAtMs, { includeDate: true })}` : ''}${scope === 'all' ? ` - Session ${t.sessionIndex}` : ''} - ${sessionSourceLabel(t)} -> ${sessionTargetLabel(t)}`,
+        `${sessionSourceLabel(t)}: ${t.input || '(empty)'}`,
+        t.mode === 'transcribe' ? '' : `${sessionTargetLabel(t)}: ${t.output || '(empty)'}`,
         '',
       ]),
     ];
     downloadText(base + '.txt', lines.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'), 'text/plain');
   }
-  log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
+  // Mark covered sessions as "downloaded up to here" so closeSession doesn't
+  // warn about throwing them away. We use history.length (not turns.length),
+  // since turns may include the live partial — which will keep growing.
+  for (const entry of sessions) {
+    entry.session.exportedTurnCount = entry.session.history.length;
+  }
+  saveSessions();
+  if (scope === 'session') {
+    log('info', `Exported session as ${format.toUpperCase()}.`);
+  } else {
+    log('info', `Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'} as ${format.toUpperCase()}.`);
+  }
 }
 
 // ─── System prompt editor ────────────────────────────────────────────────────
@@ -4302,787 +5224,53 @@ function resetPromptEditor() {
   log('info', 'System prompt reset to default for the current mode.');
 }
 
-// Confirm-then-close wrapper used by the close × and the backdrop. Returns
-// true if the close should proceed; false to abort.
-function confirmDiscardPromptEdits() {
-  if (!isPromptEditorDirty()) return true;
-  return window.confirm('Discard unsaved system prompt edits?');
+// Confirm-then-close wrapper used by the close × / backdrop / Escape paths.
+// If there are no unsaved edits, closes immediately. Otherwise opens the
+// in-app confirm sheet on top of the prompt sheet and closes the prompt sheet
+// only if the user confirms discard. Callers should fire-and-forget — the
+// dialog stack handles ordering.
+async function tryClosePromptSheet() {
+  if (!isPromptEditorDirty()) { closeSheet('prompt-sheet'); return; }
+  const ok = await showConfirm({
+    title: 'Discard edits?',
+    message: 'You have unsaved changes to the system prompt. Discard them?',
+    confirmLabel: 'Discard',
+    confirmStyle: 'danger',
+  });
+  if (ok) closeSheet('prompt-sheet');
 }
 
 // ─── Picture-in-Picture ──────────────────────────────────────────────────────
-// PIP_DISPLAY_MODES: keys are persisted in prefs; do not rename.
-const PIP_DISPLAY_MODES = ['both', 'input', 'output'];
-// Font-size steps in rem multipliers. Index 1 ('normal') is the default; the
-// step is small enough to be useful on tiny PiP windows without overflowing.
-const PIP_FONT_STEPS = [0.78, 1.00, 1.22, 1.50];
-const PIP_FONT_LABELS = ['xs', 'sm', 'md', 'lg'];
-
-class PipController {
-  constructor({ onStart, onStop, onPause, onHush, onClear,
-                onCycleSession, onPttToggle, onPrefsChange,
-                onForceReset } = {}) {
-    this.win = null;
-    this.doc = null;
-
-    // Callbacks back into the main page. PIP runs in a same-origin window, so
-    // closures here execute in the main JS context — these wire the PIP's
-    // header buttons to the same actions the main controls already trigger.
-    // Callers pass them so PipController stays decoupled from main-page
-    // globals.
-    this.onStart = onStart || (() => {});
-    this.onStop = onStop || (() => {});
-    this.onPause = onPause || (() => {});
-    this.onHush = onHush || (() => {});
-    this.onClear = onClear || (() => {});
-    // Cycle through running/idle sessions when more than one exists. Hidden
-    // when the count is <= 1.
-    this.onCycleSession = onCycleSession || (() => {});
-    // PTT button — tap to engage, tap to release. Standalone implementation:
-    // main page wires this to togglePtt(), which flips session.pttHeld and
-    // tells the GeminiLive client via activityStart/activityEnd. The button
-    // hides itself when the active session isn't in PTT mode (setPttVisible).
-    this.onPttToggle = onPttToggle || (() => {});
-    this.onPrefsChange = onPrefsChange || (() => {});
-    this.onForceReset = onForceReset || (() => {});
-    this.onClose = () => {};
-
-    // Element references — set by _setup, nulled by _cleanup.
-    this.statusEl = null;
-    this.dotEl = null;
-    this.inputLabelEl = null;
-    this.outputLabelEl = null;
-    this.inputEl = null;
-    this.outputEl = null;
-    this.inputRowEl = null;
-    this.outputRowEl = null;
-    // Header action buttons + settings slide-over.
-    this.btnStartStopEl = null;
-    this.btnPttEl = null;
-    this.btnCycleEl = null;
-    this.btnSettingsToggleEl = null;
-    this.settingsPanelEl = null;
-    this.settingsBackdropEl = null;
-    this.btnPauseEl = null;
-    this.btnHushEl = null;
-    this.btnClearEl = null;
-    this.displaySegEl = null;
-    this.fontDecEl = null;
-    this.fontIncEl = null;
-    this.fontLabelEl = null;
-
-    // Persisted view state. setDisplayMode / setFontStep update these and
-    // fire onPrefsChange so the main page can save into prefs.
-    this._displayMode = 'both';
-    this._fontStep = 1;
-    this._settingsOpen = false;
-    this._sessionCount = 1;
-    this._pttHeld = false;
-
-    // Mirror of upstream state — used both to seed _setup on (re)open and to
-    // update the visible DOM whenever the main page calls a setter.
-    this._currentInput = '';
-    this._currentOutput = '';
-    this._currentStatus = 'Idle';
-    this._currentLive = false;
-    this._currentEffStatus = 'idle';
-    this._currentRunning = false;
-    this._currentPaused = false;
-    this._currentIsAudio = true;
-    this._inLang = '';
-    this._outLang = '';
-  }
-
-  static isDocPipSupported() {
-    return 'documentPictureInPicture' in window;
-  }
-
-  isOpen() { return !!(this.win && !this.win.closed); }
-
-  async open() {
-    if (this.isOpen()) { try { this.win.focus(); } catch (_) {} return; }
-    if (PipController.isDocPipSupported()) {
-      this.win = await window.documentPictureInPicture.requestWindow({
-        // Compact default; the new single-row header lets us reclaim the
-        // ~44 px the old tab bar used. User can resize, container queries
-        // collapse buttons as it shrinks.
-        width: 380, height: 280,
-      });
-    } else {
-      this.win = window.open('', 'live-translator-pip',
-        'width=380,height=280,resizable=yes,scrollbars=yes,noopener=no');
-      if (!this.win) throw new Error('Popup blocked. Allow popups for this site.');
-    }
-    this._setup();
-    this.win.addEventListener('pagehide', () => this._cleanup());
-    if (this.win.document) this.win.document.title = 'Live Translator';
-  }
-
-  _setup() {
-    const doc = this.win.document;
-    this.doc = doc;
-    doc.documentElement.lang = 'en';
-    // Without this, mobile browsers fall back to a 980px virtual viewport and
-    // render the PiP content shrunk to a fraction of the real window width.
-    const viewport = doc.createElement('meta');
-    viewport.name = 'viewport';
-    viewport.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
-    doc.head.appendChild(viewport);
-    // Container queries (below) need a known container. Body is the natural
-    // root and `inline-size` lets buttons hide based on PIP width without JS.
-    doc.documentElement.style.height = '100%';
-    // Pull the palette from the main document's CSS variables so the PiP
-    // window can never drift from the app theme. Falls back to literal
-    // hex values when a custom property is missing (host page didn't ship
-    // them, or the PiP was opened from a barebones context).
-    const cs = getComputedStyle(document.documentElement);
-    const v = (name, fallback) => (cs.getPropertyValue(name).trim() || fallback);
-    const palette = {
-      bg0:    v('--bg-0',      '#0b0d12'),
-      bg1:    v('--bg-1',      '#11141b'),
-      bg2:    v('--bg-2',      '#161a23'),
-      bg3:    v('--bg-3',      '#1d2230'),
-      fg0:    v('--fg-0',      '#e8ecf3'),
-      fg1:    v('--fg-1',      '#aab2c4'),
-      fg2:    v('--fg-2',      '#8a93a8'),
-      accent: v('--accent',    '#7c9cff'),
-      accent2:v('--accent-2',  '#a78bfa'),
-      warn:   v('--warn',      '#f0b429'),
-      bad:    v('--bad',       '#ef4444'),
-      good:   v('--good',      '#34d399'),
-      line:   v('--line-soft', '#1c2230'),
-    };
-    const style = doc.createElement('style');
-    style.textContent = `
-      html, body {
-        margin: 0; height: 100%;
-        background: ${palette.bg0}; color: ${palette.fg0};
-        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
-        display: flex; flex-direction: column; overflow: hidden;
-        /* Container query target — every responsive hide rule below keys off
-           the body's inline-size, so the PIP collapses gracefully as the user
-           drags it down to a tiny sliver. */
-        container: pip / inline-size;
-        --pip-scale: 1;
-        transition: background-color 0.25s ease, color 0.25s ease;
-      }
-
-      /* ─── Header (single compact action row) ─── */
-      header {
-        display: flex; align-items: center; gap: 4px;
-        padding: 4px 6px;
-        border-bottom: 1px solid ${palette.line};
-        background: ${palette.bg1}; flex: 0 0 auto;
-        font-size: 12px;
-        min-height: 0;
-      }
-      /* The pill is the priority element — never hides. Its label collapses
-         to just the dot when space gets very tight. */
-      .pip-pill {
-        display: inline-flex; align-items: center; gap: 5px;
-        padding: 3px 8px; border-radius: 999px;
-        font-size: 10.5px; font-weight: 600;
-        background: ${palette.bg3};
-        flex-shrink: 0;
-      }
-      .pip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${palette.fg2}; }
-      .pip-dot.live { background: ${palette.accent}; animation: pip-pulse 0.8s infinite; }
-      @keyframes pip-pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
-
-      /* Brand sits at the far right, takes leftover space, and is the FIRST
-         thing to disappear when the user shrinks the PIP. */
-      .pip-brand-wrap {
-        flex: 1 1 0; min-width: 0;
-        display: flex; align-items: center; justify-content: flex-end; gap: 4px;
-        color: ${palette.fg2}; font-size: 11px;
-        overflow: hidden;
-      }
-      .pip-brand-text {
-        font-weight: 600;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      }
-      .pip-brand-globe { flex-shrink: 0; font-size: 11px; opacity: 0.6; }
-
-      /* Header icon buttons. Square 28px so the whole header stays compact;
-         touch targets still get the 44px effective via padding+focus ring. */
-      .pip-iconbtn {
-        flex-shrink: 0;
-        width: 28px; height: 28px; padding: 0;
-        background: transparent; color: ${palette.fg1};
-        border: 1px solid transparent;
-        border-radius: 6px;
-        font: inherit; font-size: 14px; line-height: 1;
-        cursor: pointer;
-        display: inline-flex; align-items: center; justify-content: center;
-      }
-      .pip-iconbtn:hover:not(:disabled) { background: ${palette.bg3}; color: ${palette.fg0}; }
-      .pip-iconbtn:disabled { opacity: 0.35; cursor: not-allowed; }
-      .pip-iconbtn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -1px; }
-      /* Start/Stop tint — green when stopped (ready to start), red when running. */
-      .pip-iconbtn.pip-startstop[data-running="false"] { color: ${palette.good}; }
-      .pip-iconbtn.pip-startstop[data-running="true"]  { color: ${palette.bad}; }
-      .pip-iconbtn.pip-ptt[data-held="true"] {
-        background: ${palette.accent}; color: #0b0d12;
-      }
-      .pip-iconbtn.pip-settings-toggle[data-open="true"] {
-        background: ${palette.bg3}; color: ${palette.accent};
-      }
-      /* Force-reconnect: warn tint hints at destructive action (loses model context). */
-      .pip-iconbtn.pip-reset { color: ${palette.warn}; }
-      .pip-iconbtn.pip-reset:hover:not(:disabled) {
-        background: ${palette.bg3}; color: ${palette.warn};
-      }
-      .pip-iconbtn.is-hidden { display: none; }
-
-      /* ─── Container-query responsive hiding ─────────────────────────
-         Priority of disappearance as the PIP gets narrower:
-           > 360px   everything visible
-           ≤ 360px   brand text drops, only globe stays
-           ≤ 310px   brand wrap fully drops
-           ≤ 270px   pill label drops (pill becomes just the dot)
-           ≤ 240px   PTT button drops
-           ≤ 225px   force-reconnect button drops
-           ≤ 210px   cycle button drops
-         Settings cog + Start/Stop always remain — they're the essentials. */
-      @container pip (max-width: 360px) {
-        .pip-brand-text { display: none; }
-      }
-      @container pip (max-width: 310px) {
-        .pip-brand-wrap { display: none; }
-      }
-      @container pip (max-width: 270px) {
-        .pip-pill-label { display: none; }
-        .pip-pill { padding: 5px 6px; }
-      }
-      @container pip (max-width: 240px) {
-        .pip-iconbtn.pip-ptt { display: none; }
-      }
-      @container pip (max-width: 225px) {
-        .pip-iconbtn.pip-reset { display: none; }
-      }
-      @container pip (max-width: 210px) {
-        .pip-iconbtn.pip-cycle { display: none; }
-      }
-
-      /* ─── Transcript ─── */
-      main.pip-transcript {
-        padding: 12px 14px; overflow-y: auto;
-        display: flex; flex-direction: column; gap: 10px;
-        flex: 1; min-height: 0;
-      }
-      .pip-row { transition: opacity 0.2s ease; }
-      .pip-row.is-hidden { display: none; }
-      .pip-label {
-        font-size: calc(10px * var(--pip-scale)); font-weight: 700;
-        letter-spacing: 0.6px; text-transform: uppercase;
-        color: ${palette.fg2}; margin-bottom: 4px;
-      }
-      .pip-input-lab { color: ${palette.accent}; }
-      .pip-output-lab { color: ${palette.accent2}; }
-      .pip-input  { font-size: calc(15px * var(--pip-scale)); color: ${palette.fg1};
-                    line-height: 1.45; word-wrap: break-word; }
-      .pip-output { font-size: calc(20px * var(--pip-scale)); font-weight: 500;
-                    line-height: 1.4; word-wrap: break-word; }
-      .pip-empty { color: ${palette.fg2}; font-style: italic; }
-
-      /* ─── Settings slide-over panel ─────────────────────────────────
-         Sits on top of the transcript, slides in from the right. Backdrop
-         is interactive (closes the panel on click) but very subtle so the
-         underlying transcript stays readable. */
-      .pip-settings-backdrop {
-        position: absolute; inset: 0;
-        background: rgba(0, 0, 0, 0.35);
-        opacity: 0; pointer-events: none;
-        transition: opacity 0.18s ease;
-        z-index: 5;
-      }
-      .pip-settings-backdrop.is-open { opacity: 1; pointer-events: auto; }
-      .pip-settings-panel {
-        position: absolute; top: 0; right: 0; bottom: 0;
-        width: min(280px, 92vw);
-        background: ${palette.bg1};
-        border-left: 1px solid ${palette.line};
-        transform: translateX(100%);
-        transition: transform 0.22s ease-out;
-        z-index: 6;
-        display: flex; flex-direction: column;
-        overflow: hidden;
-      }
-      .pip-settings-panel.is-open { transform: translateX(0); }
-      .pip-settings-head {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 8px 10px 8px 14px;
-        border-bottom: 1px solid ${palette.line};
-        flex: 0 0 auto;
-      }
-      .pip-settings-title {
-        font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
-        text-transform: uppercase; color: ${palette.fg1};
-      }
-      .pip-settings-body {
-        padding: 12px 14px;
-        display: flex; flex-direction: column; gap: 14px;
-        overflow-y: auto; flex: 1; min-height: 0;
-      }
-      .pip-field { display: flex; flex-direction: column; gap: 6px; }
-      .pip-field-label {
-        font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
-        text-transform: uppercase; color: ${palette.fg2};
-      }
-      .pip-row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-      .pip-btn {
-        background: ${palette.bg3}; color: ${palette.fg0};
-        border: 1px solid ${palette.line}; border-radius: 7px;
-        padding: 7px 10px; font: inherit; font-size: 12px; font-weight: 600;
-        cursor: pointer; min-height: 34px;
-        display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-      }
-      .pip-btn:hover:not(:disabled) { background: ${palette.bg2}; }
-      .pip-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-      .pip-btn.warn   { background: ${palette.warn}; color: #0b0d12; border-color: transparent; }
-      .pip-btn.danger { background: ${palette.bad};  color: #fff;    border-color: transparent; }
-      .pip-btn.flex { flex: 1 1 0; }
-      .pip-btn:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: 2px; }
-
-      .pip-seg {
-        display: flex; gap: 0;
-        background: ${palette.bg3}; border: 1px solid ${palette.line};
-        border-radius: 7px; padding: 2px; overflow: hidden;
-      }
-      .pip-seg-opt {
-        flex: 1; background: transparent; color: ${palette.fg1};
-        border: 0; border-radius: 5px; padding: 6px 6px;
-        font: inherit; font-size: 11.5px; font-weight: 600;
-        cursor: pointer; min-height: 28px;
-      }
-      .pip-seg-opt.is-active { background: ${palette.accent}; color: #0b0d12; }
-      .pip-seg-opt:focus-visible { outline: 2px solid ${palette.accent}; outline-offset: -1px; }
-      .pip-font-row { display: flex; align-items: center; gap: 6px; }
-      .pip-font-row .pip-btn { padding: 6px 10px; min-width: 40px; }
-      .pip-font-label {
-        flex: 1; text-align: center; font-size: 11px;
-        color: ${palette.fg2}; text-transform: uppercase; letter-spacing: 0.06em;
-      }
-
-      /* The transcript area needs to be the positioning context for the
-         absolutely-positioned settings panel + backdrop so the slide-over
-         covers only the body, not the header. */
-      .pip-body-wrap {
-        position: relative;
-        flex: 1; min-height: 0; display: flex; flex-direction: column;
-      }
-
-      /* State-driven background tints + a 4 px stripe along the top of the
-         body. The stripe is a *secondary* signal that doesn't depend on
-         hue discrimination — width and presence are enough to identify the
-         state even with significant colour-vision deficiency. Mix
-         percentages are deliberately high (25 – 50 %) so neighbouring
-         states are clearly distinct on the background alone.
-         The states are also placed on a lightness ladder (idle is darkest,
-         translating + error are brightest) so even a desaturated view shows
-         meaningful contrast. */
-      body {
-        --pip-state-accent: transparent;
-        --pip-state-mix: 0%;
-        background: ${palette.bg0};
-      }
-      body::before {
-        content: '';
-        position: fixed; top: 0; left: 0; right: 0;
-        height: 4px;
-        background: var(--pip-state-accent);
-        z-index: 100;
-        transition: background 0.25s ease;
-        pointer-events: none;
-      }
-      body:not(.pip-state-idle) {
-        background: color-mix(in srgb, var(--pip-state-accent) var(--pip-state-mix), ${palette.bg0});
-      }
-
-      body.pip-state-idle         { --pip-state-accent: ${palette.line};   --pip-state-mix: 0%; }
-      /* Cool / cold side: ready, queued, waiting — all blue-ish + dim. */
-      body.pip-state-waiting      { --pip-state-accent: #38bdf8;           --pip-state-mix: 22%; } /* cyan, dim */
-      body.pip-state-queued       { --pip-state-accent: ${palette.accent2}; --pip-state-mix: 32%; } /* violet */
-      body.pip-state-connected    { --pip-state-accent: ${palette.good};   --pip-state-mix: 28%; } /* green */
-      /* Transitional warm: connecting, paused. */
-      body.pip-state-paused       { --pip-state-accent: #94a3b8;           --pip-state-mix: 28%; } /* slate */
-      body.pip-state-connecting   { --pip-state-accent: ${palette.warn};   --pip-state-mix: 30%; } /* amber */
-      /* High-attention: speaking + reconnecting + error are the brightest. */
-      body.pip-state-switching    { --pip-state-accent: ${palette.warn};   --pip-state-mix: 38%; } /* amber — server signaled imminent renewal */
-      body.pip-state-reconnecting { --pip-state-accent: #fb923c;           --pip-state-mix: 45%; } /* orange */
-      body.pip-state-translating  { --pip-state-accent: ${palette.accent}; --pip-state-mix: 50%; } /* bright blue */
-      body.pip-state-error        { --pip-state-accent: ${palette.bad};    --pip-state-mix: 55%; } /* red */
-    `;
-    doc.head.appendChild(style);
-
-    // DOM layout. Header order = priority left to right (pill = highest, then
-    // start/stop, PTT, cycle, settings cog). Brand wrap at the far right
-    // claims leftover space and is the first thing the container query hides.
-    doc.body.innerHTML = `
-      <header>
-        <span class="pip-pill" title="Session status">
-          <span class="pip-dot" id="pipdot"></span>
-          <span class="pip-pill-label" id="pipstatus">Idle</span>
-        </span>
-        <button class="pip-iconbtn pip-startstop" id="pipBtnStartStop"
-                type="button" data-running="false"
-                title="Start" aria-label="Start">▶</button>
-        <button class="pip-iconbtn pip-ptt is-hidden" id="pipBtnPtt"
-                type="button" data-held="false" aria-pressed="false"
-                title="Push to talk — tap to start, tap to stop" aria-label="Push to talk">🎙</button>
-        <button class="pip-iconbtn pip-cycle is-hidden" id="pipBtnCycle"
-                type="button"
-                title="Switch session" aria-label="Switch session">⇆</button>
-        <button class="pip-iconbtn pip-reset" id="pipBtnForceReset"
-                type="button"
-                title="Force reconnect: drop the WebSocket and clear the resume handle. Starts a fresh model context."
-                aria-label="Force reconnect">↻</button>
-        <button class="pip-iconbtn pip-settings-toggle" id="pipBtnSettingsToggle"
-                type="button" data-open="false"
-                title="Settings" aria-label="Settings"
-                aria-expanded="false" aria-controls="pipSettingsPanel">⚙</button>
-        <span class="pip-brand-wrap">
-          <span class="pip-brand-globe" aria-hidden="true">🌐</span>
-          <span class="pip-brand-text">Translator</span>
-        </span>
-      </header>
-
-      <div class="pip-body-wrap">
-        <main class="pip-transcript">
-          <div class="pip-row" id="pipInputRow">
-            <div class="pip-label pip-input-lab" id="pipinlab">You</div>
-            <div class="pip-input pip-empty" id="pipin">—</div>
-          </div>
-          <div class="pip-row" id="pipOutputRow">
-            <div class="pip-label pip-output-lab" id="pipoutlab">Translation</div>
-            <div class="pip-output pip-empty" id="pipout">—</div>
-          </div>
-        </main>
-
-        <div class="pip-settings-backdrop" id="pipSettingsBackdrop" aria-hidden="true"></div>
-        <aside class="pip-settings-panel" id="pipSettingsPanel"
-               role="dialog" aria-modal="false" aria-labelledby="pipSettingsTitle" tabindex="-1">
-          <div class="pip-settings-head">
-            <span class="pip-settings-title" id="pipSettingsTitle">Settings</span>
-            <button class="pip-iconbtn" id="pipBtnSettingsClose"
-                    type="button" title="Close settings" aria-label="Close settings">×</button>
-          </div>
-          <div class="pip-settings-body">
-            <div class="pip-field">
-              <div class="pip-field-label">Mic</div>
-              <div class="pip-row-actions">
-                <button class="pip-btn flex" id="pipBtnPause" type="button" disabled>Pause</button>
-                <button class="pip-btn warn flex" id="pipBtnHush" type="button" disabled>Silence</button>
-              </div>
-            </div>
-
-            <div class="pip-field">
-              <div class="pip-field-label">Show</div>
-              <div class="pip-seg" id="pipDisplaySeg" role="radiogroup" aria-label="Show">
-                <button class="pip-seg-opt" data-mode="both"   role="radio" aria-checked="true"  type="button">Both</button>
-                <button class="pip-seg-opt" data-mode="input"  role="radio" aria-checked="false" type="button">Source</button>
-                <button class="pip-seg-opt" data-mode="output" role="radio" aria-checked="false" type="button">Target</button>
-              </div>
-            </div>
-
-            <div class="pip-field">
-              <div class="pip-field-label">Text size</div>
-              <div class="pip-font-row">
-                <button class="pip-btn" id="pipFontDec" type="button" aria-label="Smaller text">A−</button>
-                <span class="pip-font-label" id="pipFontLabel">sm</span>
-                <button class="pip-btn" id="pipFontInc" type="button" aria-label="Larger text">A+</button>
-              </div>
-            </div>
-
-            <div class="pip-field">
-              <div class="pip-field-label">Transcript</div>
-              <button class="pip-btn flex" id="pipBtnClear" type="button">Clear</button>
-            </div>
-          </div>
-        </aside>
-      </div>
-    `;
-
-    this.statusEl = doc.getElementById('pipstatus');
-    this.dotEl = doc.getElementById('pipdot');
-    this.inputLabelEl = doc.getElementById('pipinlab');
-    this.outputLabelEl = doc.getElementById('pipoutlab');
-    this.inputEl = doc.getElementById('pipin');
-    this.outputEl = doc.getElementById('pipout');
-    this.inputRowEl = doc.getElementById('pipInputRow');
-    this.outputRowEl = doc.getElementById('pipOutputRow');
-
-    this.btnStartStopEl = doc.getElementById('pipBtnStartStop');
-    this.btnPttEl = doc.getElementById('pipBtnPtt');
-    this.btnCycleEl = doc.getElementById('pipBtnCycle');
-    this.btnSettingsToggleEl = doc.getElementById('pipBtnSettingsToggle');
-    this.settingsPanelEl = doc.getElementById('pipSettingsPanel');
-    this.settingsBackdropEl = doc.getElementById('pipSettingsBackdrop');
-    const btnSettingsCloseEl = doc.getElementById('pipBtnSettingsClose');
-    this.btnPauseEl = doc.getElementById('pipBtnPause');
-    this.btnHushEl = doc.getElementById('pipBtnHush');
-    this.btnClearEl = doc.getElementById('pipBtnClear');
-    this.btnForceResetEl = doc.getElementById('pipBtnForceReset');
-    this.displaySegEl = doc.getElementById('pipDisplaySeg');
-    this.fontDecEl = doc.getElementById('pipFontDec');
-    this.fontIncEl = doc.getElementById('pipFontInc');
-    this.fontLabelEl = doc.getElementById('pipFontLabel');
-
-    // ─── Header actions ────────────────────────────────────────────────
-    this.btnStartStopEl.addEventListener('click', () => {
-      if (this._currentRunning) this.onStop();
-      else this.onStart();
-    });
-
-    // PTT: tap to engage, tap to release. The main page owns the engaged
-    // state (session.pttHeld) and writes it back via setPttEngaged() — so we
-    // never flip the visual on click; we just forward the toggle intent.
-    this.btnPttEl.addEventListener('click', () => this.onPttToggle());
-
-    this.btnCycleEl.addEventListener('click', () => this.onCycleSession());
-    this.btnForceResetEl.addEventListener('click', () => this.onForceReset());
-    this.btnSettingsToggleEl.addEventListener('click', () => this.toggleSettingsPanel());
-    btnSettingsCloseEl.addEventListener('click', () => this.closeSettingsPanel());
-    this.settingsBackdropEl.addEventListener('click', () => this.closeSettingsPanel());
-
-    // ─── Settings-panel actions ────────────────────────────────────────
-    this.btnPauseEl.addEventListener('click', () => this.onPause());
-    this.btnHushEl.addEventListener('click', () => this.onHush());
-    this.btnClearEl.addEventListener('click', () => this.onClear());
-
-    this.displaySegEl.addEventListener('click', (ev) => {
-      const btn = ev.target.closest('.pip-seg-opt');
-      if (!btn) return;
-      const mode = btn.dataset.mode;
-      if (!PIP_DISPLAY_MODES.includes(mode)) return;
-      this.setDisplayMode(mode, /* persist */ true);
-    });
-
-    this.fontDecEl.addEventListener('click', () => this.setFontStep(this._fontStep - 1, true));
-    this.fontIncEl.addEventListener('click', () => this.setFontStep(this._fontStep + 1, true));
-
-    // ESC closes the settings panel if it's open.
-    doc.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Escape' && this._settingsOpen) {
-        ev.preventDefault();
-        this.closeSettingsPanel();
-      }
-    });
-
-    // Replay current state into the freshly-built DOM.
-    this.setStatus(this._currentStatus, this._currentLive);
-    this.setEffectiveStatus(this._currentEffStatus);
-    this.setRunning(this._currentRunning, this._currentPaused, this._currentIsAudio);
-    if (this._inLang) this.setLangs(this._inLang, this._outLang);
-    this.setInput(this._currentInput);
-    this.setOutput(this._currentOutput);
-    this.setDisplayMode(this._displayMode, /* persist */ false);
-    this.setFontStep(this._fontStep, /* persist */ false);
-    this.setSessionCount(this._sessionCount);
-  }
-
-  // Settings slide-over open/close.
-  openSettingsPanel() {
-    if (!this.settingsPanelEl) return;
-    this._settingsOpen = true;
-    this.settingsPanelEl.classList.add('is-open');
-    this.settingsBackdropEl.classList.add('is-open');
-    this.btnSettingsToggleEl.dataset.open = 'true';
-    this.btnSettingsToggleEl.setAttribute('aria-expanded', 'true');
-    try { this.settingsPanelEl.focus({ preventScroll: true }); } catch (_) {}
-  }
-  closeSettingsPanel() {
-    if (!this.settingsPanelEl) return;
-    this._settingsOpen = false;
-    this.settingsPanelEl.classList.remove('is-open');
-    this.settingsBackdropEl.classList.remove('is-open');
-    this.btnSettingsToggleEl.dataset.open = 'false';
-    this.btnSettingsToggleEl.setAttribute('aria-expanded', 'false');
-    try { this.btnSettingsToggleEl.focus({ preventScroll: true }); } catch (_) {}
-  }
-  toggleSettingsPanel() {
-    if (this._settingsOpen) this.closeSettingsPanel();
-    else this.openSettingsPanel();
-  }
-
-  // Shown only when more than one session exists in the main page. Called
-  // from refreshAddSessionButton / closeSession / restoreSessionsFromStorage.
-  setSessionCount(n) {
-    this._sessionCount = n | 0;
-    if (this.btnCycleEl) {
-      this.btnCycleEl.classList.toggle('is-hidden', this._sessionCount <= 1);
-    }
-  }
-
-  // PTT button visibility — driven by whether the active session is in PTT
-  // mode. Hidden buttons stay in the DOM (state survives toggles) but don't
-  // interrupt the header rhythm or steal a focus stop.
-  setPttVisible(visible) {
-    if (!this.btnPttEl) return;
-    this.btnPttEl.classList.toggle('is-hidden', !visible);
-  }
-
-  // PTT engaged state — written by the main page, never by the click handler.
-  // Keeping the engaged visual in lockstep with session.pttHeld means the
-  // footer Talk button, the popup Talk button, and an optional companion
-  // hotkey can all share one source of truth.
-  setPttEngaged(engaged) {
-    this._pttHeld = !!engaged;
-    if (!this.btnPttEl) return;
-    this.btnPttEl.dataset.held = engaged ? 'true' : 'false';
-    this.btnPttEl.setAttribute('aria-pressed', engaged ? 'true' : 'false');
-    this.btnPttEl.setAttribute('aria-label', engaged ? 'Stop talking' : 'Push to talk');
-  }
-
-  // Greyed-out state — driven from the main page's canEngage check (running,
-  // not paused, etc.). Kept separate from setPttEngaged so the engaged visual
-  // and the click-availability can change independently.
-  setPttDisabled(disabled) {
-    if (!this.btnPttEl) return;
-    this.btnPttEl.disabled = !!disabled;
-    this.btnPttEl.title = this._pttHeld ? 'Tap to stop' : 'Push to talk — tap to start';
-  }
-
-  setDisplayMode(mode, persist) {
-    if (!PIP_DISPLAY_MODES.includes(mode)) mode = 'both';
-    this._displayMode = mode;
-    if (this.displaySegEl) {
-      for (const btn of this.displaySegEl.querySelectorAll('.pip-seg-opt')) {
-        const isThis = btn.dataset.mode === mode;
-        btn.classList.toggle('is-active', isThis);
-        btn.setAttribute('aria-checked', isThis ? 'true' : 'false');
-      }
-    }
-    const showInput  = mode === 'both' || mode === 'input';
-    const showOutput = mode === 'both' || mode === 'output';
-    if (this.inputRowEl)  this.inputRowEl.classList.toggle('is-hidden', !showInput);
-    if (this.outputRowEl) this.outputRowEl.classList.toggle('is-hidden', !showOutput);
-    if (persist) this.onPrefsChange(this._exportPrefs());
-  }
-
-  setFontStep(step, persist) {
-    const max = PIP_FONT_STEPS.length - 1;
-    step = Math.max(0, Math.min(max, step | 0));
-    this._fontStep = step;
-    if (this.doc && this.doc.body) {
-      this.doc.body.style.setProperty('--pip-scale', String(PIP_FONT_STEPS[step]));
-    }
-    if (this.fontLabelEl) this.fontLabelEl.textContent = PIP_FONT_LABELS[step];
-    if (this.fontDecEl) this.fontDecEl.disabled = step <= 0;
-    if (this.fontIncEl) this.fontIncEl.disabled = step >= max;
-    if (persist) this.onPrefsChange(this._exportPrefs());
-  }
-
-  _exportPrefs() {
-    return { displayMode: this._displayMode, fontStep: this._fontStep };
-  }
-
-  // Called from refreshSessionDisplay so the bg colour tracks the same
-  // effectiveStatus the chip + topbar pill use.
-  setEffectiveStatus(eff) {
-    this._currentEffStatus = eff || 'idle';
-    if (!this.doc || !this.doc.body) return;
-    // Drop any previously-set pip-state-* class before applying the new one.
-    const body = this.doc.body;
-    for (const cls of Array.from(body.classList)) {
-      if (cls.startsWith('pip-state-')) body.classList.remove(cls);
-    }
-    body.classList.add('pip-state-' + this._currentEffStatus);
-  }
-
-  // Drives the Start/Stop icon button in the header plus the Pause/Hush
-  // buttons in the slide-over settings panel. Running + paused passed in
-  // explicitly so the PIP doesn't need to interpret session status strings.
-  setRunning(running, paused, isAudio) {
-    this._currentRunning = !!running;
-    this._currentPaused = !!paused;
-    this._currentIsAudio = isAudio === undefined ? true : !!isAudio;
-    if (this.btnStartStopEl) {
-      this.btnStartStopEl.dataset.running = this._currentRunning ? 'true' : 'false';
-      this.btnStartStopEl.textContent = this._currentRunning ? '■' : '▶';
-      this.btnStartStopEl.title = this._currentRunning ? 'Stop' : 'Start';
-      this.btnStartStopEl.setAttribute('aria-label', this._currentRunning ? 'Stop' : 'Start');
-    }
-    if (this.btnPauseEl) {
-      this.btnPauseEl.disabled = !this._currentRunning;
-      this.btnPauseEl.textContent = this._currentPaused ? 'Resume' : 'Pause';
-    }
-    if (this.btnHushEl) {
-      this.btnHushEl.disabled = !this._currentRunning || !this._currentIsAudio;
-    }
-    // If a session stops while PTT is held, release it so the visual state
-    // doesn't lie about what's happening.
-    if (!this._currentRunning && this._pttHeld && this.btnPttEl) {
-      this._pttHeld = false;
-      this.btnPttEl.dataset.held = 'false';
-    }
-  }
-
-  setStatus(text, live) {
-    this._currentStatus = text;
-    this._currentLive = !!live;
-    if (this.statusEl) this.statusEl.textContent = text;
-    if (this.dotEl) this.dotEl.classList.toggle('live', !!live);
-  }
-
-  setLangs(inLang, outLang) {
-    this._inLang = inLang; this._outLang = outLang;
-    if (this.inputLabelEl) this.inputLabelEl.textContent = '🎙 ' + inLang;
-    if (this.outputLabelEl) this.outputLabelEl.textContent = '→ ' + outLang;
-  }
-
-  setInput(text) {
-    this._currentInput = text;
-    if (!this.inputEl) return;
-    if (text) {
-      this.inputEl.classList.remove('pip-empty');
-      this.inputEl.textContent = text;
-    } else {
-      this.inputEl.classList.add('pip-empty');
-      this.inputEl.textContent = '—';
-    }
-  }
-
-  setOutput(text) {
-    this._currentOutput = text;
-    if (!this.outputEl) return;
-    if (text) {
-      this.outputEl.classList.remove('pip-empty');
-      this.outputEl.textContent = text;
-    } else {
-      this.outputEl.classList.add('pip-empty');
-      this.outputEl.textContent = '—';
-    }
-  }
-
-  _cleanup() {
-    this.win = null;
-    this.doc = null;
-    this.statusEl = this.dotEl = null;
-    this.inputEl = this.outputEl = null;
-    this.inputLabelEl = this.outputLabelEl = null;
-    this.inputRowEl = this.outputRowEl = null;
-    this.btnStartStopEl = null;
-    this.btnPttEl = null;
-    this.btnCycleEl = null;
-    this.btnSettingsToggleEl = null;
-    this.settingsPanelEl = this.settingsBackdropEl = null;
-    this.btnPauseEl = this.btnHushEl = this.btnClearEl = null;
-    this.displaySegEl = null;
-    this.fontDecEl = this.fontIncEl = this.fontLabelEl = null;
-    this._settingsOpen = false;
-    this._pttHeld = false;
-    this.onClose();
-  }
-
-  close() {
-    if (this.win) { try { this.win.close(); } catch (_) {} }
-    this._cleanup();
-  }
+// PipController lives in js/pip.js and is loaded on first Pop-out click via
+// dynamic <script> injection. Keeping the ~750-line class out of the main
+// bundle saves cold-start parse cost; the parse moves to first-pop-out, which
+// is itself a user-initiated action so a short delay there is acceptable.
+let _pipModulePromise = null;
+function loadPipModule() {
+  if (typeof PipController !== 'undefined') return Promise.resolve();
+  if (_pipModulePromise) return _pipModulePromise;
+  _pipModulePromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'js/pip.js';
+    s.onload = () => resolve();
+    s.onerror = () => { _pipModulePromise = null; reject(new Error('Failed to load js/pip.js')); };
+    document.head.appendChild(s);
+  });
+  return _pipModulePromise;
 }
+
 
 async function togglePip() {
   if (state.pip && state.pip.isOpen()) {
     state.pip.close();
+    return;
+  }
+  // First-Pop-out cost: download + parse js/pip.js (~24 KB). Subsequent clicks
+  // resolve immediately because loadPipModule caches the promise.
+  try {
+    await loadPipModule();
+  } catch (e) {
+    log('error', 'Pop out failed: ' + (e && e.message ? e.message : e));
     return;
   }
   const pip = new PipController({
@@ -5153,7 +5341,11 @@ async function togglePip() {
     pip.setStatus('Idle', false);
     pip.setEffectiveStatus('idle');
     pip.setRunning(false, false, true);
-    pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+    if (els.engineSelect.value === 'translate') {
+      pip.setLangs('Auto', translateLangName(els.translateTarget ? els.translateTarget.value : DEFAULT_TRANSLATE_TARGET));
+    } else {
+      pip.setLangs(langName(els.langSource.value), langName(els.langTarget.value));
+    }
   }
   // Seed the cycle-button visibility now that the PIP exists. Subsequent
   // session add/close/restore paths re-call this via refreshPipSessionCount.
@@ -5173,31 +5365,17 @@ function refreshPipSessionCount() {
 function wireUI() {
   els.btnStart.addEventListener('click', startPipeline);
   els.btnStop.addEventListener('click', stopPipeline);
-  els.btnPause.addEventListener('click', togglePause);
+  // DEPRECATED: mic pause + silence buttons retired.
+  // els.btnPause.addEventListener('click', togglePause);
   if (els.btnPtt) els.btnPtt.addEventListener('click', togglePtt);
-  els.btnHush.addEventListener('click', () => {
-    const session = activeSession();
-    if (session) state.ttsCoordinator.hush(session);
-    log('info', 'Playback silenced');
-  });
-  els.btnClear.addEventListener('click', clearConversation);
-  // Export now goes through a single button with a popup menu. The Export
-  // button toggles the menu; the menu items run the export AND close the
-  // menu. Outside-click + Escape (handled in the global keydown listener
-  // below) dismiss without exporting.
-  if (els.btnExport && els.exportMenu) {
-    els.btnExport.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      toggleExportMenu();
-    });
-    els.exportMenu.addEventListener('click', (ev) => {
-      // Stop propagation so the document-level close listener doesn't
-      // immediately dismiss the menu after a menuitem click.
-      ev.stopPropagation();
-    });
-  }
-  els.btnExportJson.addEventListener('click', () => { closeExportMenu(); exportConversation('json'); });
-  els.btnExportText.addEventListener('click', () => { closeExportMenu(); exportConversation('text'); });
+  // els.btnHush.addEventListener('click', () => {
+  //   const session = activeSession();
+  //   if (session) state.ttsCoordinator.hush(session);
+  //   log('info', 'Playback silenced');
+  // });
+  // Per-session Clear / Export live in each session header strip and are
+  // wired in createSessionDOM. The previous sidebar Actions buttons were
+  // removed in favour of those — see CLAUDE.md plan note.
   els.btnSwap.addEventListener('click', () => {
     const a = els.langSource.value;
     els.langSource.value = els.langTarget.value;
@@ -5220,6 +5398,16 @@ function wireUI() {
     updateUIVisibility();
     onSettingsChange();
   });
+  els.engineSelect.addEventListener('change', () => {
+    updateUIVisibility();
+    onSettingsChange();
+  });
+  if (els.translateTarget) {
+    els.translateTarget.addEventListener('change', onSettingsChange);
+  }
+  if (els.echoTarget) {
+    els.echoTarget.addEventListener('change', onSettingsChange);
+  }
   els.vadPreset.addEventListener('change', () => {
     if (els.vadPreset.value !== 'custom') applyVadPreset(els.vadPreset.value);
     updateUIVisibility();
@@ -5344,8 +5532,15 @@ function wireUI() {
   // API key is global, not per-session — savePrefs only. Listen on 'input' so
   // a paste-then-reload doesn't lose the key (the 'change' event only fires
   // on blur, which is too late for the user who pastes and immediately
-  // reloads, switches tabs, or experiences a crash).
-  els.apiKey.addEventListener('input', savePrefs);
+  // reloads, switches tabs, or experiences a crash). Debounce 500ms: typing
+  // a 40-char key would otherwise fire 40 synchronous localStorage writes.
+  const debouncedSavePrefs = (() => {
+    let t = 0;
+    return () => { clearTimeout(t); t = setTimeout(savePrefs, 500); };
+  })();
+  els.apiKey.addEventListener('input', debouncedSavePrefs);
+  // Flush on blur and before unload so a paste-then-tab-away can't lose it.
+  els.apiKey.addEventListener('blur', savePrefs);
 
   els.btnMenu.addEventListener('click', () => openSheet('sidebar'));
   els.btnLog.addEventListener('click', () => openSheet('log-sheet'));
@@ -5386,7 +5581,6 @@ function wireUI() {
   els.btnEditPrompt.addEventListener('click', openPromptEditor);
   els.btnSavePrompt.addEventListener('click', savePromptEditor);
   els.btnResetPrompt.addEventListener('click', resetPromptEditor);
-  els.btnPip.addEventListener('click', togglePip);
   els.btnPipQuick.addEventListener('click', togglePip);
 
   const okConfirm = $('btn-confirm-ok');
@@ -5488,20 +5682,20 @@ function wireUI() {
   }
 
   // Generic sheet close handlers. Prompt-sheet additionally guards against
-  // discarding unsaved edits — see confirmDiscardPromptEdits.
+  // discarding unsaved edits — see tryClosePromptSheet.
   document.addEventListener('click', (ev) => {
-    // Any click outside the export-menu / its trigger dismisses it. The
-    // menu's own click handler stopPropagation()s to avoid this firing on
-    // menuitem clicks (we want those to run the export AND close).
-    if (isExportMenuOpen()) {
-      const insideMenu = els.exportMenu && els.exportMenu.contains(ev.target);
-      const onTrigger = els.btnExport && els.btnExport.contains(ev.target);
-      if (!insideMenu && !onTrigger) closeExportMenu();
+    // Any click outside an open per-session export menu / its trigger
+    // dismisses it. Each menu's own click handler stopPropagation()s to
+    // avoid this firing on menuitem clicks (we want those to run the export
+    // AND close).
+    if (anyExportMenuOpen()) {
+      const inWrap = ev.target.closest && ev.target.closest('.session-export-wrap');
+      if (!inWrap) closeAllExportMenus();
     }
     const tgt = ev.target.closest('[data-close]');
     if (!tgt) return;
     const id = tgt.getAttribute('data-close');
-    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) return;
+    if (id === 'prompt-sheet') { tryClosePromptSheet(); return; }
     // Confirm dialog: dismissal (× / backdrop) is "cancel". settleConfirm
     // closes the sheet, so don't double-close.
     if (id === 'confirm-sheet') { settleConfirm(false); return; }
@@ -5512,18 +5706,20 @@ function wireUI() {
     // Export menu wins over sheets when both are open — it's the most
     // recently-opened transient UI and closing it first matches user intent
     // (and matches how native menus stack with dialogs).
-    if (isExportMenuOpen()) {
+    const openOwner = findOpenExportMenu();
+    if (openOwner) {
       ev.preventDefault();
-      closeExportMenu();
-      if (els.btnExport) els.btnExport.focus();
+      closeExportMenu(openOwner.headerExportMenu, openOwner.headerExportBtn);
+      if (openOwner.headerExportBtn) openOwner.headerExportBtn.focus();
       return;
     }
     // Close only the topmost open modal so layered sheets (e.g. Log opened
     // from inside Settings) close one at a time, matching native dialog UX.
     const id = topmostOpenSheet();
     if (!id) return;
-    if (id === 'prompt-sheet' && !confirmDiscardPromptEdits()) {
+    if (id === 'prompt-sheet') {
       ev.preventDefault();
+      tryClosePromptSheet();
       return;
     }
     if (id === 'confirm-sheet') {
@@ -5545,18 +5741,21 @@ function wireUI() {
     }
   });
   window.addEventListener('pagehide', () => {
+    // Flush any pending debounced saveSessions so per-turn updates aren't lost
+    // when the user closes the tab between turn boundaries.
+    if (_pendingSaveSessionsTimer) saveSessions();
     for (const session of state.sessions.values()) {
       if (session.running) {
         try { session.client && session.client.stop(); } catch (_) {}
         try { session.capture && session.capture.stop(); } catch (_) {}
         try { session.player && session.player.destroy(); } catch (_) {}
       }
-      // ageTimer survives across BFCache restore (Safari especially) — a
-      // restored page would tick the age display against a destroyed session.
-      // Clear unconditionally; ageTimer is also cleared in stopSession but
-      // not every running-state path here was guaranteed to flow through it.
-      if (session.ageTimer) { clearInterval(session.ageTimer); session.ageTimer = 0; }
     }
+    // The global age tick survives across BFCache restore (Safari especially) —
+    // a restored page would tick the age display against destroyed sessions.
+    // Clear unconditionally; the tick also stops in stopSession but not every
+    // running-state path here was guaranteed to flow through it.
+    if (_ageTickHandle) { clearInterval(_ageTickHandle); _ageTickHandle = 0; }
     for (const session of state.sessions.values()) {
       try { session.micPassthrough && session.micPassthrough.stop(); } catch (_) {}
     }
@@ -5648,7 +5847,9 @@ function checkSupport() {
       location.hostname !== '127.0.0.1') {
     log('warn', 'Microphone needs HTTPS, localhost, or file://.');
   }
-  if (!PipController.isDocPipSupported()) {
+  // Inline check matches PipController.isDocPipSupported(). Done here without
+  // loading js/pip.js because checkSupport runs at boot, before any Pop-out.
+  if (!('documentPictureInPicture' in window)) {
     log('info', 'Native PiP unavailable here — Pop out will use a regular popup window.');
   }
   return true;
@@ -5667,7 +5868,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   state.pttClient.onAvailabilityChange = () => updatePttButton();
   restoreSessionsFromStorage();
-  detectCompanionService();
+  // Defer the companion-service probe out of DOMContentLoaded — it does a 600ms
+  // HTTP request that blocks time-to-interactive when the companion is offline.
+  // The companion-only UI reveals itself when detection lands, same as before.
+  const _kickCompanionDetect = () => detectCompanionService();
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(_kickCompanionDetect, { timeout: 1000 });
+  } else {
+    setTimeout(_kickCompanionDetect, 0);
+  }
   refreshAudioInputDevices();
   refreshAudioOutputDevices();
   updateSpeechModeFields();

@@ -94,14 +94,14 @@ void PassthroughSession::send_event_ready(const std::vector<std::string>& warnin
   send_json(s);
 }
 
-void PassthroughSession::distribute(uint64_t startFrame, const float* L, const float* R, size_t n) {
+void PassthroughSession::distribute(int srcIdx, uint64_t startFrame, const float* L, const float* R, size_t n) {
   std::lock_guard<std::mutex> lock(sinksMu);
   for (auto& s : sinks) {
-    if (s->alive.load()) s->ring.mixIn(startFrame, L, R, n);
+    if (s->alive.load()) s->ring.mixFrom(srcIdx, startFrame, L, R, n);
   }
 }
 
-void PassthroughSession::distribute_logged(const char* who, uint64_t startFrame,
+void PassthroughSession::distribute_logged(const char* who, int srcIdx, uint64_t startFrame,
                                            const float* L, const float* R, size_t n,
                                            bool verbose) {
   if (verbose) {
@@ -110,7 +110,7 @@ void PassthroughSession::distribute_logged(const char* who, uint64_t startFrame,
     dlog("pt %s: distribute start frame=%llu n=%zu sinks=%zu Lptr=%p Rptr=%p",
          who, (unsigned long long)startFrame, n, nSinks, (void*)L, (void*)R);
   }
-  distribute(startFrame, L, R, n);
+  distribute(srcIdx, startFrame, L, R, n);
   if (verbose) {
     dlog("pt %s: distribute done frame=%llu n=%zu",
          who, (unsigned long long)startFrame, n);
@@ -180,7 +180,11 @@ void PassthroughSession::mic_source_thread() {
     HRESULT enHr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                     __uuidof(IMMDeviceEnumerator), (void**)&en);
     if (SUCCEEDED(enHr) && en) {
-      HRESULT defHr = en->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+      // eConsole, not eCommunications: the browser's "System default" mic is
+      // the console/multimedia default. Using the communications default here
+      // could make the passthrough capture a different mic than the one
+      // being translated when the two roles point at different devices.
+      HRESULT defHr = en->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
       dlog("pt mic source: default capture fallback hr=0x%08x device=%p",
            defHr, (void*)device);
       en->Release();
@@ -242,6 +246,7 @@ void PassthroughSession::mic_source_thread() {
   }
   if (FAILED(hr)) {
     dlog("pt mic source: init failed hr=0x%08x", hr);
+    if (task) AvRevertMmThreadCharacteristics(task);
     if (event) CloseHandle(event);
     if (capture) capture->Release();
     if (client) client->Release();
@@ -319,7 +324,7 @@ void PassthroughSession::mic_source_thread() {
         for (float v : outR) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         update_peak(peak);
         const bool verbose = packetCount <= 10 || (packetCount % 500) == 0;
-        distribute_logged("mic source", frame, outL.data(), outR.data(), outL.size(), verbose);
+        distribute_logged("mic source", kPtSrcMic, frame, outL.data(), outR.data(), outL.size(), verbose);
         frame += outL.size();
         if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {  // every ~5s
           dlog("pt mic source: heartbeat frame=%llu packets=%llu",
@@ -333,6 +338,9 @@ void PassthroughSession::mic_source_thread() {
   dlog("pt mic source: loop exit micAlive=%d running=%d frames=%llu packets=%llu",
        micAlive.load() ? 1 : 0, running.load() ? 1 : 0,
        (unsigned long long)frame, (unsigned long long)packetCount);
+  // The loop can also exit on a wait/device error with micAlive still true;
+  // clear it so configure() sees the source as dead and can restart it.
+  micAlive = false;
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -494,6 +502,7 @@ void PassthroughSession::loopback_source_thread() {
   }
   if (FAILED(hr)) {
     dlog("pt loopback source: init failed hr=0x%08x", hr);
+    if (task) AvRevertMmThreadCharacteristics(task);
     if (event) CloseHandle(event);
     if (capture) capture->Release();
     if (client) client->Release();
@@ -570,7 +579,7 @@ void PassthroughSession::loopback_source_thread() {
         for (float v : outR) { float a = v < 0 ? -v : v; if (a > peak) peak = a; }
         update_peak(peak);
         const bool verbose = packetCount <= 10 || (packetCount % 500) == 0;
-        distribute_logged("loopback source", frame, outL.data(), outR.data(), outL.size(), verbose);
+        distribute_logged("loopback source", kPtSrcLoopback, frame, outL.data(), outR.data(), outL.size(), verbose);
         frame += outL.size();
         if (frame - lastHeartbeatFrame >= (uint64_t)kPtMixRate * 5) {
           dlog("pt loopback source: heartbeat frame=%llu packets=%llu",
@@ -584,6 +593,9 @@ void PassthroughSession::loopback_source_thread() {
   dlog("pt loopback source: loop exit loopbackAlive=%d running=%d frames=%llu packets=%llu",
        loopbackAlive.load() ? 1 : 0, running.load() ? 1 : 0,
        (unsigned long long)frame, (unsigned long long)packetCount);
+  // Same as the mic source: a wait/device error leaves loopbackAlive true;
+  // clear it so configure() can detect the dead source and restart it.
+  loopbackAlive = false;
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -684,6 +696,7 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
   }
   if (FAILED(hr)) {
     dlog("pt sink \"%s\": init failed hr=0x%08x", sink->endpointIdUtf8.c_str(), hr);
+    if (task) AvRevertMmThreadCharacteristics(task);
     if (event) CloseHandle(event);
     if (render) render->Release();
     if (client) client->Release();
@@ -840,6 +853,10 @@ void PassthroughSession::sink_render_thread(PtSink* sink) {
        sink->endpointIdUtf8.c_str(), sink->alive.load() ? 1 : 0,
        running.load() ? 1 : 0,
        (unsigned long long)iterCount, (unsigned long long)totalWritten);
+  // The render loop can exit on a padding/GetBuffer error with alive still
+  // true; clear it so configure() stops reporting the sink as active and
+  // restarts it on the next reconfigure.
+  sink->alive = false;
   client->Stop();
   if (task) AvRevertMmThreadCharacteristics(task);
   if (event) CloseHandle(event);
@@ -899,7 +916,17 @@ void PassthroughSession::configure(const std::string& payload) {
     std::vector<std::unique_ptr<PtSink>> keep;
     keep.reserve(sinks.size());
     for (auto& s : sinks) {
-      if (wanted.count(s->endpointIdUtf8) == 0) {
+      const bool isWanted = wanted.count(s->endpointIdUtf8) != 0;
+      if (isWanted && !s->alive.load()) {
+        // The render thread died (endpoint vanished, device error). Drain it
+        // and leave the id in `wanted` so the start loop below respawns it —
+        // otherwise a once-failed sink would be reported active forever and
+        // never recover.
+        dlog("pt configure: sink \"%s\" died, restarting", s->endpointIdUtf8.c_str());
+        warnings.push_back("{\"deviceId\":\"" + json_escape(s->endpointIdUtf8) +
+                           "\",\"reason\":\"output failed; restarting\"}");
+        drained.push_back(std::move(s));
+      } else if (!isWanted) {
         dlog("pt configure: stopping sink \"%s\"", s->endpointIdUtf8.c_str());
         s->alive = false;
         drained.push_back(std::move(s));
@@ -943,9 +970,18 @@ void PassthroughSession::configure(const std::string& payload) {
     return nextCfg.pid != srcCfg.pid;
   };
 
-  if (needRestartMic()) {
-    dlog("pt configure: restarting mic source (was=%d -> want=%d)",
-         srcCfg.haveMic ? 1 : 0, nextCfg.haveMic ? 1 : 0);
+  // A source whose thread died (device error, endpoint gone) leaves its
+  // alive flag false; treat that as needing a restart even when the wanted
+  // config is unchanged, so a reconfigure can revive it.
+  const bool micDead = nextCfg.haveMic && srcCfg.haveMic && !micAlive.load();
+  const bool loopDead = nextCfg.haveLoopback && srcCfg.haveLoopback && !loopbackAlive.load();
+
+  if (needRestartMic() || micDead) {
+    if (micDead) {
+      warnings.push_back("{\"deviceId\":\"\",\"reason\":\"mic capture failed; restarting\"}");
+    }
+    dlog("pt configure: restarting mic source (was=%d -> want=%d dead=%d)",
+         srcCfg.haveMic ? 1 : 0, nextCfg.haveMic ? 1 : 0, micDead ? 1 : 0);
     micAlive = false;
     if (micThread.joinable()) micThread.join();
     srcCfg.haveMic = nextCfg.haveMic;
@@ -957,10 +993,13 @@ void PassthroughSession::configure(const std::string& payload) {
     }
   }
 
-  if (needRestartLoop()) {
-    dlog("pt configure: restarting loopback source (was=%d/pid=%lu -> want=%d/pid=%lu)",
+  if (needRestartLoop() || loopDead) {
+    if (loopDead) {
+      warnings.push_back("{\"deviceId\":\"\",\"reason\":\"loopback capture failed; restarting\"}");
+    }
+    dlog("pt configure: restarting loopback source (was=%d/pid=%lu -> want=%d/pid=%lu dead=%d)",
          srcCfg.haveLoopback ? 1 : 0, srcCfg.pid,
-         nextCfg.haveLoopback ? 1 : 0, nextCfg.pid);
+         nextCfg.haveLoopback ? 1 : 0, nextCfg.pid, loopDead ? 1 : 0);
     loopbackAlive = false;
     if (loopbackThread.joinable()) loopbackThread.join();
     srcCfg.haveLoopback = nextCfg.haveLoopback;

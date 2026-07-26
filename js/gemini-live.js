@@ -15,7 +15,17 @@ function buildLiveUrl(endpoint, apiKey) {
 }
 
 const DEFAULT_MODEL = 'models/gemini-3.1-flash-live-preview';
+// Dedicated Live Translation model. Config-driven (translationConfig) rather
+// than prompt-driven: no systemInstruction, no VAD/turns (continuous stream),
+// one-way into a single target language with auto source detection. Message
+// parsing is otherwise identical to the standard Live API.
+const TRANSLATE_MODEL = 'models/gemini-3.5-live-translate-preview';
 const GOAWAY_SAFETY_MS = 2000;
+// How long the model's output must be quiet before a continuous (translate)
+// session treats "now" as a clean cut point for a GoAway renewal. Long enough
+// to clear intra-utterance chunk gaps, short enough to catch the pauses between
+// utterances.
+const OUTPUT_SILENCE_MS = 800;
 const RECONNECT_BACKOFF_MS = 1500;
 const RECONNECT_MAX_MS = 30000;
 const MAX_RECONNECT_ATTEMPTS = 8;
@@ -94,6 +104,10 @@ class GeminiLiveClient {
     this.voice = opts.voice || 'Zephyr';
     this.systemInstruction = opts.systemInstruction || '';
     this.useOutputTranscription = opts.useOutputTranscription !== false;
+    // When set, selects the Live Translation setup path instead of the
+    // prompt-based one. Shape: { targetLanguageCode, echoTargetLanguage }.
+    // Callers using this should also pass model: TRANSLATE_MODEL.
+    this.translationConfig = opts.translationConfig || null;
     this.vad = opts.vad || null;  // { startSensitivity, endSensitivity, prefixPaddingMs, silenceDurationMs }
     // When true, Gemini's auto VAD is disabled; the client must signal turn
     // boundaries via sendActivityStart / sendActivityEnd. Used by push-to-talk.
@@ -145,12 +159,18 @@ class GeminiLiveClient {
     // audio replay) and only fall back to the hard deadline if no handle
     // arrives in time.
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     // Set true the first time `turnComplete` fires after a GoAway lands.
     // The handle-close trigger only fires after this arms (so we close at a
     // clean turn boundary), unless the deadline is closing in (<5s left), in
     // which case the next handle closes immediately regardless.
     this._turnCompleteSinceGoAway = false;
+    // Wall-clock of the last model output (translated audio or output text).
+    // The translate engine has no turnComplete, so a gap in output is its clean
+    // cut point: a GoAway renews on the next resumable handle that arrives while
+    // output has been silent for OUTPUT_SILENCE_MS (the model is between
+    // utterances), instead of risking a cut mid-translation.
+    this._lastOutputAt = 0;
   }
 
   _setState(s) {
@@ -176,7 +196,7 @@ class GeminiLiveClient {
   _renewNow(reason) {
     if (!this._goAwayPending) return;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog('info', `Renewing now (reason=${reason})`);
     if (this.ws) {
@@ -203,7 +223,7 @@ class GeminiLiveClient {
     this._setupComplete = false;
     this._reconnectAttempts = 0;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     this._turnCompleteSinceGoAway = false;
     this._setSwitching(false);
     this._setState('idle');
@@ -247,11 +267,10 @@ class GeminiLiveClient {
     this.ws.onclose = (ev) => this._onClose(ev);
   }
 
-  _onOpen() {
-    this.onLog('info', 'WS open — sending setup');
-    // gemini-3.1-flash-live-preview (and all native audio models) only support
-    // AUDIO response modality. TEXT modality is not supported. To get a text
-    // representation of the model's response, use outputAudioTranscription.
+  // Standard prompt-driven Live API setup (gemini-3.1-flash-live-preview etc.).
+  _buildLiveSetup() {
+    // Native audio models only support the AUDIO response modality. TEXT is not
+    // supported; for a text representation use outputAudioTranscription.
     const genConfig = {
       responseModalities: ['AUDIO'],
       speechConfig: {
@@ -260,7 +279,7 @@ class GeminiLiveClient {
       mediaResolution: 'MEDIA_RESOLUTION_MEDIUM',
     };
 
-    const setup = {
+    return {
       setup: {
         model: this.model,
         generationConfig: genConfig,
@@ -285,6 +304,45 @@ class GeminiLiveClient {
         sessionResumption: this.resumeHandle ? { handle: this.resumeHandle } : {},
       },
     };
+  }
+
+  // Live Translation setup (gemini-3.5-live-translate-preview). No
+  // systemInstruction and no realtimeInputConfig/VAD — the model translates
+  // continuously and auto-detects the source language. translationConfig
+  // carries the single target language and the echo toggle.
+  _buildTranslateSetup() {
+    const genConfig = {
+      responseModalities: ['AUDIO'],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: this.voice } },
+      },
+      translationConfig: {
+        targetLanguageCode: this.translationConfig.targetLanguageCode || 'en',
+        echoTargetLanguage: !!this.translationConfig.echoTargetLanguage,
+      },
+    };
+
+    return {
+      setup: {
+        model: this.model,
+        generationConfig: genConfig,
+        inputAudioTranscription: {},
+        // Same context-compression / resumption handling as the live path so
+        // long translate sessions survive and GoAway reconnect keeps working.
+        contextWindowCompression: {
+          triggerTokens: '104857',
+          slidingWindow: { targetTokens: '52428' },
+        },
+        sessionResumption: this.resumeHandle ? { handle: this.resumeHandle } : {},
+      },
+    };
+  }
+
+  _onOpen() {
+    this.onLog('info', 'WS open — sending setup');
+    const setup = this.translationConfig
+      ? this._buildTranslateSetup()
+      : this._buildLiveSetup();
 
     if (this.useOutputTranscription) {
       setup.setup.outputAudioTranscription = {};
@@ -355,14 +413,17 @@ class GeminiLiveClient {
       }
       if (sc.outputTranscription && sc.outputTranscription.text) {
         this.onOutputChunk(sc.outputTranscription.text);
+        this._lastOutputAt = Date.now();
       }
       if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
         for (const part of sc.modelTurn.parts) {
           if (part && part.inlineData && part.inlineData.data) {
             this.onAudio(part.inlineData.data);
+            this._lastOutputAt = Date.now();
           }
           if (part && part.text) {
             this.onOutputChunk(part.text);
+            this._lastOutputAt = Date.now();
           }
         }
       }
@@ -407,13 +468,23 @@ class GeminiLiveClient {
         //     server doesn't get stuck in a "between generationComplete and
         //     turnComplete" state that it can't re-emit on resume.
         if (this._goAwayPending) {
-          const remainingMs = this._goAwayDeadlineMs - Date.now();
+          const remainingMs = this.goAwayDeadlineMs - Date.now();
+          // The translate engine streams continuously and never emits
+          // turnComplete, so its clean cut point is a gap in model output: only
+          // renew on a resumable handle that arrives while output has been quiet
+          // for OUTPUT_SILENCE_MS (the model is between utterances), so we don't
+          // sever a translation mid-stream. If output never goes quiet before
+          // the deadline, the urgent / deadline fallbacks below still fire.
+          const outputIdle = !!this.translationConfig &&
+            (Date.now() - this._lastOutputAt) > OUTPUT_SILENCE_MS;
+          const armed = this._turnCompleteSinceGoAway || outputIdle;
           if (remainingMs < 5000) {
             this._renewNow('handle-urgent');
-          } else if (this._turnCompleteSinceGoAway) {
-            this._renewNow('handle-after-turn');
+          } else if (armed) {
+            this._renewNow(this.translationConfig ? 'handle-output-idle' : 'handle-after-turn');
           }
-          // else: wait for turnComplete to arm us, then the next handle closes.
+          // else: wait for a turn boundary (live) or an output-silence gap
+          // (translate) to arm us, then the next handle closes.
         }
       } else {
         // Resumption is not possible at certain points (mid-generation, tool
@@ -429,8 +500,8 @@ class GeminiLiveClient {
       // GoAway arrives with more time, prefer the *later* deadline (the
       // server is extending our grace period). Never shrink it.
       const newDeadline = Date.now() + Math.max(0, secs * 1000 - GOAWAY_SAFETY_MS);
-      const deadline = Math.max(this._goAwayDeadlineMs || 0, newDeadline);
-      this._goAwayDeadlineMs = deadline;
+      const deadline = Math.max(this.goAwayDeadlineMs || 0, newDeadline);
+      this.goAwayDeadlineMs = deadline;
       // Reset on each fresh GoAway: we want a turnComplete *after* this
       // moment, not one that fired before the GoAway landed.
       const wasPending = this._goAwayPending;
@@ -501,7 +572,7 @@ class GeminiLiveClient {
     const closedBeforeSetup = !this._setupComplete;
     this._setupComplete = false;
     this._goAwayPending = false;
-    this._goAwayDeadlineMs = 0;
+    this.goAwayDeadlineMs = 0;
     this._turnCompleteSinceGoAway = false;
     if (this._goAwayTimer) { clearTimeout(this._goAwayTimer); this._goAwayTimer = null; }
     this.onLog(ev.code === 1000 ? 'info' : 'warn',
@@ -662,6 +733,7 @@ class GeminiLiveClient {
 window.GeminiLive = {
   GeminiLiveClient,
   DEFAULT_ENDPOINT,
+  TRANSLATE_MODEL,
   DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   ONE_WAY_SYSTEM_PROMPT_TEMPLATE,
   TRANSCRIBE_SYSTEM_PROMPT_TEMPLATE,

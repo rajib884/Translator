@@ -145,6 +145,119 @@ TEST(PtRing, WrapsAroundModuloBoundary) {
   }
 }
 
+// ─── mixFrom: per-source offset + rebase ────────────────────────────────────
+
+namespace {
+
+// Drain `frames` from the ring in chunks, discarding the output. Advances
+// readFrame by exactly `frames` regardless of available data.
+void drain(PtRing& r, uint64_t frames) {
+  std::vector<float> sink(1024);
+  while (frames > 0) {
+    size_t step = static_cast<size_t>(std::min<uint64_t>(1024, frames));
+    r.consume(sink.data(), sink.data(), step);
+    frames -= step;
+  }
+}
+
+}  // namespace
+
+TEST(PtRing, MixFromFirstChunkLandsAtRebaseLead) {
+  PtRing r;
+  std::vector<float> v(8, 0.5f);
+  r.mixFrom(kPtSrcMic, 0, v.data(), v.data(), 8);
+
+  // The synced stream starts kPtRebaseLeadFrames ahead of the read head:
+  // silence until then, then the data.
+  std::vector<float> oL(kPtRebaseLeadFrames), oR(kPtRebaseLeadFrames);
+  r.consume(oL.data(), oR.data(), kPtRebaseLeadFrames);
+  for (size_t i = 0; i < kPtRebaseLeadFrames; ++i) ASSERT_FLOAT_EQ(oL[i], 0.0f);
+  std::vector<float> dL(8), dR(8);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 8), 8u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[i], 0.5f);
+}
+
+TEST(PtRing, MixFromRebasesSourceThatStartedAfterSink) {
+  // Sink consumed for a while before the source's first chunk (source device
+  // init lost the race). The legacy mixIn dropped frame-0 chunks forever;
+  // mixFrom must rebase them to land just ahead of the read head.
+  PtRing r;
+  drain(r, 10000);
+
+  std::vector<float> v(8, 0.5f);
+  r.mixFrom(kPtSrcMic, 0, v.data(), v.data(), 8);
+
+  drain(r, kPtRebaseLeadFrames);
+  std::vector<float> dL(8), dR(8);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 8), 8u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[i], 0.5f);
+}
+
+TEST(PtRing, MixFromRebasesCounterFarAheadOfFreshRing) {
+  // A sink added mid-session sees a source counter that is already hours
+  // large — far past the fresh ring's horizon. mixFrom rebases it down.
+  PtRing r;
+  const uint64_t huge = 48000ull * 3600;
+  std::vector<float> v(8, 0.25f);
+  r.mixFrom(kPtSrcLoopback, huge, v.data(), v.data(), 8);
+
+  drain(r, kPtRebaseLeadFrames);
+  std::vector<float> dL(8), dR(8);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 8), 8u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[i], 0.25f);
+}
+
+TEST(PtRing, MixFromRebasesAfterSourceStall) {
+  // Source feeds, stalls while the sink keeps consuming (readFrame advances
+  // past the stream), then resumes with its old counter. The resumed audio
+  // must come back instead of being permanently stale-dropped.
+  PtRing r;
+  std::vector<float> v(64, 0.5f);
+  r.mixFrom(kPtSrcMic, 0, v.data(), v.data(), 64);
+  drain(r, kPtRebaseLeadFrames + 64);  // play out everything written so far
+
+  drain(r, 48000);  // 1 s stall: sink consumes silence, source produces nothing
+
+  std::vector<float> resumed(8, 0.75f);
+  r.mixFrom(kPtSrcMic, 64, resumed.data(), resumed.data(), 8);  // counter resumes at 64
+
+  drain(r, kPtRebaseLeadFrames);
+  std::vector<float> dL(8), dR(8);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 8), 8u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[i], 0.75f);
+}
+
+TEST(PtRing, MixFromContiguousChunksStayContiguousAfterSync) {
+  // After the initial sync, consecutive chunks land back-to-back — the
+  // rebase only fires on dislocation, not per chunk.
+  PtRing r;
+  auto a = ramp(8, 0.10f, 0.01f);
+  auto b = ramp(8, 0.50f, 0.01f);
+  r.mixFrom(kPtSrcMic, 0, a.data(), a.data(), 8);
+  r.mixFrom(kPtSrcMic, 8, b.data(), b.data(), 8);
+
+  drain(r, kPtRebaseLeadFrames);
+  std::vector<float> dL(16), dR(16);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 16), 16u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[i], a[i]);
+  for (size_t i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(dL[8 + i], b[i]);
+}
+
+TEST(PtRing, MixFromTwoSourcesKeepIndependentOffsets) {
+  // Mic counter starts at 0, loopback counter is already huge — both must
+  // sync to "now" and mix together.
+  PtRing r;
+  std::vector<float> mic(8, 0.10f);
+  std::vector<float> loop(8, 0.25f);
+  r.mixFrom(kPtSrcMic, 0, mic.data(), mic.data(), 8);
+  r.mixFrom(kPtSrcLoopback, 48000ull * 7200, loop.data(), loop.data(), 8);
+
+  drain(r, kPtRebaseLeadFrames);
+  std::vector<float> dL(8), dR(8);
+  EXPECT_EQ(r.consume(dL.data(), dR.data(), 8), 8u);
+  for (size_t i = 0; i < 8; ++i) EXPECT_NEAR(dL[i], 0.35f, 1e-6);
+}
+
 TEST(PtRing, ConsumedCellsZeroBeforeNextMix) {
   // Verifies the invariant that consume() zeroes the cells it drains so a
   // later mix-add through the same modulo position doesn't double-count.
